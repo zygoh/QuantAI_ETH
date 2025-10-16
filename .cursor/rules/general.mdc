@@ -1,0 +1,1124 @@
+---
+description: QuantAI-ETH量化智能交易系统 - 通用规则
+globs:
+  - "**/*"
+alwaysApply: true
+---
+
+# QuantAI-ETH - 项目规则
+
+**项目全称**: QuantAI-ETH（Quantitative AI for Ethereum Trading）  
+**中文名称**: ETH量化智能交易系统  
+**版本**: v2.0
+
+## 📋 项目概述
+
+**QuantAI-ETH** 是一个**生产级加密货币量化交易系统**，使用多时间框架机器学习进行ETH/USDT合约中频交易。
+
+**核心功能**：
+- 多时间框架模型训练（15m/2h/4h独立模型）
+- 实时信号生成与多模型加权合成
+- **信号缓存机制**（每个时间框架独立缓存预测结果）
+- **预热信号保护**（前5个信号仅记录不交易）
+- 自动交易执行与风险管理
+- WebSocket实时数据流处理（stream名称中所有交易对均为小写）
+
+**技术栈**：Python 3.12+ | FastAPI | LightGBM | PostgreSQL+TimescaleDB | Redis | React
+
+---
+
+## 🎯 核心架构原则
+
+### 1. 多模型独立性原则（最重要）
+
+每个时间框架完全独立：
+```python
+# ✅ 正确：独立的模型、Scaler、特征、预测缓存
+self.models = {'15m': model_15m, '2h': model_2h, '4h': model_4h}
+self.scalers = {'15m': scaler_15m, '2h': scaler_2h, '4h': scaler_4h}
+self.feature_columns_dict = {
+    '15m': ['rsi', 'macd', ...],
+    '2h': ['rsi', 'macd', ...],
+    '4h': ['rsi', 'macd', ...]
+}
+self.cached_predictions = {}  # 🆕 信号缓存
+
+# ❌ 错误：共享模型或Scaler
+self.model = single_model  # ❌ 不允许
+```
+
+### 2. 信号生成架构（核心改进）
+
+**正确的信号生成流程**：
+```python
+# ✅ 各时间框架独立预测并缓存
+# 15m K线完成 → 预测15m → 缓存15m信号
+# 2h K线完成  → 预测2h  → 缓存2h信号  
+# 4h K线完成  → 预测4h  → 缓存4h信号
+
+# ✅ 只有15m触发合成（15m作为主时间框架）
+# 15m信号更新 → 合成所有缓存的信号 → 发出交易信号
+
+# ❌ 错误：每次15m完成时同时预测3个时间框架
+# 这样会重复预测，效率低且没有必要
+```
+
+### 3. 预热信号保护（生产安全）
+
+**前5个信号仅记录不交易**：
+```python
+# 🔒 安全保护机制
+self.signal_counter = 0
+self.warmup_signals = 5  # 预热信号数量
+
+if self.signal_counter <= self.warmup_signals:
+    logger.warning(f"⚠️ 预热信号 [{self.signal_counter}/{self.warmup_signals}]：仅记录，不执行交易")
+    await self._save_signal(signal)  # 只保存
+    return  # 🔒 不发送给交易引擎
+```
+
+**目的**：
+- 观察模型稳定性
+- 确保资金安全
+- 避免启动初期误操作
+
+### 4. 数据源分离原则
+
+- **模型训练**：Binance API（实时获取最新数据）
+- **信号生成**：WebSocket缓冲区（优先）→ Binance API（备用）
+- **数据库**：仅用于前端展示、历史查询、性能分析
+
+### 5. 无未来函数原则（关键）
+
+```python
+# ✅ 正确：只看下一根K线
+df['next_return'] = df['close'].shift(-1) / df['close'] - 1
+
+# ❌ 错误：看未来多根K线
+df['next_return'] = df['close'].shift(-5) / df['close'] - 1  # ❌
+
+# ✅ 正确：时间序列分割
+split_idx = int(len(X) * 0.8)
+X_train, X_val = X[:split_idx], X[split_idx:]
+
+# ❌ 错误：随机分割
+X_train, X_val = train_test_split(X, y, shuffle=True)  # ❌
+```
+
+### 6. 时区统一原则
+
+全系统使用 `Asia/Shanghai` 时区：
+```python
+import pytz
+from datetime import datetime
+
+shanghai_tz = pytz.timezone('Asia/Shanghai')
+
+# ✅ 正确
+now = datetime.now(shanghai_tz)
+ts = datetime.fromtimestamp(timestamp / 1000, tz=shanghai_tz)
+
+# ❌ 错误：naive datetime
+now = datetime.now()  # ❌ 没有时区信息
+```
+
+### 7. WebSocket订阅格式
+
+**必须使用小写交易对**：
+```python
+# ✅ 正确：小写
+stream_name = f"{symbol.lower()}@kline_{interval}"  # ethusdt@kline_15m
+
+# ❌ 错误：大写
+stream_name = f"{symbol}@kline_{interval}"  # ETHUSDT@kline_15m ❌
+```
+
+---
+
+## 🏗️ 关键配置参数
+
+### 标签阈值（已优化）
+
+```python
+# ✅ 当前生产配置（中频交易：灵敏策略）
+threshold_config = {
+    '15m': {
+        'up': 0.001,      # ±0.1% ← 中频交易：极度灵敏，HOLD<30%
+        'down': -0.001
+    },
+    '2h': {
+        'up': 0.0035,     # ±0.35% ← 中期辅助：HOLD<40%
+        'down': -0.0035
+    },
+    '4h': {
+        'up': 0.005,      # ±0.5% ← 长期确认：HOLD<45%
+        'down': -0.005
+    }
+}
+
+# 预期标签分布（中频交易）
+# 15m: SHORT 32-38%, HOLD 24-32%, LONG 32-38%  ← 灵敏
+# 2h:  SHORT 28-32%, HOLD 36-40%, LONG 28-32%  ← 平衡
+# 4h:  SHORT 26-30%, HOLD 42-46%, LONG 26-30%  ← 稳健
+
+# ❌ 过时配置（导致信号过少）
+# '15m': ±0.15% → HOLD 45% ❌ 对中频交易太保守
+# '15m': ±0.3%  → HOLD 74% ❌ 几乎无信号
+```
+
+### 时间框架权重
+
+```python
+# ✅ 短线策略权重分配
+timeframe_weights = {
+    '15m': 0.60,   # 主导：快速捕捉入场点
+    '2h': 0.25,    # 辅助：趋势过滤
+    '4h': 0.15     # 辅助：避免逆势交易
+}
+```
+
+---
+
+## 🎯 代码质量规范
+
+### 禁止冗余
+
+#### 文件级别
+- ❌ **禁止创建功能重复的文件**
+- ❌ **禁止创建冗余方法**（同一项目中存在功能相同的方法）
+- ❌ **验证完成之后需要删除验证文件，禁止保存冗余文件和方法函数**
+- ✅ 相似功能的模块必须合并或继承基类
+- ✅ 检查现有文件，避免重复造轮子
+- ✅ 超过 2 次使用的代码块必须提取为函数
+- 请注意：任何修改如果涉及了规则文件中的说明那么需要更新规则文件（始终保持规则文件最新。）
+- 检查修改后的代码，去除冗余代码
+- 检查数据的流转确保一致性
+- 检查代码是否没有报错通顺
+
+#### 公共方法管理
+- 公共方法统一放在 `backend/app/utils/` 或 `frontend/src/utils/`
+- 相同逻辑必须抽取为工具函数
+- 避免在多个文件中复制粘贴相同代码
+
+---
+
+### 解耦原则
+
+#### 单一职责
+```python
+# ✅ 正确：每个函数只做一件事
+def fetch_data():
+    """只负责获取数据"""
+    return data
+
+def process_data(data):
+    """只负责处理数据"""
+    return processed
+
+def save_data(data):
+    """只负责保存数据"""
+    db.save(data)
+```
+
+#### 依赖注入
+```python
+# ✅ 正确：通过构造函数注入依赖
+class SignalGenerator:
+    def __init__(self, ml_service: MLService, data_service: DataService):
+        self.ml_service = ml_service
+        self.data_service = data_service
+
+# ❌ 错误：直接导入具体实现
+class SignalGenerator:
+    def __init__(self):
+        from app.services.ml_service import ml_service
+        self.ml_service = ml_service
+```
+
+---
+
+## 💻 代码规范
+
+### Python代码规范
+
+```python
+# 1. 类型提示（必须）
+def predict(self, data: pd.DataFrame, timeframe: str) -> Dict[str, Any]:
+    ...
+
+# 2. 文档字符串（必须）
+def train_model(self) -> Dict[str, Any]:
+    """训练多时间框架模型
+    
+    Returns:
+        模型指标字典
+    """
+
+# 3. 错误处理（必须）
+try:
+    result = await some_operation()
+except Exception as e:
+    logger.error(f"操作失败: {e}")
+    return default_value
+
+# 4. 日志规范（使用emoji提高可读性）
+logger.info("✅ 成功信息")
+logger.warning("⚠️ 警告信息")
+logger.error("❌ 错误信息")
+logger.debug("🔍 调试信息")
+```
+
+### TypeScript/React代码规范
+
+```typescript
+// 1. 类型定义（必须）
+interface SignalData {
+  signalType: 'LONG' | 'SHORT' | 'HOLD';
+  confidence: number;
+  timestamp: string;
+}
+
+// 2. 函数组件（优先）
+const Dashboard: React.FC = () => {
+  return <div>Dashboard</div>;
+};
+
+// 3. 自定义Hook复用逻辑
+const useSignalData = () => {
+  const [signals, setSignals] = useState<SignalData[]>([]);
+  // ... 逻辑
+  return { signals, loading, error };
+};
+```
+
+---
+
+## 🚫 禁止事项
+
+### 代码层面
+```python
+# ❌ 禁止：未来函数
+df['label'] = df['close'].shift(-5)
+
+# ❌ 禁止：随机数据分割
+train_test_split(X, y, shuffle=True)
+
+# ❌ 禁止：所有时间框架共享模型
+self.model = single_model
+
+# ❌ 禁止：naive datetime
+datetime.now()  # 没有时区
+
+# ❌ 禁止：硬编码配置（应差异化）
+threshold = 0.005  # 所有时间框架使用相同值
+
+# ❌ 禁止：创建冗余文件和方法
+
+
+# ❌ 禁止：修改代码之后不做检查导致低级错误（需要保证修改之后代码没有语法错误）
+```
+
+### 操作层面
+```python
+# ❌ 禁止：在训练/预测中依赖数据库
+data = await postgresql_manager.query_klines()  # ❌
+
+# ❌ 禁止：没有错误处理的关键操作
+result = critical_api_call()  # ❌ 可能崩溃
+
+# ❌ 禁止：循环依赖
+# ServiceA imports ServiceB, ServiceB imports ServiceA  # ❌
+
+# ❌ 禁止：WebSocket订阅使用大写交易对
+subscribe("ETHUSDT@kline_15m")  # ❌ 应该用小写
+```
+
+---
+
+## ✅ 最佳实践
+
+### 1. 配置集中化
+
+```python
+# ✅ 差异化配置
+prediction_days_config = {
+    '15m': 15,   # 快速响应
+    '2h': 20,    # 中期平衡
+    '4h': 35     # 长期稳定
+}
+
+# ✅ 魔法数字常量化
+BUFFER_DAYS = 60
+WARMUP_SIGNALS = 5  # 预热信号数量
+MIN_SIGNAL_INTERVAL = 900
+```
+
+### 2. 组合优于继承
+
+```python
+# ✅ 正确：使用组合
+class TradingEngine:
+    def __init__(self, signal_generator, risk_manager):
+        self.signal_generator = signal_generator
+        self.risk_manager = risk_manager
+
+# ⚠️ 谨慎：继承（仅在明确的 is-a 关系时使用）
+class AdvancedTrader(BaseTrader):
+    pass
+```
+
+### 3. 日志最佳实践
+
+```python
+# ✅ 关键流程必须记录
+logger.info("🚀 开始模型训练...")
+logger.info(f"📊 {timeframe} 数据获取成功: {len(df)}条")
+
+# ✅ 信号生成全链路追踪
+logger.info(f"📥 收到WebSocket K线: {symbol} {interval}")
+logger.info(f"🎯 {timeframe} K线完成，开始预测该时间框架...")
+logger.info(f"✅ {timeframe} 预测完成并缓存: {signal_type}")
+logger.info(f"🔄 15m信号更新，触发合成")
+
+# ✅ 预热信号标注清晰
+logger.warning(f"⚠️ 预热信号 [{count}/{warmup}]：仅记录，不执行交易")
+```
+
+---
+
+## 📚 项目结构
+
+```
+backend/
+├── app/
+│   ├── core/          # 核心配置（database, config, cache）
+│   ├── services/      # 业务服务（ml, trading, signal等）
+│   ├── api/           # API接口
+│   ├── models/        # 数据模型
+│   └── utils/         # 公共工具函数 ⭐
+├── models/            # 训练好的模型文件（.pkl）
+├── logs/              # 日志文件
+└── main.py            # 启动入口
+
+frontend/
+├── src/
+│   ├── components/    # UI组件
+│   ├── services/      # API服务和业务逻辑
+│   ├── contexts/      # 全局状态
+│   ├── utils/         # 公共工具函数 ⭐
+│   └── App.tsx
+```
+
+---
+
+## 🔄 开发流程
+
+### 添加新功能前
+
+1. **检查现有代码**：是否已有类似功能？
+2. **评估复用性**：能否扩展现有方法而非新建？
+3. **规划解耦**：新功能如何与现有系统集成？
+4. **确定位置**：放在哪个模块/服务最合适？
+
+### 代码审查要点
+
+- [ ] 是否有冗余代码？
+- [ ] 是否有重复方法？
+- [ ] 职责是否单一？
+- [ ] 依赖是否注入？
+- [ ] 是否有类型提示？
+- [ ] 是否有错误处理？
+- [ ] 是否有适当注释？
+- [ ] 日志是否完整可追踪？
+
+---
+
+## 🎓 设计哲学
+
+1. **独立性** - 每个时间框架完全独立
+2. **差异化** - 根据特性使用不同配置
+3. **实时性** - WebSocket优先，缓冲区加速
+4. **可靠性** - 多层容错，优雅降级
+5. **可维护性** - 清晰架构，详细日志
+6. **无冗余** - 一个功能，一个实现 ⭐
+7. **高内聚低耦合** - 模块独立，接口清晰 ⭐
+8. **安全第一** - 预热保护，资金安全 🆕
+
+---
+
+---
+
+## 🏛️ 服务模块职责矩阵
+
+| 服务模块 | 核心职责 | 不应该做 |
+|---------|---------|----------|
+| **SignalGenerator** | 信号生成、缓存、合成、预热保护 | ❌ 计算仓位（委托给 position_manager） |
+| **TradingEngine** | 执行交易、虚拟/实盘切换、订单管理 | ❌ 生成信号、计算仓位 |
+| **PositionManager** | 🎯 仓位计算（唯一）、查询持仓、设置杠杆 | ❌ 管理本地持仓状态 |
+| **RiskService** | 计算风险指标、生成报告 | ❌ 阻止交易（仅供展示） |
+| **MLService** | 模型训练、预测、特征工程 | ❌ 访问数据库（用 API） |
+| **DataService** | WebSocket 数据流、缓冲区管理 | ❌ 模型训练 |
+| **Scheduler** | 定时任务调度（训练、更新、检查） | ❌ 重置预热状态 |
+| **TradingController** | 系统启停、信号路由、会话管理 | ❌ 直接交易执行 |
+
+---
+
+## 🎯 虚拟交易 vs 实盘交易
+
+### 交易模式配置
+
+```python
+# config.py - 单一配置源
+TRADING_MODE: str = "SIGNAL_ONLY"  # ✅ 唯一字段，控制所有行为
+```
+
+### 两种模式对比
+
+| 特性 | SIGNAL_ONLY（默认） | AUTO |
+|------|---------------------|------|
+| **配置** | `TRADING_MODE="SIGNAL_ONLY"` | `TRADING_MODE="AUTO"` |
+| **余额来源** | 虚拟（10000 USDT） | Binance API 实盘 |
+| **订单类型** | 虚拟订单（数据库） | 真实订单（Binance） |
+| **手续费** | 模拟（开仓0.02%+平仓0.05%） | 真实扣除 |
+| **风险** | ✅ 无风险，测试策略 | ⚠️ 真实资金风险 |
+| **切换方式** | API 动态切换，无需重启 | API 动态切换，无需重启 |
+| **持久化** | Redis: `system:trading_mode` | Redis: `system:trading_mode` |
+
+### 仓位计算逻辑
+
+```python
+# position_manager.py - 统一的仓位计算
+async def calculate_position_size(
+    symbol, signal_type, confidence, current_price,
+    is_virtual: bool = True  # 根据交易模式动态传入
+):
+    if is_virtual:
+        # SIGNAL_ONLY 模式
+        available_balance = VIRTUAL_ACCOUNT_BALANCE  # 10000 USDT
+    else:
+        # AUTO 模式
+        account_info = binance_client.get_account_info()
+        available_balance = float(account_info['availableBalance'])
+    
+    # 统一的计算逻辑
+    position_ratio = 0.1 * confidence  # 基础10% × 置信度
+    position_value = available_balance * position_ratio * leverage
+    position_size = position_value / current_price
+    return position_size
+```
+
+### 虚拟订单手续费
+
+```python
+# trading_engine.py
+VIRTUAL_OPEN_FEE_RATE = 0.0002   # 开仓 0.02% (Maker)
+VIRTUAL_CLOSE_FEE_RATE = 0.0005  # 平仓 0.05% (Taker)
+
+# 净盈亏计算
+price_pnl = (exit_price - entry_price) * quantity  # 价差
+open_fee = entry_price * quantity * 0.0002
+close_fee = exit_price * quantity * 0.0005
+net_pnl = price_pnl - open_fee - close_fee  # ✅ 扣除双边手续费
+```
+
+### 模式切换流程
+
+```python
+# 1. 通过 API 切换（推荐）
+POST /api/trading/mode
+{"mode": "SIGNAL_ONLY"}  或  {"mode": "AUTO"}
+
+# 2. 内部同步
+trading_engine.set_trading_mode(mode)
+    ↓
+Redis["system:trading_mode"] = "SIGNAL_ONLY"  # 同步到 Redis
+    ↓
+signal_generator 从 Redis 读取
+    ↓
+position_manager(is_virtual=True/False)  # 动态决定余额来源
+```
+
+---
+
+## 🗄️ 缓存策略与 Redis 键规范
+
+### 通用缓存方法
+
+```python
+# cache.py - 基础方法
+await cache_manager.get(key)              # 智能反序列化（JSON/字符串）
+await cache_manager.set(key, value, expire=None)  # 智能序列化，支持永久缓存
+```
+
+### Redis 键命名规范
+
+| 键模式 | 用途 | 过期时间 | 示例 |
+|--------|------|----------|------|
+| `system:*` | 系统配置 | ❌ 永久 | `system:trading_mode` |
+| `warmup:*` | 预热状态 | ❌ 永久 | `warmup:signal_counter:ETHUSDT` |
+| `signal:*` | 交易信号 | ❌ 永久（去重用） | `signal:last:ETHUSDT` |
+| `market_data:*` | 市场数据 | ✅ 60秒 | `market_data:ETHUSDT:15m` |
+| `prediction:*` | 模型预测 | ✅ 300秒 | `prediction:ETHUSDT` |
+| `account_info` | 账户信息 | ✅ 30秒 | `account_info` |
+| `position_info` | 持仓信息 | ✅ 30秒 | `position_info` |
+
+### 缓存设计原则
+
+```python
+# ✅ 关键状态永久缓存
+await cache_manager.set("system:trading_mode", mode, expire=None)
+await cache_manager.set("warmup:signal_counter:ETHUSDT", count, expire=None)
+
+# ✅ 临时数据设置过期
+await cache_manager.set("market_data:ETHUSDT:15m", data, expire=60)
+
+# ✅ 处理 None 值
+await cache_manager.set(key, None, expire=None)  # 自动跳过，不报错
+```
+
+### 常见错误处理
+
+```python
+# ❌ 错误：expire=None 导致 setex 失败
+await redis.client.setex(key, None, value)  # Invalid input type: NoneType
+
+# ✅ 正确：区分永久和临时缓存
+if expire is None:
+    await redis.client.set(key, value)  # 永久
+else:
+    await redis.client.setex(key, expire, value)  # 临时
+```
+
+---
+
+## 🔄 数据流与状态同步
+
+### 预热状态持久化
+
+```python
+# ✅ 启动时加载
+async def _load_warmup_state(self):
+    cached_counter = await cache_manager.get(f"warmup:signal_counter:{settings.SYMBOL}")
+    if cached_counter is not None:
+        self.signal_counter = int(cached_counter)
+        logger.info(f"📂 已加载预热状态: {self.signal_counter}/5")
+    else:
+        logger.info(f"📂 首次部署，初始化预热状态: 0/5")
+
+# ✅ 每次计数后保存
+self.signal_counter += 1
+await self._save_warmup_state()  # 立即持久化
+
+# ❌ 错误：定期训练重置预热状态
+# 训练完成后不应该触发 _initial_predictions()
+```
+
+### 交易模式同步
+
+```python
+# ✅ 启动时同步到 Redis
+async def start(self):
+    await self._sync_trading_mode_to_cache()
+
+# ✅ 切换时立即同步
+async def set_trading_mode(self, mode):
+    self.trading_mode = mode
+    await self._sync_trading_mode_to_cache()  # 同步到 Redis
+
+# ✅ 其他模块动态读取
+current_mode = await cache_manager.get("system:trading_mode")
+is_virtual = (current_mode != "AUTO")
+```
+
+---
+
+## 🐛 常见错误模式与修复
+
+### 错误1：datetime 序列化
+
+```python
+# ❌ 错误：直接存储 datetime
+predictions = {
+    '15m': {'timestamp': datetime.now()}  # ❌ JSON 不支持
+}
+await postgresql_manager.write_signal_data({'predictions': predictions})
+# Error: Object of type datetime is not JSON serializable
+
+# ✅ 正确：转换为 ISO 字符串
+for tf, pred in predictions.items():
+    if 'timestamp' in pred and hasattr(pred['timestamp'], 'isoformat'):
+        pred['timestamp'] = pred['timestamp'].isoformat()
+```
+
+### 错误2：CacheManager 缺少方法
+
+```python
+# ❌ 错误：调用不存在的方法
+await cache_manager.get(key)  # AttributeError: no attribute 'get'
+await cache_manager.set(key, value)  # AttributeError: no attribute 'set'
+
+# ✅ 正确：必须实现通用 get/set 方法
+class CacheManager:
+    async def get(self, key: str) -> Optional[Any]:
+        # 通用获取，自动 JSON 反序列化
+        
+    async def set(self, key: str, value: Any, expire: Optional[int] = None):
+        # 通用设置，支持永久缓存（expire=None）
+```
+
+### 错误3：None 值缓存
+
+```python
+# ❌ 错误：Redis 不接受 None
+await cache_manager.set(key, None, expire=None)
+# Error: Invalid input of type: 'NoneType'
+
+# ✅ 正确：检查并跳过
+if value is None:
+    logger.debug(f"跳过设置缓存（值为None）")
+    return
+```
+
+### 错误4：虚拟模式查询实盘余额
+
+```python
+# ❌ 错误：SIGNAL_ONLY 模式查询实盘账户
+account_info = binance_client.get_account_info()  # 返回 0 USDT
+if available_balance <= 0:
+    logger.warning("可用余额不足")  # 反复报错
+
+# ✅ 正确：根据模式选择余额
+if is_virtual:
+    available_balance = 10000.0  # 虚拟余额
+else:
+    account_info = binance_client.get_account_info()
+    available_balance = float(account_info['availableBalance'])
+```
+
+### 错误5：WebSocket 错误不重连
+
+```python
+# ❌ 错误：只在 _on_close 触发重连
+def _on_error(self, ws, error):
+    logger.error(f"错误: {error}")  # 只记录，不重连
+
+# ✅ 正确：error 也触发重连
+def _on_error(self, ws, error):
+    self.is_connected = False
+    if self.is_running and not self.is_reconnecting:
+        self.is_reconnecting = True  # 🔒 防重复
+        asyncio.run_coroutine_threadsafe(self._reconnect(), self.loop)
+```
+
+### 错误6：代码重复
+
+```python
+# ❌ 错误：同一功能写两遍
+# signal_generator.py
+async def _calculate_position_size(...):
+    position_ratio = 0.1 * confidence
+    ...
+
+# position_manager.py
+async def calculate_position_size(...):
+    position_ratio = 0.1 * confidence
+    ...  # 完全相同的逻辑
+
+# ✅ 正确：统一使用 position_manager
+from app.services.position_manager import position_manager
+position_size = await position_manager.calculate_position_size(...)
+```
+
+---
+
+## 📊 配置管理最佳实践
+
+### 单一配置源原则
+
+```python
+# ✅ 正确：只用一个字段控制
+TRADING_MODE: str = "SIGNAL_ONLY"
+
+# ❌ 错误：冗余字段
+TRADING_MODE: str = "SIGNAL_ONLY"
+AUTO_TRADING_ENABLED: bool = False  # ❌ 可以从 TRADING_MODE 推导
+```
+
+### 配置读取顺序
+
+```
+1. config.py（默认值）
+   ↓
+2. .env 文件（覆盖）
+   ↓
+3. Redis 运行时状态（动态切换）
+   ↓
+4. API 调用（即时生效）
+```
+
+### 差异化配置示例
+
+```python
+# ✅ 正确：根据时间框架特性配置
+threshold_config = {
+    '15m': {'up': 0.001, 'down': -0.001},   # 短线灵敏
+    '2h': {'up': 0.0035, 'down': -0.0035},  # 中期平衡
+    '4h': {'up': 0.005, 'down': -0.005}     # 长期稳健
+}
+
+training_days_config = {
+    '15m': 180,  # 短期数据充足
+    '2h': 360,   # 中期需要更多
+    '4h': 540    # 长期需要最多
+}
+
+# ❌ 错误：所有时间框架用相同配置
+threshold = 0.005  # 不合理，应差异化
+```
+
+---
+
+## 🔧 常量命名规范
+
+```python
+# 虚拟交易常量（大写，模块级）
+VIRTUAL_ACCOUNT_BALANCE = 10000.0
+VIRTUAL_OPEN_FEE_RATE = 0.0002
+VIRTUAL_CLOSE_FEE_RATE = 0.0005
+
+# 系统常量
+BUFFER_DAYS = 60
+WARMUP_SIGNALS = 5
+MIN_SIGNAL_INTERVAL = 900
+
+# ❌ 禁止：魔法数字
+position_value = balance * 0.1  # ❌ 0.1 是什么？
+# ✅ 应该：
+BASE_POSITION_RATIO = 0.1  # 基础10%仓位
+position_value = balance * BASE_POSITION_RATIO
+```
+
+---
+
+## 🔄 异步编程最佳实践
+
+### 正确的异步调用
+
+```python
+# ✅ I/O 操作必须异步
+async def fetch_data(symbol: str):
+    return await binance_client.get_klines(symbol)
+
+# ✅ CPU 密集型可以同步
+def train_model(X, y):
+    model = lgb.train(params, train_set)
+    return model
+
+# ❌ 错误：同步 I/O 阻塞
+def fetch_data(symbol: str):
+    return requests.get(url)  # ❌ 阻塞事件循环
+```
+
+### 跨线程调用
+
+```python
+# ✅ 正确：WebSocket 回调（子线程）调用主事件循环
+def _on_close(self, ws):
+    if self.loop:
+        future = asyncio.run_coroutine_threadsafe(
+            self._reconnect(), 
+            self.loop  # 提交到主事件循环
+        )
+        self.reconnect_task = future  # 保存 future 防止 GC
+
+# ❌ 错误：直接调用 async 函数
+def _on_close(self, ws):
+    await self._reconnect()  # ❌ 同步函数不能 await
+```
+
+---
+
+## 🚫 本次会话修复的错误（记录）
+
+### 修复清单
+
+1. ✅ 置信度过滤日志不显示 → 改为 INFO 级别
+2. ✅ 预热状态不持久化 → 添加 Redis 持久化
+3. ✅ 定期训练重置预热 → 删除训练后触发预测
+4. ✅ CacheManager 缺 get/set → 添加通用方法
+5. ✅ None 值序列化错误 → 添加 None 处理
+6. ✅ datetime 序列化错误 → 转换为 ISO 字符串
+7. ✅ 虚拟模式余额不足 → 添加虚拟余额支持（10000）
+8. ✅ 虚拟订单无手续费 → 添加 0.02%/0.05%
+9. ✅ 交易模式配置冗余 → 删除 AUTO_TRADING_ENABLED
+10. ✅ 代码重复（仓位计算） → 统一到 position_manager
+11. ✅ WebSocket 错误不重连 → _on_error 触发重连
+12. ✅ 重复重连风险 → 添加 is_reconnecting 锁
+13. ✅ 重连失败不再尝试 → 失败后再次调度
+
+---
+
+## 🎯 架构设计原则（更新）
+
+### 1. 单一职责原则（SRP）
+- 每个服务模块只负责一件事
+- 仓位计算**只在** position_manager
+- 信号生成**只在** signal_generator
+- 交易执行**只在** trading_engine
+
+### 2. 依赖注入原则（DI）
+- 通过构造函数传递依赖
+- 避免在类内部直接导入全局实例
+- 便于测试和解耦
+
+### 3. 配置集中化
+- 所有配置在 config.py
+- 单一数据源，避免冗余
+- 支持 .env 文件覆盖
+
+### 4. 状态持久化
+- 关键状态存储到 Redis（预热、交易模式）
+- 重启后恢复，避免中断
+- 支持动态切换，无需重启
+
+### 5. 错误优雅降级
+- WebSocket 断开 → 自动重连
+- 缓存失败 → 降级到 API
+- 模型未训练 → 等待训练完成
+
+---
+
+## 🚀 系统优化规范
+
+### 1. 性能优化原则
+
+**关键指标**：
+- 模型准确率：**基本要求 ≥50%**，目标 ≥55%（当前34.59%）
+- 实际信号准确率：基本要求 ≥50%，目标 ≥55%
+- 预测延迟：目标 <1秒
+- 系统稳定性：目标 99.9%
+
+**性能基准**（三分类）：
+- 随机猜测: 33.3%
+- 基本可用: **50%** ← 最低要求
+- 良好: 55%
+- 优秀: 60%+
+
+### 2. 优化优先级
+
+**立即执行** ⭐⭐⭐：
+- 标签阈值配置修复（15m: ±0.1%, 2h: ±0.35%, 4h: ±0.5%）
+- 置信度阈值调整（0.44 → 0.40）
+- 样本加权训练（解决类别不平衡）
+- 动态仓位管理（根据市场状态调整）
+- 动态止损止盈（基于ATR）
+
+**短期优化** ⭐⭐（1-2周）：
+- 市场微观结构特征（买卖压力、K线形态）
+- 模型集成（LightGBM + XGBoost + CatBoost）
+- 市场情绪特征（恐慌指数、连续涨跌）
+- 信号增强过滤（趋势一致性、量能确认）
+- 回撤保护机制（分级保护）
+
+**中期优化** ⭐（1-2月）：
+- 多时间框架特征融合（长周期趋势融入短周期）
+- 动态标签阈值（根据波动率调整）
+- 超参数自动优化（Optuna）
+- 特征缓存机制（避免重复计算）
+- 实时性能监控
+
+**长期探索**：
+- 多目标标签（方向+幅度+持续时间）
+- 强化学习
+- A/B测试框架
+- 增量特征计算
+
+### 3. 特征工程规范
+
+**禁止事项**：
+- ❌ 添加未来函数（使用未来数据）
+- ❌ 过度拟合（特征数>样本数/10）
+- ❌ 重复特征（相关系数>0.95）
+- ❌ 忽略异常值处理
+
+**最佳实践**：
+- ✅ 特征标准化/归一化
+- ✅ 移除高缺失率特征（>20%）
+- ✅ 特征重要性分析（保留Top 50）
+- ✅ 交叉验证防止过拟合
+- ✅ 增量计算提升效率
+
+### 4. 模型训练规范
+
+**差异化配置**（必须遵守）：
+```python
+# 标签阈值（关键配置）
+'15m': ±0.1%  (0.001)   # 目标HOLD 24-32%
+'2h': ±0.35% (0.0035)  # 目标HOLD 36-40%
+'4h': ±0.5%  (0.005)   # 目标HOLD 42-46%
+
+# 训练天数
+'15m': 180天  # 短期数据充足
+'2h': 270天   # 中期需要更多
+'4h': 360天   # 长期需要最多
+
+# 模型复杂度
+'15m': num_leaves=127  # 数据多，模型复杂
+'2h': num_leaves=63    # 中等
+'4h': num_leaves=47    # 数据少，模型简单
+```
+
+**样本权重策略**：
+```python
+# 1. 类别权重（解决不平衡）
+class_weights = compute_sample_weight('balanced', y_train)
+
+# 2. 时间衰减权重（重视最近数据）
+time_decay = np.exp(-np.arange(len(X)) / (len(X) * 0.1))[::-1]
+
+# 3. 组合权重
+sample_weights = class_weights * time_decay
+```
+
+### 5. 风险管理规范
+
+**动态仓位计算**：
+```python
+# 基础仓位
+base_ratio = 0.1 * confidence  # 最高10%
+
+# 调整因子
+volatility_adj = f(市场波动率)     # 0.5-1.5
+exposure_adj = f(当前持仓)         # 0.5-1.0
+loss_adj = f(连续亏损次数)         # 0.5-1.0
+
+# 最终仓位
+position_ratio = base_ratio * volatility_adj * exposure_adj * loss_adj
+position_ratio = clip(position_ratio, 0.02, 0.15)  # 限制2%-15%
+```
+
+**回撤保护**（强制执行）：
+```python
+# 分级保护
+if drawdown > 15%: 暂停交易
+elif drawdown > 10%: 仓位降至50%
+elif drawdown > 5%: 仓位降至75%
+
+# 恢复条件
+if drawdown < 3%: 恢复正常交易
+```
+
+### 6. 系统性能规范
+
+**响应时间要求**：
+- 特征计算：<500ms
+- 模型预测：<200ms
+- 信号生成：<1000ms
+- 订单执行：<2000ms
+
+**优化策略**：
+- 特征缓存（最近100个）
+- 增量计算（只计算新K线）
+- GPU加速（如果可用）
+- 异步并发（I/O操作）
+
+### 7. 监控指标
+
+**必须监控**：
+- 模型准确率（每次训练后）
+- 实际信号准确率（实时更新）
+- 胜率（7日/30日）
+- 盈亏比（7日/30日）
+- 最大回撤（实时）
+- 夏普比率（30日）
+- 信号数量（日均）
+- 系统延迟（p99）
+
+**告警阈值**：
+```python
+if win_rate < 45%: 发送告警
+if drawdown > 10%: 紧急告警
+if accuracy < 40%: 模型需重训
+if latency_p99 > 3s: 性能告警
+```
+
+### 8. 优化文档规范
+
+**必须文档化**：
+- 每次优化的目标、方法、结果
+- A/B测试对比数据
+- 参数调整前后对比
+- 失败的尝试和原因
+
+**文档位置**：
+- 总体规划：`OPTIMIZATION_ROADMAP.md`
+- 实施记录：`docs/optimization/`
+- 性能报告：`docs/performance/`
+
+### 9. 代码质量规范
+
+**优化相关代码必须**：
+- 添加详细注释（说明优化目的）
+- 包含性能测试（before/after）
+- 可配置开关（便于对比）
+- 向后兼容（不破坏现有功能）
+
+**示例**：
+```python
+# ✅ 好的优化代码
+def create_features_cached(self, df: pd.DataFrame) -> pd.DataFrame:
+    """
+    创建特征（带缓存优化）
+    
+    优化目标：减少重复计算，提升响应速度50%+
+    
+    Args:
+        df: 原始K线数据
+    
+    Returns:
+        带特征的DataFrame
+    
+    Performance:
+        Before: ~800ms
+        After:  ~300ms (缓存命中时)
+    """
+    # ... 实现
+```
+
+### 10. 测试规范
+
+**优化必须测试**：
+- 单元测试（新增功能）
+- 性能测试（before/after对比）
+- 回测验证（历史数据）
+- 压力测试（极端情况）
+
+**测试通过标准**：
+- 准确率提升 ≥2%（或其他目标指标）
+- 无性能退化（延迟不增加）
+- 无功能破坏（现有功能正常）
+- 代码覆盖率 ≥80%
+
+---
+
+## 📚 参考文档
+
+- **优化路线图**：`OPTIMIZATION_ROADMAP.md`（完整优化计划）
+- **后端规则**：`.cursor/rules/backend.mdc`
+- **前端规则**：`.cursor/rules/frontend.mdc`
+- **部署文档**：`DEPLOYMENT.md`
+- **项目总结**：`PROJECT_SUMMARY.md`
+
+---
+
+**版本**: v6.0  
+**更新日期**: 2025-10-16  
+**更新内容**: 
+- 添加系统优化规范章节
+- 完善特征工程、模型训练、风险管理规范
+- 添加性能要求和监控指标
+- 添加优化文档和测试规范
+- 创建独立优化路线图文档（OPTIMIZATION_ROADMAP.md）
+- 修复标签阈值配置错误
+- 调整置信度阈值为0.40
+**适用范围**: 全项目（前端+后端）

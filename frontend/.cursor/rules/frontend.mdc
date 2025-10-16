@@ -1,0 +1,680 @@
+---
+description: 前端开发规则 - React/TypeScript
+globs:
+  - "frontend/**/*.ts"
+  - "frontend/**/*.tsx"
+alwaysApply: true
+---
+
+# 前端开发规则
+
+## ⚛️ React/TypeScript规范
+
+### 组件设计原则
+
+```typescript
+// ✅ 推荐：函数组件 + TypeScript
+interface DashboardProps {
+  symbol: string;
+  onRefresh?: () => void;
+}
+
+const Dashboard: React.FC<DashboardProps> = ({ symbol, onRefresh }) => {
+  const [loading, setLoading] = useState(false);
+  
+  return (
+    <div className="dashboard">
+      {/* UI */}
+    </div>
+  );
+};
+
+// ❌ 避免：类组件（除非必要）
+class Dashboard extends React.Component<DashboardProps> {
+  // 不推荐新代码使用
+}
+```
+
+### 自定义Hook复用逻辑
+
+```typescript
+// ✅ 正确：抽取复用逻辑到自定义Hook
+const useSignalData = (symbol: string) => {
+  const [signals, setSignals] = useState<TradingSignal[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  
+  useEffect(() => {
+    fetchSignals(symbol)
+      .then(setSignals)
+      .catch(err => setError(err.message))
+      .finally(() => setLoading(false));
+  }, [symbol]);
+  
+  return { signals, loading, error };
+};
+
+// 使用
+const Dashboard: React.FC = () => {
+  const { signals, loading, error } = useSignalData('ETHUSDT');
+  
+  if (loading) return <Spinner />;
+  if (error) return <Error message={error} />;
+  
+  return <SignalList signals={signals} />;
+};
+
+// ❌ 错误：在组件中重复相同逻辑
+const Dashboard: React.FC = () => {
+  const [signals, setSignals] = useState<TradingSignal[]>([]);
+  // ... 重复的获取逻辑
+};
+
+const Signals: React.FC = () => {
+  const [signals, setSignals] = useState<TradingSignal[]>([]);
+  // ... 相同的获取逻辑  // ❌ 应该抽取为Hook
+};
+```
+
+---
+
+## 📁 项目结构
+
+```
+frontend/src/
+├── components/
+│   ├── Dashboard/        # 仪表盘相关组件
+│   ├── Layout/           # 布局组件
+│   └── Pages/            # 页面组件
+├── contexts/
+│   ├── DataContext.tsx   # 数据上下文
+│   └── WebSocketContext.tsx  # WebSocket上下文
+├── services/
+│   ├── api.ts            # API调用封装
+│   └── websocket.ts      # WebSocket管理
+├── utils/                # 公共工具函数 ⭐
+│   ├── formatters.ts     # 格式化工具
+│   ├── validators.ts     # 验证工具
+│   └── helpers.ts        # 通用辅助函数
+├── types/                # TypeScript类型定义
+│   └── index.ts
+├── hooks/                # 自定义Hooks
+│   ├── useSignalData.ts
+│   └── useWebSocket.ts
+└── App.tsx
+```
+
+---
+
+## 🎯 代码质量规范
+
+### 禁止冗余
+
+```typescript
+// ❌ 错误：重复的格式化函数
+// 文件: components/Dashboard/AccountSummary.tsx
+const formatPrice = (price: number) => `$${price.toFixed(2)}`;
+
+// 文件: components/Dashboard/PositionsSummary.tsx
+const formatPrice = (price: number) => `$${price.toFixed(2)}`;  // ❌ 重复
+
+// ✅ 正确：抽取到utils
+// 文件: utils/formatters.ts
+export const formatPrice = (price: number): string => {
+  return `$${price.toFixed(2)}`;
+};
+
+// 使用
+import { formatPrice } from '@/utils/formatters';
+```
+
+### 单一职责
+
+```typescript
+// ✅ 正确：职责分离
+// 数据获取逻辑
+const fetchSignals = async (symbol: string): Promise<TradingSignal[]> => {
+  const response = await fetch(`/api/signals/${symbol}`);
+  return response.json();
+};
+
+// UI展示逻辑
+const SignalList: React.FC<{ signals: TradingSignal[] }> = ({ signals }) => {
+  return (
+    <ul>
+      {signals.map(signal => (
+        <li key={signal.id}>{signal.type}</li>
+      ))}
+    </ul>
+  );
+};
+
+// ❌ 错误：混合职责
+const SignalList: React.FC = () => {
+  const [signals, setSignals] = useState<TradingSignal[]>([]);
+  
+  // 数据获取 + UI渲染混在一起  // ❌
+  useEffect(() => {
+    fetch('/api/signals')
+      .then(res => res.json())
+      .then(setSignals);
+  }, []);
+  
+  return <ul>{/* UI */}</ul>;
+};
+```
+
+---
+
+## 🔌 API调用规范
+
+### 统一API封装
+
+```typescript
+// ✅ 正确：统一的API服务
+// 文件: services/api.ts
+import axios, { AxiosInstance } from 'axios';
+
+class ApiService {
+  private client: AxiosInstance;
+  
+  constructor() {
+    this.client = axios.create({
+      baseURL: import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000',
+      timeout: 10000,
+    });
+    
+    // 拦截器
+    this.client.interceptors.response.use(
+      response => response.data,
+      error => {
+        console.error('API Error:', error);
+        throw error;
+      }
+    );
+  }
+  
+  // 获取信号
+  async getSignals(symbol: string): Promise<TradingSignal[]> {
+    return this.client.get(`/api/signals/${symbol}`);
+  }
+  
+  // 获取持仓
+  async getPositions(): Promise<Position[]> {
+    return this.client.get('/api/positions');
+  }
+  
+  // 获取账户信息
+  async getAccount(): Promise<AccountInfo> {
+    return this.client.get('/api/account');
+  }
+}
+
+export const apiService = new ApiService();
+
+// ❌ 错误：在组件中直接调用
+const Dashboard: React.FC = () => {
+  useEffect(() => {
+    fetch('http://localhost:8000/api/signals')  // ❌ 硬编码URL
+      .then(res => res.json())
+      .then(setSignals);
+  }, []);
+};
+```
+
+### 错误处理
+
+```typescript
+// ✅ 正确：完善的错误处理
+const useSignalData = (symbol: string) => {
+  const [signals, setSignals] = useState<TradingSignal[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+  
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        setLoading(true);
+        setError(null);
+        const data = await apiService.getSignals(symbol);
+        setSignals(data);
+      } catch (err) {
+        setError(err instanceof Error ? err : new Error('Unknown error'));
+        console.error('Failed to fetch signals:', err);
+      } finally {
+        setLoading(false);
+      }
+    };
+    
+    fetchData();
+  }, [symbol]);
+  
+  return { signals, loading, error };
+};
+
+// ❌ 错误：没有错误处理
+const useSignalData = (symbol: string) => {
+  const [signals, setSignals] = useState<TradingSignal[]>([]);
+  
+  useEffect(() => {
+    apiService.getSignals(symbol).then(setSignals);  // ❌ 没有catch
+  }, [symbol]);
+  
+  return { signals };
+};
+```
+
+---
+
+## 🌐 WebSocket规范
+
+### WebSocket管理
+
+```typescript
+// ✅ 正确：统一的WebSocket管理
+// 文件: services/websocket.ts
+class WebSocketService {
+  private ws: WebSocket | null = null;
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 5;
+  
+  connect(url: string, onMessage: (data: any) => void) {
+    this.ws = new WebSocket(url);
+    
+    this.ws.onopen = () => {
+      console.log('✅ WebSocket连接成功');
+      this.reconnectAttempts = 0;
+    };
+    
+    this.ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      onMessage(data);
+    };
+    
+    this.ws.onerror = (error) => {
+      console.error('❌ WebSocket错误:', error);
+    };
+    
+    this.ws.onclose = () => {
+      console.log('WebSocket连接关闭');
+      this.reconnect(url, onMessage);
+    };
+  }
+  
+  private reconnect(url: string, onMessage: (data: any) => void) {
+    if (this.reconnectAttempts < this.maxReconnectAttempts) {
+      this.reconnectAttempts++;
+      console.log(`尝试重连 (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+      setTimeout(() => this.connect(url, onMessage), 3000);
+    }
+  }
+  
+  disconnect() {
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+  }
+}
+
+export const wsService = new WebSocketService();
+```
+
+### Context集成
+
+```typescript
+// ✅ 正确：使用Context管理WebSocket状态
+// 文件: contexts/WebSocketContext.tsx
+interface WebSocketContextType {
+  isConnected: boolean;
+  latestSignal: TradingSignal | null;
+  latestPrice: number | null;
+}
+
+export const WebSocketContext = createContext<WebSocketContextType | null>(null);
+
+export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [isConnected, setIsConnected] = useState(false);
+  const [latestSignal, setLatestSignal] = useState<TradingSignal | null>(null);
+  const [latestPrice, setLatestPrice] = useState<number | null>(null);
+  
+  useEffect(() => {
+    const wsUrl = 'ws://localhost:8000/ws';
+    
+    wsService.connect(wsUrl, (data) => {
+      if (data.type === 'signal') {
+        setLatestSignal(data.signal);
+      } else if (data.type === 'price') {
+        setLatestPrice(data.price);
+      }
+    });
+    
+    setIsConnected(true);
+    
+    return () => {
+      wsService.disconnect();
+      setIsConnected(false);
+    };
+  }, []);
+  
+  return (
+    <WebSocketContext.Provider value={{ isConnected, latestSignal, latestPrice }}>
+      {children}
+    </WebSocketContext.Provider>
+  );
+};
+
+// 自定义Hook
+export const useWebSocket = () => {
+  const context = useContext(WebSocketContext);
+  if (!context) {
+    throw new Error('useWebSocket must be used within WebSocketProvider');
+  }
+  return context;
+};
+```
+
+---
+
+## 🎨 UI组件规范
+
+### 组件拆分
+
+```typescript
+// ✅ 正确：小而专注的组件
+// 文件: components/Dashboard/SignalCard.tsx
+interface SignalCardProps {
+  signal: TradingSignal;
+  isWarmup?: boolean;  // 🆕 是否为预热信号
+}
+
+const SignalCard: React.FC<SignalCardProps> = ({ signal, isWarmup }) => {
+  const signalColor = {
+    'LONG': 'text-green-500',
+    'SHORT': 'text-red-500',
+    'HOLD': 'text-gray-500'
+  }[signal.type];
+  
+  return (
+    <div className="signal-card">
+      {isWarmup && <span className="text-yellow-500">⚠️ 预热</span>}
+      <span className={signalColor}>{signal.type}</span>
+      <span>置信度: {(signal.confidence * 100).toFixed(1)}%</span>
+      <span>{formatTimestamp(signal.timestamp)}</span>
+    </div>
+  );
+};
+
+// ✅ 组合使用
+const SignalList: React.FC<{ signals: TradingSignal[] }> = ({ signals }) => {
+  return (
+    <div className="signal-list">
+      {signals.map((signal, index) => (
+        <SignalCard 
+          key={signal.id} 
+          signal={signal} 
+          isWarmup={index < 5}  // 前5个标记为预热
+        />
+      ))}
+    </div>
+  );
+};
+
+// ❌ 错误：巨大的单体组件
+const Dashboard: React.FC = () => {
+  return (
+    <div>
+      {/* 500行代码混在一个组件里 */}  // ❌
+    </div>
+  );
+};
+```
+
+### 样式管理
+
+```typescript
+// ✅ 推荐：使用Tailwind CSS或CSS Modules
+// Tailwind CSS
+const Button: React.FC<ButtonProps> = ({ children, variant = 'primary' }) => {
+  const baseStyles = 'px-4 py-2 rounded font-medium transition';
+  const variantStyles = {
+    primary: 'bg-blue-500 text-white hover:bg-blue-600',
+    secondary: 'bg-gray-500 text-white hover:bg-gray-600',
+    warning: 'bg-yellow-500 text-white hover:bg-yellow-600'  // 🆕 预热信号
+  };
+  
+  return (
+    <button className={`${baseStyles} ${variantStyles[variant]}`}>
+      {children}
+    </button>
+  );
+};
+
+// CSS Modules
+import styles from './Button.module.css';
+
+const Button: React.FC<ButtonProps> = ({ children }) => {
+  return <button className={styles.button}>{children}</button>;
+};
+```
+
+---
+
+## 🔧 工具函数规范
+
+```typescript
+// ✅ 文件: utils/formatters.ts
+export const formatPrice = (price: number): string => {
+  return `$${price.toFixed(2)}`;
+};
+
+export const formatPercentage = (value: number): string => {
+  return `${(value * 100).toFixed(2)}%`;
+};
+
+export const formatTimestamp = (timestamp: string): string => {
+  return new Date(timestamp).toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai'
+  });
+};
+
+// 🆕 格式化信号状态
+export const formatSignalStatus = (index: number, warmupCount: number = 5): string => {
+  if (index < warmupCount) {
+    return `预热 ${index + 1}/${warmupCount}`;
+  }
+  return `正式 ${index + 1}`;
+};
+
+// ✅ 文件: utils/validators.ts
+export const isValidSymbol = (symbol: string): boolean => {
+  return /^[A-Z]+USDT$/.test(symbol);
+};
+
+export const isValidTimeframe = (timeframe: string): boolean => {
+  return ['15m', '2h', '4h'].includes(timeframe);
+};
+
+// ✅ 使用
+import { formatPrice, formatPercentage, formatSignalStatus } from '@/utils/formatters';
+import { isValidSymbol } from '@/utils/validators';
+```
+
+---
+
+## 🚫 前端禁止事项
+
+```typescript
+// ❌ 禁止：在组件中硬编码API URL
+fetch('http://localhost:8000/api/signals')  // ❌
+
+// ✅ 应该：使用环境变量和API服务
+apiService.getSignals('ETHUSDT')
+
+// ❌ 禁止：直接修改state
+const [data, setData] = useState([]);
+data.push(newItem);  // ❌ 直接修改
+
+// ✅ 应该：使用不可变更新
+setData([...data, newItem]);
+
+// ❌ 禁止：在组件中重复相同逻辑
+// 多个组件中都有相同的数据获取逻辑  // ❌
+
+// ✅ 应该：抽取为自定义Hook
+const { data, loading } = useSignalData('ETHUSDT');
+
+// ❌ 禁止：缺少错误处理
+useEffect(() => {
+  fetchData().then(setData);  // ❌ 没有catch
+}, []);
+
+// ✅ 应该：完善的错误处理
+useEffect(() => {
+  fetchData()
+    .then(setData)
+    .catch(err => {
+      setError(err);
+      console.error(err);
+    });
+}, []);
+
+// ❌ 禁止：useEffect依赖项遗漏
+useEffect(() => {
+  fetchData(symbol);  // 使用了symbol
+}, []);  // ❌ 但没有加到依赖数组
+
+// ✅ 应该：完整的依赖数组
+useEffect(() => {
+  fetchData(symbol);
+}, [symbol]);  // ✅
+```
+
+---
+
+## ♿ 可访问性规范
+
+```typescript
+// ✅ 正确：添加aria标签和语义化HTML
+const Button: React.FC<ButtonProps> = ({ children, onClick, disabled }) => {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={typeof children === 'string' ? children : undefined}
+      aria-disabled={disabled}
+    >
+      {children}
+    </button>
+  );
+};
+
+// ✅ 使用语义化HTML
+const Navigation: React.FC = () => {
+  return (
+    <nav aria-label="主导航">
+      <ul>
+        <li><a href="/dashboard">仪表盘</a></li>
+        <li><a href="/signals">信号</a></li>
+      </ul>
+    </nav>
+  );
+};
+```
+
+---
+
+## ⚡ 性能优化
+
+```typescript
+// ✅ 使用React.memo避免不必要的重渲染
+const SignalCard = React.memo<SignalCardProps>(({ signal }) => {
+  return <div>{/* UI */}</div>;
+});
+
+// ✅ 使用useMemo缓存计算结果
+const Dashboard: React.FC = () => {
+  const signals = useSignalData('ETHUSDT');
+  
+  const filteredSignals = useMemo(() => {
+    return signals.filter(s => s.confidence > 0.7);
+  }, [signals]);
+  
+  return <SignalList signals={filteredSignals} />;
+};
+
+// ✅ 使用useCallback缓存回调函数
+const Dashboard: React.FC = () => {
+  const [count, setCount] = useState(0);
+  
+  const handleClick = useCallback(() => {
+    setCount(c => c + 1);
+  }, []);  // 依赖为空，函数不会重新创建
+  
+  return <Button onClick={handleClick}>点击</Button>;
+};
+```
+
+---
+
+## 🧪 测试规范
+
+```typescript
+// ✅ 组件测试
+import { render, screen } from '@testing-library/react';
+import { SignalCard } from './SignalCard';
+
+describe('SignalCard', () => {
+  it('should render signal type', () => {
+    const signal = {
+      id: '1',
+      type: 'LONG',
+      confidence: 0.85,
+      timestamp: '2025-10-13T00:00:00Z'
+    };
+    
+    render(<SignalCard signal={signal} />);
+    
+    expect(screen.getByText('LONG')).toBeInTheDocument();
+    expect(screen.getByText(/85.0%/)).toBeInTheDocument();
+  });
+  
+  // 🆕 测试预热信号
+  it('should show warmup indicator', () => {
+    const signal = { /* ... */ };
+    
+    render(<SignalCard signal={signal} isWarmup={true} />);
+    
+    expect(screen.getByText(/预热/)).toBeInTheDocument();
+  });
+});
+
+// ✅ Hook测试
+import { renderHook } from '@testing-library/react-hooks';
+import { useSignalData } from './useSignalData';
+
+describe('useSignalData', () => {
+  it('should fetch signals', async () => {
+    const { result, waitForNextUpdate } = renderHook(() => 
+      useSignalData('ETHUSDT')
+    );
+    
+    expect(result.current.loading).toBe(true);
+    
+    await waitForNextUpdate();
+    
+    expect(result.current.loading).toBe(false);
+    expect(result.current.signals).toHaveLength(10);
+  });
+});
+```
+
+---
+
+**版本**: v4.0  
+**更新日期**: 2025-10-13  
+**更新内容**:
+- 添加预热信号UI展示规范
+- 添加信号状态格式化工具
+- 完善组件测试规范
+**适用范围**: frontend/**/*.{ts,tsx}
