@@ -1101,6 +1101,749 @@ def create_features_cached(self, df: pd.DataFrame) -> pd.DataFrame:
 
 ---
 
+## 🎓 专业量化工程师代码规范
+
+**项目**: QuantAI-ETH  
+**重要性**: 🔴 **CRITICAL** - 必须严格遵守  
+**目标**: 避免低级错误，确保代码质量
+
+---
+
+### 1. 代码质量基本要求
+
+#### 1.1 零容忍错误
+
+**严格禁止以下低级错误**：
+
+```python
+# ❌ 禁止1: 重复定义
+new_features['price'] = ...  # 第一次
+# ... 100行代码后 ...
+new_features['price'] = ...  # ❌ 重复定义！
+
+# ❌ 禁止2: 变量未定义就使用
+result = calculate(data, label)  # ❌ label未定义
+label = df['label']  # 定义太晚了
+
+# ❌ 禁止3: 逻辑错误
+if accuracy > 0.5:
+    logger.info("准确率低于50%")  # ❌ 逻辑反了
+
+# ❌ 禁止4: 硬编码
+threshold = 0.001  # ❌ 应该用配置
+data = pd.read_csv("C:\\Users\\data.csv")  # ❌ 绝对路径
+
+# ❌ 禁止5: 缺少错误处理
+result = risky_operation()  # ❌ 可能失败但没有try-except
+
+# ❌ 禁止6: 未来函数
+df['label'] = df['close'].shift(-5)  # ❌ 使用未来数据
+
+# ❌ 禁止7: 时区错误
+now = datetime.now()  # ❌ 没有时区信息
+
+# ❌ 禁止8: 类型错误
+def process(data):  # ❌ 缺少类型提示
+    return data * 2
+```
+
+#### 1.2 代码质量检查清单
+
+**每次提交代码前必须检查**：
+
+- [ ] ✅ 无重复定义（特征、变量、函数）
+- [ ] ✅ 无未定义变量使用
+- [ ] ✅ 所有变量先定义后使用
+- [ ] ✅ 类型提示完整
+- [ ] ✅ 错误处理完善
+- [ ] ✅ 日志记录充分
+- [ ] ✅ 注释清晰准确
+- [ ] ✅ 无硬编码常量
+- [ ] ✅ 无魔法数字
+- [ ] ✅ 通过语法检查
+- [ ] ✅ 通过单元测试
+- [ ] ✅ 代码格式规范
+
+---
+
+### 2. 特征工程专业规范
+
+#### 2.1 特征定义规范
+
+**强制规则**：
+
+```python
+# ✅ 规则1: 特征名称唯一性检查
+def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
+    """创建特征"""
+    # ... 特征计算 ...
+    
+    # 🔑 强制检查重复
+    duplicates = df.columns[df.columns.duplicated()].tolist()
+    if duplicates:
+        raise ValueError(f"❌ 重复特征: {duplicates}")
+    
+    return df
+
+# ✅ 规则2: 添加特征前检查是否存在
+if 'price_change' not in new_features:
+    new_features['price_change'] = df['close'].pct_change()
+
+# ✅ 规则3: 使用注释标记特征来源
+# 注：upper_shadow 在微观结构特征中定义（避免重复）
+
+# ✅ 规则4: 特征分组管理
+def _add_price_features(self, df):      # 价格特征组
+def _add_volume_features(self, df):     # 成交量特征组
+def _add_technical_indicators(self, df):# 技术指标组
+```
+
+#### 2.2 特征命名规范
+
+```python
+# ✅ 好的命名
+price_acceleration     # 清晰、语义明确
+rsi_14                # 包含参数
+sma_cross_5_20        # 描述具体含义
+volume_spike          # 表达意图
+
+# ❌ 差的命名
+pa                    # 太简短
+temp                  # 临时变量不应该保存
+feature_1             # 无意义
+data                  # 太泛化
+```
+
+#### 2.3 特征验证规范
+
+```python
+# ✅ 必须验证的内容
+def validate_features(self, df: pd.DataFrame):
+    """验证特征质量"""
+    
+    # 1. 检查重复特征
+    duplicates = df.columns[df.columns.duplicated()].tolist()
+    assert len(duplicates) == 0, f"重复特征: {duplicates}"
+    
+    # 2. 检查NaN比例
+    for col in df.columns:
+        nan_pct = df[col].isna().sum() / len(df)
+        assert nan_pct < 0.2, f"{col} NaN比例过高: {nan_pct:.1%}"
+    
+    # 3. 检查数值范围
+    for col in df.select_dtypes(include=[np.number]).columns:
+        assert not np.isinf(df[col]).any(), f"{col} 含有无穷大"
+    
+    # 4. 检查特征数量合理性
+    n_samples = len(df)
+    n_features = len(df.columns)
+    ratio = n_samples / n_features
+    assert ratio > 50, f"样本/特征比太低: {ratio:.1f}"
+```
+
+---
+
+### 3. 机器学习专业规范
+
+#### 3.1 训练流程规范
+
+**严格遵守的顺序**：
+
+```python
+async def train_model(self, timeframe: str):
+    """标准训练流程"""
+    
+    # 1️⃣ 数据获取
+    data = await self._get_training_data(timeframe)
+    logger.info(f"✅ 数据获取: {len(data)}条")
+    
+    # 2️⃣ 数据验证
+    self._validate_data(data)
+    logger.info(f"✅ 数据验证通过")
+    
+    # 3️⃣ 特征工程
+    data = self.feature_engineer.create_features(data)
+    logger.info(f"✅ 特征工程: {len(data.columns)}个特征")
+    
+    # 4️⃣ 创建标签（必须传入timeframe）
+    data = self._create_labels(data, timeframe=timeframe)
+    logger.info(f"✅ 标签创建完成")
+    
+    # 5️⃣ 准备特征和标签
+    X, y = self._prepare_features_labels(data, timeframe)
+    logger.info(f"✅ 特征准备: X={X.shape}, y={y.shape}")
+    
+    # 6️⃣ 数据分割（时间序列！）
+    X_train, X_val, y_train, y_val = self._time_series_split(X, y)
+    logger.info(f"✅ 数据分割: 训练{len(X_train)}, 验证{len(X_val)}")
+    
+    # 7️⃣ 特征缩放
+    X_train_scaled = self._scale_features(X_train, timeframe, fit=True)
+    X_val_scaled = self._scale_features(X_val, timeframe, fit=False)
+    logger.info(f"✅ 特征缩放完成")
+    
+    # 8️⃣ 模型训练
+    model = self._train_lightgbm(X_train_scaled, y_train, timeframe)
+    logger.info(f"✅ 模型训练完成")
+    
+    # 9️⃣ 模型评估
+    metrics = self._evaluate_model(model, X_val_scaled, y_val)
+    logger.info(f"✅ 模型评估: 准确率={metrics['accuracy']:.4f}")
+    
+    # 🔟 保存模型
+    self._save_model(model, timeframe)
+    logger.info(f"✅ 模型保存完成")
+    
+    return model, metrics
+```
+
+#### 3.2 数据验证规范
+
+```python
+def _validate_data(self, df: pd.DataFrame):
+    """数据质量检查（强制执行）"""
+    
+    # 1. 基础检查
+    assert len(df) > 0, "数据为空"
+    assert not df.empty, "DataFrame为空"
+    
+    # 2. 必需列检查
+    required_cols = ['open', 'high', 'low', 'close', 'volume']
+    missing = set(required_cols) - set(df.columns)
+    assert len(missing) == 0, f"缺少列: {missing}"
+    
+    # 3. 数据类型检查
+    for col in required_cols:
+        assert pd.api.types.is_numeric_dtype(df[col]), f"{col}不是数值类型"
+    
+    # 4. 数据范围检查
+    assert (df['high'] >= df['low']).all(), "存在high < low"
+    assert (df['high'] >= df['close']).all(), "存在high < close"
+    assert (df['low'] <= df['close']).all(), "存在low > close"
+    assert (df['volume'] >= 0).all(), "存在负成交量"
+    
+    # 5. 时间排序检查
+    if 'timestamp' in df.columns:
+        assert df['timestamp'].is_monotonic_increasing, "时间序列未排序"
+    
+    # 6. 重复数据检查
+    if 'timestamp' in df.columns:
+        duplicates = df['timestamp'].duplicated().sum()
+        assert duplicates == 0, f"存在{duplicates}个重复时间戳"
+```
+
+#### 3.3 标签创建规范
+
+```python
+def _create_labels(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """创建标签（严格规范）"""
+    
+    # ❌ 禁止：使用未来多个K线
+    # df['label'] = df['close'].shift(-5)  # ❌ 看未来5根
+    
+    # ✅ 正确：只看下一根K线
+    df['next_return'] = df['close'].shift(-1) / df['close'] - 1
+    
+    # ✅ 使用差异化阈值配置
+    threshold_config = {
+        '15m': {'up': 0.001, 'down': -0.001},
+        '2h': {'up': 0.0035, 'down': -0.0035},
+        '4h': {'up': 0.005, 'down': -0.005}
+    }
+    
+    threshold = threshold_config[timeframe]
+    
+    # ✅ 三分类标签
+    conditions = [
+        df['next_return'] <= threshold['down'],  # SHORT
+        df['next_return'] > threshold['up']      # LONG
+    ]
+    choices = [0, 2]
+    df['label'] = np.select(conditions, choices, default=1)  # HOLD
+    
+    # ✅ 标签分布验证
+    label_counts = df['label'].value_counts()
+    for label in [0, 1, 2]:
+        pct = label_counts.get(label, 0) / len(df) * 100
+        logger.info(f"  标签{label}: {pct:.1f}%")
+        
+        # 检查标签分布是否合理
+        if label == 1:  # HOLD
+            assert 20 < pct < 50, f"HOLD比例异常: {pct:.1f}%"
+    
+    return df
+```
+
+---
+
+### 4. 错误预防措施
+
+#### 4.1 自动检测机制
+
+**必须实施的检测**：
+
+```python
+# 1. 重复特征检测
+def check_duplicate_features(df: pd.DataFrame):
+    """检测重复特征（每次特征工程后调用）"""
+    duplicates = df.columns[df.columns.duplicated()].tolist()
+    if duplicates:
+        raise ValueError(f"❌ 发现重复特征: {duplicates}")
+
+# 2. 变量定义检测
+def check_variable_defined(var_name: str, local_vars: dict):
+    """检查变量是否已定义"""
+    if var_name not in local_vars:
+        raise NameError(f"❌ 变量未定义: {var_name}")
+
+# 3. 数据类型检测
+def check_data_types(df: pd.DataFrame, expected_types: dict):
+    """检查数据类型"""
+    for col, expected_type in expected_types.items():
+        if col not in df.columns:
+            raise ValueError(f"❌ 列不存在: {col}")
+        actual_type = df[col].dtype
+        if not pd.api.types.is_dtype_equal(actual_type, expected_type):
+            raise TypeError(f"❌ {col}类型错误: 期望{expected_type}, 实际{actual_type}")
+```
+
+#### 4.2 代码审查清单
+
+**每次提交前必须检查**：
+
+```markdown
+## 代码审查清单
+
+### 基础检查
+- [ ] 无语法错误
+- [ ] 无拼写错误
+- [ ] 无未使用的导入
+- [ ] 无未使用的变量
+- [ ] 无注释掉的代码（应删除）
+
+### 逻辑检查
+- [ ] 变量先定义后使用
+- [ ] 循环逻辑正确
+- [ ] 条件判断正确
+- [ ] 返回值类型正确
+- [ ] 边界条件处理
+
+### 数据检查
+- [ ] 无未来函数
+- [ ] 时间序列正确排序
+- [ ] 标签创建正确
+- [ ] 特征无重复
+- [ ] 数据类型正确
+
+### 性能检查
+- [ ] 无性能瓶颈
+- [ ] 无内存泄漏
+- [ ] 无无限循环
+- [ ] 合理使用缓存
+- [ ] 异步操作正确
+
+### 安全检查
+- [ ] 无SQL注入风险
+- [ ] 无密钥硬编码
+- [ ] 输入验证完整
+- [ ] 错误处理完善
+- [ ] 日志不含敏感信息
+```
+
+#### 4.3 单元测试规范
+
+**关键功能必须测试**：
+
+```python
+import pytest
+import pandas as pd
+import numpy as np
+
+# ✅ 测试1: 特征无重复
+def test_no_duplicate_features():
+    """测试特征工程无重复"""
+    from app.services.feature_engineering import FeatureEngineer
+    
+    fe = FeatureEngineer()
+    data = create_test_data()
+    result = fe.create_features(data)
+    
+    # 检查重复
+    duplicates = result.columns[result.columns.duplicated()].tolist()
+    assert len(duplicates) == 0, f"发现重复特征: {duplicates}"
+
+# ✅ 测试2: 标签分布合理
+def test_label_distribution():
+    """测试标签分布合理性"""
+    from app.services.ml_service import MLService
+    
+    ml = MLService()
+    data = create_test_data()
+    data = ml._create_labels(data, timeframe='15m')
+    
+    # 检查标签分布
+    counts = data['label'].value_counts()
+    for label in [0, 1, 2]:
+        pct = counts[label] / len(data) * 100
+        assert 20 < pct < 50, f"标签{label}分布异常: {pct:.1f}%"
+
+# ✅ 测试3: 无未来函数
+def test_no_future_function():
+    """测试无未来数据泄露"""
+    from app.services.ml_service import MLService
+    
+    ml = MLService()
+    data = create_test_data()
+    
+    # 检查shift方向
+    assert 'next_return' in data.columns
+    # next_return应该只使用shift(-1)
+    # 不应该使用shift(-n) where n > 1
+
+# ✅ 测试4: 时间序列分割
+def test_time_series_split():
+    """测试时间序列分割正确性"""
+    from app.services.ml_service import MLService
+    
+    ml = MLService()
+    X, y = create_test_features_labels()
+    
+    X_train, X_val, y_train, y_val = ml._time_series_split(X, y)
+    
+    # 训练集应该在验证集之前
+    assert len(X_train) > 0
+    assert len(X_val) > 0
+    # 不应该使用shuffle=True
+```
+
+---
+
+### 5. 代码提交规范
+
+#### 5.1 提交前检查流程
+
+```bash
+# 1. 代码格式化
+black backend/app/services/
+isort backend/app/services/
+
+# 2. 语法检查
+pylint backend/app/services/ml_service.py
+mypy backend/app/services/ml_service.py
+
+# 3. 运行测试
+pytest tests/ -v
+
+# 4. 检查覆盖率
+pytest tests/ --cov=app --cov-report=html
+
+# 5. 手动审查清单
+# - 无重复特征
+# - 无未定义变量
+# - 无低级错误
+# - 日志充分
+# - 注释清晰
+```
+
+#### 5.2 提交信息规范
+
+```bash
+# ✅ 好的提交信息
+git commit -m "fix: 修复upper_shadow重复定义错误
+
+- 删除价格特征中的重复定义
+- 保留微观结构特征中的版本（更好的归一化）
+- 添加注释防止未来重复
+- 通过单元测试验证
+
+Issue: #123
+"
+
+# ❌ 差的提交信息
+git commit -m "修复bug"
+git commit -m "更新"
+git commit -m "临时提交"
+```
+
+---
+
+### 6. 性能优化规范
+
+#### 6.1 优化前必须测试
+
+```python
+import time
+import cProfile
+import memory_profiler
+
+# ✅ 性能测试模板
+def benchmark_feature_engineering():
+    """基准测试特征工程性能"""
+    from app.services.feature_engineering import FeatureEngineer
+    
+    fe = FeatureEngineer()
+    data = load_large_dataset()  # 10000行
+    
+    # 测试前
+    start_time = time.time()
+    result = fe.create_features(data)
+    end_time = time.time()
+    
+    duration = end_time - start_time
+    
+    print(f"特征工程耗时: {duration:.2f}秒")
+    print(f"处理速度: {len(data)/duration:.0f}行/秒")
+    print(f"特征数量: {len(result.columns)}")
+    
+    return duration
+
+# ✅ 内存测试
+@memory_profiler.profile
+def test_memory_usage():
+    """测试内存使用"""
+    from app.services.ml_service import MLService
+    
+    ml = MLService()
+    # ... 测试代码 ...
+```
+
+#### 6.2 优化后必须对比
+
+```python
+# ✅ A/B测试对比
+def compare_performance():
+    """对比优化前后性能"""
+    
+    # 优化前
+    time_before = benchmark_old_method()
+    
+    # 优化后
+    time_after = benchmark_new_method()
+    
+    # 计算改进
+    improvement = (time_before - time_after) / time_before * 100
+    
+    print(f"优化前: {time_before:.2f}秒")
+    print(f"优化后: {time_after:.2f}秒")
+    print(f"性能提升: {improvement:.1f}%")
+    
+    # 必须有提升
+    assert improvement > 0, "优化后性能反而下降"
+```
+
+---
+
+### 7. 文档规范
+
+#### 7.1 代码注释规范
+
+```python
+# ✅ 好的注释
+def _select_features_intelligent(
+    self, 
+    X: pd.DataFrame, 
+    y: pd.Series, 
+    timeframe: str
+) -> list:
+    """
+    智能特征选择（两阶段 + 动态预算）
+    
+    阶段1: Filter过滤低重要性特征（基于LightGBM重要性）
+    阶段2: 嵌入式选择（SelectFromModel + 动态预算）
+    
+    Args:
+        X: 特征DataFrame
+        y: 标签Series
+        timeframe: 时间框架（'15m', '2h', '4h'）
+    
+    Returns:
+        选中的特征列表
+    
+    优化目标:
+        - 提升准确率5-10%
+        - 样本/特征比>100:1
+        - 防止过拟合
+    
+    Example:
+        >>> features = self._select_features_intelligent(X, y, '15m')
+        >>> print(len(features))  # 150
+    """
+    # ... 实现
+
+# ❌ 差的注释
+def select(X, y, t):
+    """选择特征"""  # 太简短
+    # ... 实现
+```
+
+#### 7.2 修复文档规范
+
+**每次修复Bug必须文档化**：
+
+```markdown
+# Bug修复报告模板
+
+## 问题描述
+- 错误信息: XXX
+- 影响范围: XXX
+- 严重性: CRITICAL/HIGH/MEDIUM/LOW
+
+## 根本原因
+- 为什么会出现这个错误？
+- 什么时候引入的？
+- 为什么之前没发现？
+
+## 修复方案
+- 修改了哪些文件？
+- 修改了哪些代码？
+- 为什么这样修复？
+
+## 验证方法
+- 如何验证修复成功？
+- 测试用例？
+- 性能影响？
+
+## 预防措施
+- 如何避免类似错误？
+- 需要添加什么检测机制？
+- 需要更新什么文档？
+```
+
+---
+
+### 8. 禁止的操作
+
+**严格禁止以下操作**：
+
+```python
+# ❌ 禁止1: 修改后不测试
+# 修改代码 → 直接提交 ❌
+# ✅ 正确: 修改代码 → 测试 → 提交
+
+# ❌ 禁止2: 跳过代码审查
+git push origin main  # ❌ 直接推送到主分支
+
+# ❌ 禁止3: 删除测试
+# 为了让代码通过而删除测试 ❌
+
+# ❌ 禁止4: 忽略警告
+# pylint: disable=all  # ❌ 禁用所有警告
+
+# ❌ 禁止5: 临时修复不记录
+# 临时解决问题，不记录不文档化 ❌
+
+# ❌ 禁止6: 复制粘贴不重构
+# 复制相同代码到多个地方 ❌
+
+# ❌ 禁止7: 修改后不更新文档
+# 修改代码但不更新注释和文档 ❌
+
+# ❌ 禁止8: 使用全局变量
+global_data = []  # ❌ 避免使用全局可变变量
+
+# ❌ 禁止9: 捕获所有异常
+try:
+    risky_operation()
+except:  # ❌ 不指定异常类型
+    pass  # ❌ 忽略异常
+
+# ❌ 禁止10: 硬编码配置
+API_KEY = "abc123"  # ❌ 应该用环境变量
+```
+
+---
+
+### 9. 专业工程师检查清单
+
+**每天开发结束前检查**：
+
+```markdown
+## 今日代码质量检查
+
+### 代码质量 ✅
+- [ ] 无重复定义
+- [ ] 无未定义变量
+- [ ] 类型提示完整
+- [ ] 错误处理完善
+- [ ] 日志记录充分
+- [ ] 注释清晰准确
+
+### 测试覆盖 ✅
+- [ ] 单元测试通过
+- [ ] 集成测试通过
+- [ ] 性能测试通过
+- [ ] 边界条件测试
+
+### 文档更新 ✅
+- [ ] 代码注释更新
+- [ ] API文档更新
+- [ ] README更新
+- [ ] 修复文档记录
+
+### 性能优化 ✅
+- [ ] 无性能退化
+- [ ] 无内存泄漏
+- [ ] 响应时间达标
+- [ ] 资源使用合理
+
+### 安全检查 ✅
+- [ ] 无密钥泄露
+- [ ] 输入验证完整
+- [ ] 错误信息安全
+- [ ] 日志脱敏处理
+```
+
+---
+
+### 10. 持续改进
+
+#### 10.1 定期审查
+
+```markdown
+## 每周代码审查（周五下午）
+
+1. 代码质量回顾
+   - 本周发现的Bug
+   - 低级错误统计
+   - 代码复杂度分析
+
+2. 性能指标回顾
+   - 准确率趋势
+   - 系统延迟
+   - 资源使用
+
+3. 改进措施
+   - 需要添加的检测
+   - 需要优化的代码
+   - 需要更新的文档
+
+4. 下周计划
+   - 重点优化项
+   - 技术债务清理
+   - 新功能开发
+```
+
+#### 10.2 知识积累
+
+```markdown
+## 问题记录与总结
+
+### Bug记录
+- 日期: 2025-10-17
+- 问题: 重复特征定义
+- 原因: 未检查现有特征
+- 修复: 删除重复 + 添加检测
+- 预防: 添加自动检测机制
+
+### 经验总结
+- 教训: 不要盲目添加特征
+- 改进: 先检查后添加
+- 工具: 使用自动检测
+- 文档: 更新规则文件
+```
+
+---
+
 ## 📚 参考文档
 
 - **优化路线图**：`OPTIMIZATION_ROADMAP.md`（完整优化计划）
@@ -1108,17 +1851,22 @@ def create_features_cached(self, df: pd.DataFrame) -> pd.DataFrame:
 - **前端规则**：`.cursor/rules/frontend.mdc`
 - **部署文档**：`DEPLOYMENT.md`
 - **项目总结**：`PROJECT_SUMMARY.md`
+- **Bug修复记录**：`docs/CRITICAL_*.md`
 
 ---
 
-**版本**: v6.0  
-**更新日期**: 2025-10-16  
+**版本**: v7.0  
+**更新日期**: 2025-10-17  
 **更新内容**: 
-- 添加系统优化规范章节
-- 完善特征工程、模型训练、风险管理规范
-- 添加性能要求和监控指标
-- 添加优化文档和测试规范
-- 创建独立优化路线图文档（OPTIMIZATION_ROADMAP.md）
-- 修复标签阈值配置错误
-- 调整置信度阈值为0.40
+- 🆕 **添加专业量化工程师代码规范章节**
+- 严格定义零容忍错误清单
+- 完善特征工程专业规范
+- 添加错误预防措施
+- 建立代码审查清单
+- 制定单元测试规范
+- 规范代码提交流程
+- 定义性能优化标准
+- 完善文档规范
+- 明确禁止操作清单
+- 建立持续改进机制
 **适用范围**: 全项目（前端+后端）

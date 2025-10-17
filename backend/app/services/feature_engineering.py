@@ -85,8 +85,7 @@ class FeatureEngineer:
             
             # 价格范围
             new_features['price_range'] = (df['high'] - df['low']) / df['close']
-            new_features['upper_shadow'] = (df['high'] - df[['open', 'close']].max(axis=1)) / df['close']
-            new_features['lower_shadow'] = (df[['open', 'close']].min(axis=1) - df['low']) / df['close']
+            # 注：upper_shadow 和 lower_shadow 在市场微观结构特征中添加（更好的归一化）
             
             # 开盘价与收盘价关系
             new_features['open_close_ratio'] = df['open'] / df['close']
@@ -100,14 +99,12 @@ class FeatureEngineer:
                 new_features[f'price_change_{period}'] = df['close'].pct_change(period)
                 new_features[f'high_low_ratio_{period}'] = df['high'].rolling(period).max() / df['low'].rolling(period).min()
             
-            # ✅ 价格加速度（捕捉趋势加速/减速）
-            new_features['price_acceleration'] = price_change - price_change.shift(1)
+            # ✅ 价格加速度（一阶、三阶、五阶）
+            new_features['price_acceleration'] = price_change - price_change.shift(1)  # 一阶加速度（基础版本）
             new_features['price_acceleration_3'] = price_change - price_change.shift(3)
             new_features['price_acceleration_5'] = price_change - price_change.shift(5)
             
-            # ✅ 连续涨跌（捕捉趋势延续性）
-            new_features['consecutive_up'] = (df['close'] > df['close'].shift(1)).astype(int).rolling(5).sum()
-            new_features['consecutive_down'] = (df['close'] < df['close'].shift(1)).astype(int).rolling(5).sum()
+            # 注：consecutive_up, consecutive_down 在市场情绪特征中添加（更好的实现）
             
             # ✅ 价格动量强度
             new_features['price_momentum_strength'] = price_change.abs().rolling(5).mean()
@@ -248,7 +245,7 @@ class FeatureEngineer:
             price_change_1 = df['close'].pct_change(1)  # 定义价格变化率
             price_change_5 = df['close'].pct_change(5)
             volume_change_5 = df['volume'].pct_change(5)
-            new_features['price_volume_divergence'] = price_change_5 * volume_change_5  # 同向为正，背离为负
+            new_features['price_volume_correlation'] = price_change_5 * volume_change_5  # 同向为正，背离为负（连续值）
             
             # ✅ 成交量加权价格变化（结合量价）
             new_features['volume_weighted_price_change'] = price_change_1 * (df['volume'] / volume_ma_20)
@@ -358,8 +355,8 @@ class FeatureEngineer:
             
             # 7. 🆕 价格加速度（捕捉拐点）
             returns = df['close'].pct_change()
-            new_features['price_acceleration'] = returns.diff()
-            new_features['price_jerk'] = returns.diff().diff()  # 加加速度
+            # 注：price_acceleration 已在价格特征中定义，这里添加更高阶的
+            new_features['price_jerk'] = returns.diff().diff()  # 加加速度（三阶导数）
             
             # 8. 分形维度（已有，保留）
             for period in [10, 20]:
@@ -451,11 +448,7 @@ class FeatureEngineer:
             # Awesome Oscillator
             new_features['ao'] = ta.momentum.AwesomeOscillatorIndicator(df['high'], df['low']).awesome_oscillator()
             
-            # ✅ 趋势强度指标（ADX）
-            adx = ta.trend.ADXIndicator(df['high'], df['low'], df['close'])
-            new_features['adx'] = adx.adx()
-            new_features['adx_pos'] = adx.adx_pos()
-            new_features['adx_neg'] = adx.adx_neg()
+            # 注：ADX已在技术指标中添加，避免重复
             
             # ✅ 动量加速度（捕捉动量变化）
             rsi_14 = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
@@ -626,10 +619,11 @@ class FeatureEngineer:
                 new_features['rsi_momentum'] = rsi - rsi.shift(5)  # RSI动量
                 new_features['rsi_volatility'] = rsi.rolling(10).std()  # RSI波动率
             
-            # 4. 🆕 价格加速度（情绪转变）
+            # 4. 🆕 价格加速度幅度（情绪转变强度）
             price_change = df['close'].pct_change()
-            new_features['price_acceleration'] = price_change.diff()
-            new_features['acceleration_magnitude'] = new_features['price_acceleration'].abs()
+            # 注：price_acceleration 已在价格特征中定义，这里只添加幅度
+            acceleration = price_change.diff()
+            new_features['acceleration_magnitude'] = acceleration.abs()
             
             # 5. 🆕 成交量情绪（基于放量/缩量）
             if 'volume' in df.columns:

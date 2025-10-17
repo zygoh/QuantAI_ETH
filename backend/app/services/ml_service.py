@@ -618,6 +618,9 @@ class MLService:
             
             feature_cols = [col for col in df.columns if col not in exclude_cols]
             
+            # 🔑 先提取标签（特征选择需要用到）
+            y = df['label'].copy()
+            
             # 为每个时间框架选择独立的重要特征（基于模型的两阶段选择）
             if timeframe not in self.feature_columns_dict or not self.feature_columns_dict[timeframe]:
                 # 🆕 智能特征选择：基于LightGBM重要性的两阶段选择
@@ -632,7 +635,6 @@ class MLService:
             feature_columns = self.feature_columns_dict[timeframe]
             
             X = df[feature_columns].copy()
-            y = df['label'].copy()
             
             # 移除包含NaN的行
             mask = ~(X.isna().any(axis=1) | y.isna())
