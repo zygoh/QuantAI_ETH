@@ -1,3 +1,5 @@
-/backend/models/*
-/backend/logs/*
+/backend/models
+/backend/logs
 /backend/.venv
+.vscode
+.idea
