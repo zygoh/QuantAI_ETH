@@ -33,6 +33,9 @@ class MLService:
         self.models = {}
         self.scalers = {}
         self.feature_columns_dict = {}
+        
+        # 🔑 初始化特征工程器（修复：子类需要访问）
+        self.feature_engineer = feature_engineer
         self.model_metrics = {}
         self.training_task = None
         self.is_first_training = True  # 标记是否首次训练（只有首次才写数据库）
@@ -803,86 +806,8 @@ class MLService:
             logger.error(f"特征缩放失败: {e}")
             return X.values
     
-    def _train_lightgbm(
-        self, 
-        X_train: np.ndarray, 
-        y_train: np.ndarray, 
-        X_val: np.ndarray, 
-        y_val: np.ndarray,
-        timeframe: str = None
-    ) -> lgb.LGBMClassifier:
-        """训练LightGBM模型（支持差异化参数配置 + 样本加权）
-        
-        Args:
-            X_train: 训练特征
-            y_train: 训练标签
-            X_val: 验证特征
-            y_val: 验证标签
-            timeframe: 时间框架（用于差异化配置）
-        
-        Returns:
-            训练好的模型
-        """
-        try:
-            import time
-            from sklearn.utils.class_weight import compute_sample_weight
-            
-            # 记录训练开始时间
-            train_start = time.time()
-            
-            # ✅ 根据时间框架应用差异化参数
-            params = self.lgb_params.copy()
-            if timeframe and timeframe in self.lgb_params_by_timeframe:
-                timeframe_params = self.lgb_params_by_timeframe[timeframe]
-                params.update(timeframe_params)
-                logger.info(f"📊 {timeframe} 使用差异化参数: num_leaves={params['num_leaves']}, min_child_samples={params['min_child_samples']}")
-            else:
-                logger.info(f"📊 使用默认参数: num_leaves={params['num_leaves']}")
-            
-            # 🆕 计算样本权重（解决类别不平衡）
-            # 1. 类别权重（平衡各类别）
-            class_weights = compute_sample_weight('balanced', y_train)
-            
-            # 2. 时间衰减权重（更重视最近的数据）
-            time_decay = np.exp(-np.arange(len(X_train)) / (len(X_train) * 0.1))[::-1]
-            
-            # 3. 组合权重
-            sample_weights = class_weights * time_decay
-            
-            logger.info(f"✅ 样本加权已启用：类别平衡 × 时间衰减（最近数据权重更高）")
-            
-            # 打印设备信息（简化）
-            if params.get('device') == 'gpu':
-                logger.debug("🖥️ 尝试使用 GPU 训练...")
-            else:
-                logger.debug("💻 使用 CPU 训练...")
-            
-            # 创建模型（使用差异化参数）
-            model = lgb.LGBMClassifier(**params)
-            
-            # 训练模型（使用样本权重）
-            model.fit(
-                X_train, y_train,
-                sample_weight=sample_weights,  # 🆕 应用样本权重
-                eval_set=[(X_val, y_val)],
-                eval_metric='multi_logloss',
-                callbacks=[
-                    lgb.early_stopping(stopping_rounds=50),
-                    lgb.log_evaluation(period=100)
-                ]
-            )
-            
-            # 记录训练耗时
-            train_time = time.time() - train_start
-            
-            # 简洁的训练时间记录
-            logger.info(f"⏱️ 训练耗时: {train_time:.2f}秒 (GPU: {'✅' if train_time < 10 else '❓'})")
-            
-            return model
-            
-        except Exception as e:
-            logger.error(f"LightGBM训练失败: {e}")
-            raise
+    # 注：_train_lightgbm() 方法已移至 ensemble_ml_service.py（统一三模型训练代码位置）
+    # 原实现已被子类覆盖，此处删除以避免代码冗余
     
     def _evaluate_model_for_timeframe(self, X_val: np.ndarray, y_val: np.ndarray, timeframe: str) -> Dict[str, Any]:
         """评估特定时间框架的模型"""

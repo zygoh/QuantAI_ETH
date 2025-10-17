@@ -15,7 +15,7 @@ from app.core.config import settings
 from app.api.routes import api_router
 from app.api.middleware import LoggingMiddleware, ErrorHandlingMiddleware
 from app.services.data_service import DataService
-from app.services.ml_service import MLService
+from app.services.ensemble_ml_service import ensemble_ml_service  # 🆕 使用Stacking集成
 from app.services.trading_engine import TradingEngine
 from app.services.risk_service import RiskService
 from app.services.signal_generator import SignalGenerator
@@ -90,7 +90,7 @@ async def lifespan(app: FastAPI):
         
         # 初始化服务
         data_service = DataService()
-        ml_service = MLService()
+        ml_service = ensemble_ml_service  # 🆕 使用Stacking集成ML服务
         trading_engine = TradingEngine()
         risk_service = RiskService(data_service)
         signal_generator = SignalGenerator(ml_service, data_service)
