@@ -377,7 +377,10 @@ class SignalGenerator:
             symbol = settings.SYMBOL
             
             # 🔒 检查模型是否可用（可能正在训练中）
-            if not self.ml_service.models or len(self.ml_service.models) == 0:
+            # 兼容EnsembleMLService（使用ensemble_models）和MLService（使用models）
+            models_dict = getattr(self.ml_service, 'ensemble_models', None) or getattr(self.ml_service, 'models', None)
+            
+            if not models_dict or len(models_dict) == 0:
                 logger.warning("⚠️ 模型尚未训练完成，跳过首次预测（等待模型训练完成后首次WebSocket触发）")
                 return
             
@@ -386,7 +389,7 @@ class SignalGenerator:
             for timeframe in settings.TIMEFRAMES:
                 try:
                     # 再次确认该时间框架的模型存在
-                    if timeframe not in self.ml_service.models:
+                    if timeframe not in models_dict:
                         logger.warning(f"⚠️ {timeframe} 模型不可用，跳过首次预测")
                         continue
                     
@@ -642,18 +645,31 @@ class SignalGenerator:
             # 2h:  4,320条/360天  (训练3.5k)  ✅ 更充足，趋势过滤 ⬆️ 增加
             # 4h:  3,240条/540天  (训练2.6k)  ✅ 大幅增加，大趋势确认 ⬆️ 增加
             timeframe_weights = {
-                '15m': 0.6,   # 🎯 短线主导：快速捕捉入场点
-                '2h': 0.25,    # 中期辅助：趋势过滤
-                '4h': 0.15     # 长期辅助：避免逆势交易
+                '15m': 0.70,   # 🎯 短线主导：提高权重，快速捕捉入场点
+                '2h': 0.20,    # 中期辅助：趋势过滤
+                '4h': 0.10     # 长期辅助：避免逆势交易（权重低，避免4h信号长时间主导）
             }
             
-            # 计算加权信号
+            # 计算加权信号（动态权重：长周期HOLD时降权）
             weighted_scores = {'LONG': 0, 'SHORT': 0, 'HOLD': 0}
             total_weight = 0
             
             for timeframe, prediction in predictions.items():
-                weight = timeframe_weights.get(timeframe, 0.2)
+                base_weight = timeframe_weights.get(timeframe, 0.2)
                 probabilities = prediction.get('probabilities', {})
+                signal = prediction.get('signal_type')
+                
+                # 🔑 动态权重调整：如果长周期（2h/4h）是HOLD且置信度高，大幅降低权重
+                if timeframe in ['2h', '4h'] and signal == 'HOLD':
+                    hold_confidence = prediction.get('confidence', 0)
+                    if hold_confidence > 0.65:
+                        # HOLD置信度很高时，权重减半（避免压制15m）
+                        weight = base_weight * 0.5
+                        logger.debug(f"   {timeframe} HOLD高置信度({hold_confidence:.2f})，权重{base_weight}→{weight}")
+                    else:
+                        weight = base_weight
+                else:
+                    weight = base_weight
                 
                 weighted_scores['LONG'] += probabilities.get('long', 0) * weight
                 weighted_scores['SHORT'] += probabilities.get('short', 0) * weight
@@ -680,6 +696,18 @@ class SignalGenerator:
             # 过滤HOLD信号
             if signal_type == 'HOLD':
                 logger.info(f"⊗ 最终信号为HOLD，不发出交易信号")
+                return None
+            
+            # 🆕 信号增强过滤（预期胜率+5-10%）
+            filter_result = await self._enhanced_signal_filter(
+                signal_type=signal_type,
+                confidence=confidence,
+                predictions=predictions,
+                symbol=symbol
+            )
+            
+            if not filter_result['pass']:
+                logger.info(f"❌ 信号被过滤: {filter_result['reason']}")
                 return None
             
             # 获取当前价格
@@ -954,6 +982,96 @@ class SignalGenerator:
         except Exception as e:
             logger.error(f"获取信号表现失败: {e}")
             return {}
+    
+    async def _enhanced_signal_filter(
+        self,
+        signal_type: str,
+        confidence: float,
+        predictions: Dict[str, Dict[str, Any]],
+        symbol: str
+    ) -> Dict[str, Any]:
+        """增强的信号过滤（优化目标：胜率+5-10%）
+        
+        多维度过滤低质量信号：
+        1. 趋势一致性过滤
+        2. 量能确认
+        3. 波动率过滤
+        4. 时间过滤
+        
+        Returns:
+            {'pass': bool, 'reason': str}
+        """
+        try:
+            # 1. 置信度基础过滤（已有）
+            if confidence < self.confidence_threshold:
+                return {'pass': False, 'reason': f'置信度过低 ({confidence:.4f} < {self.confidence_threshold})'}
+            
+            # 2. 趋势一致性过滤
+            # 检查多时间框架是否趋势一致
+            if len(predictions) >= 2:
+                signal_types = [pred['signal_type'] for pred in predictions.values()]
+                # 如果有任何一个时间框架是反向信号，过滤
+                if signal_type == 'LONG' and 'SHORT' in signal_types:
+                    # 但如果15m置信度特别高（>0.7），允许通过
+                    if confidence < 0.7:
+                        return {'pass': False, 'reason': '多时间框架趋势不一致（有SHORT信号）'}
+                elif signal_type == 'SHORT' and 'LONG' in signal_types:
+                    if confidence < 0.7:
+                        return {'pass': False, 'reason': '多时间框架趋势不一致（有LONG信号）'}
+            
+            # 3. 波动率过滤（避免在极端波动时交易）
+            try:
+                # 获取最新15m K线数据来计算波动率
+                buffer_data = self.kline_buffers.get(symbol, {}).get('15m', [])
+                if len(buffer_data) >= 20:
+                    recent_closes = [k['close'] for k in buffer_data[-20:]]
+                    returns = [(recent_closes[i] - recent_closes[i-1]) / recent_closes[i-1] 
+                              for i in range(1, len(recent_closes))]
+                    current_volatility = np.std(returns)
+                    
+                    # 日波动率估算（15分钟 → 日，假设96个15分钟周期）
+                    daily_volatility = current_volatility * np.sqrt(96)
+                    
+                    if daily_volatility > 0.08:  # 日波动率>8%
+                        return {'pass': False, 'reason': f'市场波动过大 (日波动率={daily_volatility*100:.2f}%)'}
+                    
+                    if daily_volatility < 0.005:  # 日波动率<0.5%
+                        return {'pass': False, 'reason': f'市场波动过小 (日波动率={daily_volatility*100:.2f}%)'}
+            except Exception as e:
+                logger.debug(f"波动率计算失败（跳过此过滤）: {e}")
+            
+            # 4. 量能确认（高置信度信号需要量能配合）
+            if confidence > 0.6:  # 高置信度信号
+                try:
+                    buffer_data = self.kline_buffers.get(symbol, {}).get('15m', [])
+                    if len(buffer_data) >= 20:
+                        recent_volumes = [k['volume'] for k in buffer_data[-20:]]
+                        current_volume = buffer_data[-1]['volume']
+                        avg_volume = np.mean(recent_volumes)
+                        
+                        # 高置信度信号需要量能至少达到平均的70%
+                        if current_volume < avg_volume * 0.7:
+                            return {'pass': False, 'reason': f'量能不足（当前={current_volume:.0f}, 平均={avg_volume:.0f}）'}
+                except Exception as e:
+                    logger.debug(f"量能检查失败（跳过此过滤）: {e}")
+            
+            # 5. 信号频率限制（避免过度交易）
+            # 检查最近1小时内的信号数量
+            try:
+                recent_signals = await self.get_recent_signals(symbol, hours=1, limit=10)
+                if len(recent_signals) >= 5:  # 1小时内超过5个信号
+                    return {'pass': False, 'reason': f'信号频率过高（1小时内已有{len(recent_signals)}个信号）'}
+            except Exception as e:
+                logger.debug(f"信号频率检查失败（跳过此过滤）: {e}")
+            
+            # 6. 所有过滤器通过
+            logger.info(f"✅ 信号通过所有增强过滤器")
+            return {'pass': True, 'reason': '通过所有过滤条件'}
+            
+        except Exception as e:
+            logger.error(f"信号过滤失败: {e}")
+            # 过滤失败时保守处理：通过信号（避免错失机会）
+            return {'pass': True, 'reason': '过滤器异常，默认通过'}
     
     def add_signal_callback(self, callback: callable):
         """添加信号回调函数"""

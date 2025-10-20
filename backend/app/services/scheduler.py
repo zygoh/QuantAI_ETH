@@ -283,6 +283,15 @@ class TaskScheduler:
                 if metrics:
                     logger.info(f"模型训练完成，准确率: {metrics.get('accuracy', 0):.4f}")
                     logger.info("💡 定期训练完成，模型已自动更新（预热状态不变，继续正常交易）")
+                    
+                    # 🔑 训练完成后立即预测所有时间框架，填充信号缓存
+                    if self.signal_generator:
+                        logger.info("🎯 训练后立即预测所有时间框架，填充信号缓存...")
+                        try:
+                            await self.signal_generator._initial_predictions()
+                            logger.info("✅ 训练后首次预测完成，信号缓存已更新")
+                        except Exception as pred_error:
+                            logger.warning(f"⚠️ 训练后首次预测失败（不影响系统运行）: {pred_error}")
                 else:
                     logger.warning("模型训练失败")
             else:

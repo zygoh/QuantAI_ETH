@@ -364,24 +364,32 @@ class HealthMonitor:
         try:
             import os
             
-            # 🔥 检查多时间框架模型文件（新格式）
+            # 🔥 检查集成模型文件（新格式）
             all_files_exist = True
             missing_files = []
             
             for timeframe in settings.TIMEFRAMES:
-                model_path = f"models/{settings.SYMBOL}_{timeframe}_model.pkl"
+                # 检查Stacking集成模型的4个文件
+                lgb_path = f"models/{settings.SYMBOL}_{timeframe}_lgb_model.pkl"
+                xgb_path = f"models/{settings.SYMBOL}_{timeframe}_xgb_model.pkl"
+                cat_path = f"models/{settings.SYMBOL}_{timeframe}_cat_model.pkl"
+                meta_path = f"models/{settings.SYMBOL}_{timeframe}_meta_model.pkl"
                 scaler_path = f"models/{settings.SYMBOL}_{timeframe}_scaler.pkl"
                 features_path = f"models/{settings.SYMBOL}_{timeframe}_features.pkl"
                 
-                if not os.path.exists(model_path):
-                    all_files_exist = False
-                    missing_files.append(f"{timeframe}_model")
-                if not os.path.exists(scaler_path):
-                    all_files_exist = False
-                    missing_files.append(f"{timeframe}_scaler")
-                if not os.path.exists(features_path):
-                    all_files_exist = False
-                    missing_files.append(f"{timeframe}_features")
+                required_files = [
+                    (lgb_path, f"{timeframe}_lgb"),
+                    (xgb_path, f"{timeframe}_xgb"),
+                    (cat_path, f"{timeframe}_cat"),
+                    (meta_path, f"{timeframe}_meta"),
+                    (scaler_path, f"{timeframe}_scaler"),
+                    (features_path, f"{timeframe}_features")
+                ]
+                
+                for file_path, file_name in required_files:
+                    if not os.path.exists(file_path):
+                        all_files_exist = False
+                        missing_files.append(file_name)
             
             # 检查最近的信号
             last_signal = await cache_manager.get_trading_signal(settings.SYMBOL)

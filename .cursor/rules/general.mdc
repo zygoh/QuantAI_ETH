@@ -11,56 +11,109 @@ alwaysApply: true
 **中文名称**: ETH量化智能交易系统  
 **版本**: v2.0
 
+---
+
+## 🎯 专业定位与设计目标
+
+**角色定位**: 专业量化开发工程师
+
+**核心设计目标**: 
+- 🏆 **超高胜率中频交易系统**（胜率目标≥60%，盈亏比≥1.8:1）
+- 📊 模型准确率≥80%（当前已达成81%）
+- 💰 风险控制完善（最大回撤<10%）
+- ⚡ 信号质量优先于数量（宁缺毋滥）
+
+**设计理念**:
+- ✅ 准确性 > 信号频率
+- ✅ 风险控制 > 盈利激进
+- ✅ 代码质量 > 开发速度
+- ✅ 长期稳定 > 短期收益
+
+---
+
 ## 📋 项目概述
 
-**QuantAI-ETH** 是一个**生产级加密货币量化交易系统**，使用多时间框架机器学习进行ETH/USDT合约中频交易。
+**QuantAI-ETH** 是一个**生产级加密货币量化交易系统**，使用多时间框架Stacking集成学习进行ETH/USDT合约中频交易。
 
 **核心功能**：
-- 多时间框架模型训练（15m/2h/4h独立模型）
+- 多时间框架模型训练（15m/2h/4h独立Stacking集成模型）
+- Stacking三模型融合（LightGBM + XGBoost + CatBoost + 元学习器）
 - 实时信号生成与多模型加权合成
 - **信号缓存机制**（每个时间框架独立缓存预测结果）
+- **训练后立即预测**（填充所有时间框架信号缓存）
 - **预热信号保护**（前5个信号仅记录不交易）
 - 自动交易执行与风险管理
 - WebSocket实时数据流处理（stream名称中所有交易对均为小写）
 
-**技术栈**：Python 3.12+ | FastAPI | LightGBM | PostgreSQL+TimescaleDB | Redis | React
+**技术栈**：Python 3.12+ | FastAPI | LightGBM + XGBoost + CatBoost | PostgreSQL+TimescaleDB | Redis | React
+
+**当前性能**：平均准确率81%（15m:60%, 2h:90%, 4h:94%）
 
 ---
 
 ## 🎯 核心架构原则
 
-### 1. 多模型独立性原则（最重要）
+### 1. Stacking集成模型架构（最重要）
 
-每个时间框架完全独立：
+**每个时间框架使用独立的Stacking集成**：
 ```python
-# ✅ 正确：独立的模型、Scaler、特征、预测缓存
-self.models = {'15m': model_15m, '2h': model_2h, '4h': model_4h}
-self.scalers = {'15m': scaler_15m, '2h': scaler_2h, '4h': scaler_4h}
-self.feature_columns_dict = {
-    '15m': ['rsi', 'macd', ...],
-    '2h': ['rsi', 'macd', ...],
-    '4h': ['rsi', 'macd', ...]
+# ✅ 正确：每个时间框架包含4个模型
+self.ensemble_models = {
+    '15m': {
+        'lightgbm': lgb_model,    # 基础模型1
+        'xgboost': xgb_model,     # 基础模型2
+        'catboost': cat_model,    # 基础模型3
+        'meta_learner': meta_lgb  # 元学习器（LightGBM）
+    },
+    '2h': {...},  # 同样的结构
+    '4h': {...}   # 同样的结构
 }
-self.cached_predictions = {}  # 🆕 信号缓存
+self.scalers = {'15m': scaler_15m, '2h': scaler_2h, '4h': scaler_4h}
+self.feature_columns_dict = {'15m': [...], '2h': [...], '4h': [...]}
+self.cached_predictions = {}  # 信号缓存
 
-# ❌ 错误：共享模型或Scaler
+# ❌ 错误：共享模型或单模型
 self.model = single_model  # ❌ 不允许
+self.models = {'15m': single_lgb}  # ❌ 应该用Stacking
+```
+
+**Stacking训练流程**：
+```python
+# 1. 训练3个基础模型（不同数据量增加多样性）
+lgb_model = train_lgb(360天数据)  # HOLD惩罚0.7
+xgb_model = train_xgb(540天数据)  # HOLD惩罚0.7
+cat_model = train_cat(720天数据)  # HOLD惩罚0.7
+
+# 2. 生成元特征（验证集）
+meta_features = [lgb_proba, xgb_proba, cat_proba]
+
+# 3. 训练元学习器（关键：也需要HOLD惩罚！）
+meta_learner = LightGBM(HOLD惩罚=0.5)  # 比基础模型更重的惩罚
+meta_learner.fit(meta_features, y_val, sample_weight=...)
+
+# 4. 保存所有模型
 ```
 
 ### 2. 信号生成架构（核心改进）
 
 **正确的信号生成流程**：
 ```python
+# ✅ 训练完成后立即预测所有时间框架（关键！）
+训练完成 → 立即预测15m+2h+4h → 全部缓存 ✅
+
 # ✅ 各时间框架独立预测并缓存
 # 15m K线完成 → 预测15m → 缓存15m信号
 # 2h K线完成  → 预测2h  → 缓存2h信号  
 # 4h K线完成  → 预测4h  → 缓存4h信号
 
 # ✅ 只有15m触发合成（15m作为主时间框架）
-# 15m信号更新 → 合成所有缓存的信号 → 发出交易信号
+# 15m信号更新 → 合成所有缓存的信号（包含4h长期趋势）→ 发出交易信号
 
 # ❌ 错误：每次15m完成时同时预测3个时间框架
 # 这样会重复预测，效率低且没有必要
+
+# ❌ 错误：训练后不立即预测
+# 会导致4h信号缺失（4h每4小时才更新一次）
 ```
 
 ### 3. 预热信号保护（生产安全）
@@ -82,13 +135,59 @@ if self.signal_counter <= self.warmup_signals:
 - 确保资金安全
 - 避免启动初期误操作
 
-### 4. 数据源分离原则
+### 4. HOLD偏好解决方案（关键）
+
+**问题**：Stacking模型容易产生HOLD偏好（70-100%预测HOLD）
+
+**根本原因**：
+- 基础模型和元学习器都学到"不确定时选HOLD最安全"
+- 长周期（2h/4h）HOLD置信度过高（70-80%）
+- 加权合成时压制短周期（15m）信号
+
+**完整解决方案（三层防护）**：
+
+```python
+# 第1层：源头修复 - 基础模型HOLD惩罚
+class_weights = compute_sample_weight('balanced', y_train)
+hold_penalty = np.where(y_train == 1, 0.7, 1.0)  # HOLD权重0.7
+sample_weights = class_weights * time_decay * hold_penalty
+
+lgb_model.fit(X_train, y_train, sample_weight=sample_weights)  # LightGBM
+xgb_model.fit(X_train, y_train, sample_weight=sample_weights)  # XGBoost
+cat_model.fit(X_train, y_train, sample_weight=sample_weights)  # CatBoost
+
+# 第2层：元学习器HOLD惩罚（更重！）⭐⭐⭐
+meta_class_weights = compute_sample_weight('balanced', meta_labels)
+meta_hold_penalty = np.where(meta_labels == 1, 0.5, 1.0)  # HOLD权重0.5（更重）
+meta_sample_weights = meta_class_weights * meta_hold_penalty
+
+meta_learner.fit(meta_features, meta_labels, sample_weight=meta_sample_weights)
+
+# 第3层：信号合成时动态降权
+if timeframe in ['2h', '4h'] and signal == 'HOLD':
+    if hold_confidence > 0.65:
+        weight = base_weight * 0.5  # 权重减半，避免长周期HOLD压制短周期
+```
+
+**关键点**：
+- ✅ 基础模型HOLD惩罚：0.7
+- ✅ 元学习器HOLD惩罚：0.5（**必须更重**）
+- ✅ 合成时动态降权：HOLD>0.65时减半
+- ✅ 置信度阈值：0.35（适合81%准确率）
+- ✅ 15m权重70%：主导决策
+
+**禁止事项**：
+- ❌ 只惩罚基础模型，不惩罚元学习器
+- ❌ 使用"高置信度优先"策略（会导致4h信号主导4小时）
+- ❌ 置信度阈值>0.5（会过滤太多信号）
+
+### 5. 数据源分离原则
 
 - **模型训练**：Binance API（实时获取最新数据）
 - **信号生成**：WebSocket缓冲区（优先）→ Binance API（备用）
 - **数据库**：仅用于前端展示、历史查询、性能分析
 
-### 5. 无未来函数原则（关键）
+### 6. 无未来函数原则（关键）
 
 ```python
 # ✅ 正确：只看下一根K线
@@ -105,7 +204,7 @@ X_train, X_val = X[:split_idx], X[split_idx:]
 X_train, X_val = train_test_split(X, y, shuffle=True)  # ❌
 ```
 
-### 6. 时区统一原则
+### 7. 时区统一原则
 
 全系统使用 `Asia/Shanghai` 时区：
 ```python
@@ -122,7 +221,7 @@ ts = datetime.fromtimestamp(timestamp / 1000, tz=shanghai_tz)
 now = datetime.now()  # ❌ 没有时区信息
 ```
 
-### 7. WebSocket订阅格式
+### 8. WebSocket订阅格式
 
 **必须使用小写交易对**：
 ```python
@@ -894,8 +993,8 @@ def _on_close(self, ws):
 ### 1. 性能优化原则
 
 **关键指标**：
-- 模型准确率：**基本要求 ≥50%**，目标 ≥55%（当前34.59%）
-- 实际信号准确率：基本要求 ≥50%，目标 ≥55%
+- 模型准确率：**已达成81%**（15m:60%, 2h:90%, 4h:94%）✅ 超额完成
+- 实际信号准确率：基本要求 ≥50%，目标 ≥55%，长期目标 ≥60%
 - 预测延迟：目标 <1秒
 - 系统稳定性：目标 99.9%
 

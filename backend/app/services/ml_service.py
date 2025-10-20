@@ -426,20 +426,17 @@ class MLService:
                 else:
                     break
             
-            # 反转数据（因为是从最新往前获取的）
-            all_klines.reverse()
-            
-            # 转换为DataFrame
+            # 转换为DataFrame（不依赖reverse，直接用时间戳排序）
             df = pd.DataFrame(all_klines)
             
             if not df.empty:
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                 
+                # 🔑 关键：依赖时间戳排序，而不是假设API返回顺序
+                df = df.sort_values('timestamp', ascending=True)  # 明确指定升序（旧→新）
+                
                 # ✅ 去重（防止批次边界重复）
                 df = df.drop_duplicates(subset=['timestamp'], keep='last')
-                
-                # ✅ 显式排序（确保100%从旧到新，生产环境必须）
-                df = df.sort_values('timestamp')
                 
                 # 设置索引
                 df = df.set_index('timestamp')
@@ -530,7 +527,7 @@ class MLService:
             raise
     
     def _create_labels(self, df: pd.DataFrame, timeframe: str = None) -> pd.DataFrame:
-        """创建标签（差异化阈值，适应不同时间框架的波动特性）
+        """创建标签（动态阈值，基于ATR波动率自适应调整）
         
         Args:
             df: K线数据
@@ -540,28 +537,50 @@ class MLService:
             # ✅ 修复：只看下一根K线（不是未来5根）
             df['next_return'] = df['close'].shift(-1) / df['close'] - 1
             
-            # ✅ 差异化阈值：基于ETH实际波动调整（已优化）
-            # 关键理解：阈值越小 → HOLD区间越窄 → HOLD越少 → 信号越多
-            # 🎯 调整策略：放宽15m阈值，提升模型准确率到50%+
-            threshold_config = {
-                '15m': {
-                    'up': 0.0015,     # ±0.15% ← 从±0.1%放宽，提升可预测性
-                    'down': -0.0015   # $4000 × 0.15% = $6波动（更合理）
-                },
-                '2h': {
-                    'up': 0.0035,     # ±0.35% ← 中期辅助：HOLD 36-40%
-                    'down': -0.0035   # $4000 × 0.35% = $14波动
-                },
-                '4h': {
-                    'up': 0.005,      # ±0.5% ← 长期确认：HOLD 42-46%
-                    'down': -0.005    # $4000 × 0.5% = $20波动
-                }
+            # 🎯 动态阈值：基于ATR波动率自适应调整
+            # 计算ATR（14周期）
+            if 'atr' not in df.columns or df['atr'].isna().all():
+                # 如果没有ATR特征，手动计算
+                high_low = df['high'] - df['low']
+                high_close = np.abs(df['high'] - df['close'].shift())
+                low_close = np.abs(df['low'] - df['close'].shift())
+                true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+                atr = true_range.rolling(window=14).mean()
+            else:
+                atr = df['atr']
+            
+            # ATR百分比（相对于价格）
+            atr_pct = (atr / df['close']).rolling(window=50).mean()  # 50根K线平均
+            
+            # 基础阈值配置
+            base_threshold_config = {
+                '15m': 0.0015,  # 基础±0.15%
+                '2h': 0.0035,   # 基础±0.35%
+                '4h': 0.005     # 基础±0.5%
             }
             
-            # 获取该时间框架的阈值（默认1%）
-            config = threshold_config.get(timeframe, {'up': 0.010, 'down': -0.010})
-            up_threshold = config['up']
-            down_threshold = config['down']
+            base_threshold = base_threshold_config.get(timeframe, 0.010)
+            
+            # 动态调整系数（基于ATR波动率）
+            # 如果波动率高 → 扩大阈值；波动率低 → 缩小阈值
+            median_atr_pct = atr_pct.median()
+            
+            if pd.isna(median_atr_pct) or median_atr_pct == 0:
+                # 降级为固定阈值
+                up_threshold = base_threshold
+                down_threshold = -base_threshold
+                logger.info(f"⚠️ ATR计算失败，使用固定阈值: ±{base_threshold*100:.2f}%")
+            else:
+                # 动态调整：ATR高时放宽阈值，ATR低时收紧阈值
+                # 调整范围：0.7x ~ 1.3x
+                adjustment = np.clip(median_atr_pct / 0.005, 0.7, 1.3)  # 0.5%为基准
+                
+                up_threshold = base_threshold * adjustment
+                down_threshold = -base_threshold * adjustment
+                
+                logger.info(f"🎯 {timeframe} 动态阈值: ±{up_threshold*100:.2f}% "
+                          f"(基础={base_threshold*100:.2f}%, ATR调整={adjustment:.2f}x, "
+                          f"ATR%={median_atr_pct*100:.3f}%)")
             
             # 创建分类标签
             conditions = [

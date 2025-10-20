@@ -60,10 +60,30 @@ class FeatureEngineer:
             # 🆕 市场情绪特征
             df = self._add_sentiment_features(df)
             
-            # 移除包含NaN的行
-            df = df.dropna()
+            # 🆕 多时间框架特征融合
+            df = self._add_multi_timeframe_features(df)
             
-            logger.info(f"✅ 特征工程完成: {len(df)}行，特征数: {len(df.columns)}")  # 改为INFO级别
+            # 处理NaN值：训练用dropna，预测用fillna
+            rows_before = len(df)
+            
+            # 先尝试删除NaN
+            df_clean = df.dropna()
+            
+            # 如果删除后数据量<50行，说明是预测场景，改用填充
+            if len(df_clean) < 50 and rows_before >= 100:
+                logger.debug(f"⚠️ 预测场景检测：dropna会导致数据过少（{rows_before}→{len(df_clean)}），改用fillna")
+                # 使用前向填充
+                df = df.ffill()
+                # 如果前向填充后仍有NaN（开头的行），用后向填充
+                df = df.bfill()
+                # 如果还有NaN，用0填充
+                df = df.fillna(0)
+                logger.debug(f"✅ 特征工程完成（预测模式）: {len(df)}行，特征数: {len(df.columns)}")
+            else:
+                # 训练场景，正常删除NaN
+                df = df_clean
+                logger.info(f"✅ 特征工程完成: {len(df)}行，特征数: {len(df.columns)}")
+
             
             return df
             
@@ -91,8 +111,10 @@ class FeatureEngineer:
             new_features['open_close_ratio'] = df['open'] / df['close']
             new_features['body_size'] = abs(df['close'] - df['open']) / df['close']
             
-            # 价格位置
-            new_features['close_position'] = (df['close'] - df['low']) / (df['high'] - df['low'])
+            # 价格位置（避免除以零）
+            price_range_safe = df['high'] - df['low']
+            price_range_safe = price_range_safe.replace(0, np.nan)  # 零范围设为NaN
+            new_features['close_position'] = (df['close'] - df['low']) / price_range_safe
             
             # 多周期价格变化
             for period in [2, 3, 5, 10, 20]:
@@ -144,8 +166,11 @@ class FeatureEngineer:
                 new_features[f'bb_upper_{period}'] = bb_upper
                 new_features[f'bb_lower_{period}'] = bb_lower
                 new_features[f'bb_middle_{period}'] = bb_middle
-                new_features[f'bb_width_{period}'] = (bb_upper - bb_lower) / bb_middle
-                new_features[f'bb_position_{period}'] = (df['close'] - bb_lower) / (bb_upper - bb_lower)
+                # 避免除以零
+                bb_middle_safe = bb_middle.replace(0, np.nan)
+                bb_range_safe = (bb_upper - bb_lower).replace(0, np.nan)
+                new_features[f'bb_width_{period}'] = (bb_upper - bb_lower) / bb_middle_safe
+                new_features[f'bb_position_{period}'] = (df['close'] - bb_lower) / bb_range_safe
             
             # 移动平均线
             sma_dict = {}
@@ -374,7 +399,7 @@ class FeatureEngineer:
             # 一次性添加所有特征
             df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
             
-            logger.info(f"✅ 市场微观结构特征已增强：新增 {len(new_features)} 个特征")  # 改为INFO级别
+            logger.debug(f"✅ 市场微观结构特征已增强：新增 {len(new_features)} 个特征")
             
             return df
             
@@ -409,7 +434,9 @@ class FeatureEngineer:
             new_features['kc_upper'] = kc_upper
             new_features['kc_lower'] = kc_lower
             new_features['kc_middle'] = kc_middle
-            new_features['kc_position'] = (df['close'] - kc_lower) / (kc_upper - kc_lower)
+            # 避免除以零
+            kc_range_safe = (kc_upper - kc_lower).replace(0, np.nan)
+            new_features['kc_position'] = (df['close'] - kc_lower) / kc_range_safe
             
             # Donchian Channels
             dc = ta.volatility.DonchianChannel(df['high'], df['low'], df['close'])
@@ -660,10 +687,60 @@ class FeatureEngineer:
             sentiment_score += price_change.rolling(10).mean() * 100  # 短期动量贡献
             new_features['sentiment_composite'] = sentiment_score / 3  # 平均
             
+            # 9. 🆕 买卖压力指标（基于K线形态）
+            # 买压 = (收盘-最低)/(最高-最低)，卖压 = (最高-收盘)/(最高-最低)
+            price_range = df['high'] - df['low']
+            price_range = price_range.replace(0, np.nan)  # 避免除以0
+            new_features['buy_pressure'] = (df['close'] - df['low']) / price_range
+            new_features['sell_pressure'] = (df['high'] - df['close']) / price_range
+            new_features['pressure_diff'] = new_features['buy_pressure'] - new_features['sell_pressure']
+            
+            # 买卖压力趋势（多周期平均）
+            new_features['buy_pressure_ma5'] = new_features['buy_pressure'].rolling(5).mean()
+            new_features['sell_pressure_ma5'] = new_features['sell_pressure'].rolling(5).mean()
+            
+            # 10. 🆕 成交量加权情绪
+            if 'volume' in df.columns:
+                # 成交量加权价格变化
+                volume_weighted_return = price_change * df['volume']
+                new_features['volume_weighted_sentiment'] = (
+                    volume_weighted_return.rolling(10).sum() / 
+                    (df['volume'].rolling(10).sum() + 1e-10)
+                )
+                
+                # 成交量情绪强度（大单主导程度）
+                volume_std = df['volume'].rolling(20).std()
+                new_features['volume_sentiment_strength'] = (
+                    (df['volume'] - df['volume'].rolling(20).mean()) / 
+                    (volume_std + 1e-10)
+                )
+            
+            # 11. 🆕 市场宽度指标（价格分布）
+            # 价格偏离程度（当前价 vs 多周期均价）
+            if 'sma_5' in df.columns and 'sma_20' in df.columns and 'sma_50' in df.columns:
+                new_features['price_deviation_5'] = (df['close'] - df['sma_5']) / df['sma_5']
+                new_features['price_deviation_20'] = (df['close'] - df['sma_20']) / df['sma_20']
+                new_features['price_deviation_50'] = (df['close'] - df['sma_50']) / df['sma_50']
+                
+                # 市场宽度：多个均线之间的距离
+                new_features['market_breadth'] = (
+                    (df['sma_5'] - df['sma_20']).abs() + 
+                    (df['sma_20'] - df['sma_50']).abs()
+                ) / df['close']
+            
+            # 12. 🆕 极端情绪检测
+            # 检测极端上涨/下跌（可能的反转信号）
+            extreme_up = (price_change > price_change.rolling(50).mean() + 2 * price_change.rolling(50).std())
+            extreme_down = (price_change < price_change.rolling(50).mean() - 2 * price_change.rolling(50).std())
+            new_features['extreme_move'] = extreme_up.astype(int) - extreme_down.astype(int)  # +1=极端上涨, -1=极端下跌
+            
+            # 极端移动后的反转概率（历史统计）
+            new_features['extreme_move_decay'] = new_features['extreme_move'].rolling(5).sum()  # 近期极端次数
+            
             # 一次性添加所有特征
             df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
             
-            logger.info(f"✅ 市场情绪特征已添加：新增 {len(new_features)} 个特征")  # 改为INFO级别
+            logger.debug(f"✅ 市场情绪特征已添加：新增 {len(new_features)} 个特征")
             
             return df
             
@@ -672,6 +749,140 @@ class FeatureEngineer:
             import traceback
             logger.error(traceback.format_exc())
             return df
+    
+    def _add_multi_timeframe_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """添加多时间框架特征融合（优化目标：准确率+5-7%）
+        
+        目标：将长周期趋势信息融入短周期预测，减少逆势交易
+        方法：通过重采样当前数据来模拟更长周期的特征
+        """
+        try:
+            new_features = {}
+            
+            # 确保有timestamp列用于重采样
+            if 'timestamp' not in df.columns:
+                logger.warning("⚠️ 缺少timestamp列，跳过多时间框架特征")
+                return df
+            
+            # 设置timestamp为索引以便重采样
+            df_temp = df.set_index('timestamp')
+            
+            # 1. 模拟4h数据（对于15m和2h有用）
+            # 重采样到4h并向前填充
+            df_4h = df_temp.resample('4h').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).ffill()
+            
+            # 计算4h的关键指标
+            close_4h = df_4h['close']
+            sma_20_4h = close_4h.rolling(20).mean()
+            sma_50_4h = close_4h.rolling(50).mean()
+            rsi_4h = self._calculate_rsi(close_4h, 14)
+            
+            # 4h趋势方向（1=上涨，0=横盘，-1=下跌）
+            trend_4h = pd.Series(0, index=df_4h.index)
+            trend_4h[sma_20_4h > sma_50_4h] = 1  # 多头
+            trend_4h[sma_20_4h < sma_50_4h] = -1  # 空头
+            
+            # 4h波动率
+            returns_4h = close_4h.pct_change()
+            volatility_4h = returns_4h.rolling(20).std()
+            
+            # 将4h数据对齐到原始时间框架
+            new_features['trend_4h'] = trend_4h.reindex(df_temp.index, method='ffill')
+            new_features['rsi_4h'] = rsi_4h.reindex(df_temp.index, method='ffill')
+            new_features['volatility_4h'] = volatility_4h.reindex(df_temp.index, method='ffill')
+            new_features['sma_20_4h'] = sma_20_4h.reindex(df_temp.index, method='ffill')
+            new_features['sma_50_4h'] = sma_50_4h.reindex(df_temp.index, method='ffill')
+            
+            # 2. 模拟2h数据（对15m有用）
+            df_2h = df_temp.resample('2h').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).ffill()
+            
+            close_2h = df_2h['close']
+            sma_20_2h = close_2h.rolling(20).mean()
+            sma_50_2h = close_2h.rolling(50).mean()
+            rsi_2h = self._calculate_rsi(close_2h, 14)
+            
+            # 2h趋势方向
+            trend_2h = pd.Series(0, index=df_2h.index)
+            trend_2h[sma_20_2h > sma_50_2h] = 1
+            trend_2h[sma_20_2h < sma_50_2h] = -1
+            
+            # 2h波动率
+            returns_2h = close_2h.pct_change()
+            volatility_2h = returns_2h.rolling(20).std()
+            
+            # 将2h数据对齐到原始时间框架
+            new_features['trend_2h'] = trend_2h.reindex(df_temp.index, method='ffill')
+            new_features['rsi_2h'] = rsi_2h.reindex(df_temp.index, method='ffill')
+            new_features['volatility_2h'] = volatility_2h.reindex(df_temp.index, method='ffill')
+            new_features['sma_20_2h'] = sma_20_2h.reindex(df_temp.index, method='ffill')
+            new_features['sma_50_2h'] = sma_50_2h.reindex(df_temp.index, method='ffill')
+            
+            # 3. 趋势一致性特征（短中长周期是否一致）
+            if 'sma_20' in df_temp.columns and 'sma_50' in df_temp.columns:
+                # 当前时间框架的趋势（使用df_temp避免索引不匹配）
+                trend_current = pd.Series(0, index=df_temp.index)
+                trend_current[df_temp['sma_20'] > df_temp['sma_50']] = 1
+                trend_current[df_temp['sma_20'] < df_temp['sma_50']] = -1
+                
+                # 多时间框架趋势一致性
+                new_features['trend_alignment_2h'] = (trend_current == new_features['trend_2h']).astype(int)
+                new_features['trend_alignment_4h'] = (trend_current == new_features['trend_4h']).astype(int)
+                new_features['trend_alignment_all'] = (
+                    (new_features['trend_alignment_2h'] + new_features['trend_alignment_4h']) / 2
+                )
+            
+            # 4. 相对强弱（当前时间框架 vs 更长周期）
+            if 'rsi_14' in df_temp.columns:
+                new_features['rsi_diff_2h'] = df_temp['rsi_14'] - new_features['rsi_2h']
+                new_features['rsi_diff_4h'] = df_temp['rsi_14'] - new_features['rsi_4h']
+            
+            # 5. 价格相对位置（相对于更长周期均线）
+            if 'close' in df_temp.columns:
+                new_features['price_to_sma20_2h'] = (df_temp['close'] - new_features['sma_20_2h']) / new_features['sma_20_2h']
+                new_features['price_to_sma50_2h'] = (df_temp['close'] - new_features['sma_50_2h']) / new_features['sma_50_2h']
+                new_features['price_to_sma20_4h'] = (df_temp['close'] - new_features['sma_20_4h']) / new_features['sma_20_4h']
+                new_features['price_to_sma50_4h'] = (df_temp['close'] - new_features['sma_50_4h']) / new_features['sma_50_4h']
+            
+            # 将新特征添加到df_temp（确保索引一致）
+            for col_name, col_data in new_features.items():
+                df_temp[col_name] = col_data
+            
+            # 恢复原始DataFrame结构（reset timestamp索引）
+            df = df_temp.reset_index()
+            
+            logger.debug(f"✅ 多时间框架特征已添加：新增 {len(new_features)} 个特征")
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"❌ 添加多时间框架特征失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return df
+    
+    def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> pd.Series:
+        """计算RSI指标"""
+        try:
+            delta = prices.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+            rs = gain / (loss + 1e-10)
+            rsi = 100 - (100 / (1 + rs))
+            return rsi
+        except:
+            return pd.Series(50, index=prices.index)  # 默认值
     
     def get_feature_importance(self, df: pd.DataFrame) -> Dict[str, float]:
         """获取特征重要性（基于方差）"""

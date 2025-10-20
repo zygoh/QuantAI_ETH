@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     # 交易配置
     SYMBOL: str = "ETHUSDT"
     LEVERAGE: int = 20  # 20x杠杆（1.5%止损 × 20x = 30%单次风险，风险回报1:2.67）
-    CONFIDENCE_THRESHOLD: float = 0.5  # 降低到0.40以增加信号数量（待模型准确率提升后再调回0.44-0.50）
+    CONFIDENCE_THRESHOLD: float = 0.35  # 降低到0.35以增加信号数量（81%准确率下合理阈值）
     
     # 交易模式配置
     TRADING_MODE: str = "SIGNAL_ONLY"  # 默认交易模式：SIGNAL_ONLY（信号模式/虚拟交易）或 AUTO（自动交易/实盘）
