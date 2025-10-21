@@ -483,6 +483,19 @@ class PostgreSQLManager:
                 
                 signals = []
                 for row in rows:
+                    # 🔧 智能处理predictions字段（可能是JSON字符串或已解析的dict）
+                    predictions_value = None
+                    if row[8]:
+                        if isinstance(row[8], str):
+                            # 如果是字符串，需要解析
+                            predictions_value = json.loads(row[8])
+                        elif isinstance(row[8], dict):
+                            # 如果已经是dict（asyncpg自动解析），直接使用
+                            predictions_value = row[8]
+                        else:
+                            logger.warning(f"未知的predictions类型: {type(row[8])}")
+                            predictions_value = None
+                    
                     signal = {
                         'symbol': row[0],
                         'signal_type': row[1],
@@ -492,7 +505,7 @@ class PostgreSQLManager:
                         'take_profit': float(row[5]) if row[5] else 0,
                         'position_size': float(row[6]) if row[6] else 0,
                         'timestamp': row[7],
-                        'predictions': json.loads(row[8]) if row[8] else None
+                        'predictions': predictions_value
                     }
                     signals.append(signal)
                 

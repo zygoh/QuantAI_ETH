@@ -399,7 +399,6 @@ class FeatureEngineer:
             # 一次性添加所有特征
             df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
             
-            logger.debug(f"✅ 市场微观结构特征已增强：新增 {len(new_features)} 个特征")
             
             return df
             
@@ -740,7 +739,6 @@ class FeatureEngineer:
             # 一次性添加所有特征
             df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
             
-            logger.debug(f"✅ 市场情绪特征已添加：新增 {len(new_features)} 个特征")
             
             return df
             
@@ -862,7 +860,6 @@ class FeatureEngineer:
             # 恢复原始DataFrame结构（reset timestamp索引）
             df = df_temp.reset_index()
             
-            logger.debug(f"✅ 多时间框架特征已添加：新增 {len(new_features)} 个特征")
             
             return df
             

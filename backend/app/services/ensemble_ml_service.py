@@ -148,7 +148,6 @@ class EnsembleMLService(MLService):
             X = X[mask]
             y = y[mask]
             
-            logger.debug(f"特征复用: {len(feature_columns)}个特征, 样本数量: {len(X)}")
             
             return X, y
             
@@ -201,7 +200,6 @@ class EnsembleMLService(MLService):
                 'models': ['LightGBM', 'XGBoost', 'CatBoost']
             }
             await cache_manager.set_model_metrics(settings.SYMBOL, metrics_cache)
-            logger.debug(f"✅ 模型指标已缓存: 平均准确率={avg_accuracy:.4f}")
             
             return {
                 'results': results,
@@ -371,7 +369,7 @@ class EnsembleMLService(MLService):
             # 🔑 元学习器也需要HOLD惩罚（关键修复！）
             from sklearn.utils.class_weight import compute_sample_weight
             meta_class_weights = compute_sample_weight('balanced', meta_labels_val)
-            meta_hold_penalty = np.where(meta_labels_val == 1, 0.5, 1.0)  # 元学习器HOLD惩罚更重（0.5）
+            meta_hold_penalty = np.where(meta_labels_val == 1, 0.6, 1.0)  # 元学习器HOLD惩罚更重（0.6，更平衡）
             meta_sample_weights = meta_class_weights * meta_hold_penalty
             
             import lightgbm as lgb
@@ -390,7 +388,7 @@ class EnsembleMLService(MLService):
             )
             meta_learner.fit(meta_features_val, meta_labels_val, sample_weight=meta_sample_weights)
             
-            logger.info(f"✅ 元学习器训练完成（已应用HOLD惩罚0.5）")
+            logger.info(f"✅ 元学习器训练完成（已应用HOLD惩罚0.6，更平衡）")
             
             # 4️⃣ 保存模型到字典
             if timeframe not in self.ensemble_models:
@@ -512,7 +510,7 @@ class EnsembleMLService(MLService):
         # 🔑 元学习器也需要HOLD惩罚（关键修复！）
         from sklearn.utils.class_weight import compute_sample_weight
         meta_class_weights = compute_sample_weight('balanced', y_train)
-        meta_hold_penalty = np.where(y_train == 1, 0.5, 1.0)  # 元学习器HOLD惩罚更重（0.5）
+        meta_hold_penalty = np.where(y_train == 1, 0.6, 1.0)  # 元学习器HOLD惩罚更重（0.6，更平衡）
         meta_sample_weights = meta_class_weights * meta_hold_penalty
         
         import lightgbm as lgb
@@ -531,7 +529,7 @@ class EnsembleMLService(MLService):
         )
         meta_learner.fit(meta_features_train, y_train, sample_weight=meta_sample_weights)
         
-        logger.info(f"✅ 元学习器训练完成（已应用HOLD惩罚0.5）")
+        logger.info(f"✅ 元学习器训练完成（已应用HOLD惩罚0.6，更平衡）")
         
         # 6. 验证集评估
         logger.info(f"🎯 Stage 4: 验证集评估...")
@@ -846,10 +844,22 @@ class EnsembleMLService(MLService):
                     with open(filepath, 'wb') as f:
                         pickle.dump(models[full_name], f)
                     saved_count += 1
-                    logger.debug(f"✓ 保存 {timeframe} {full_name} 模型")
+            
+            # 🔥 保存scaler和features（关键！预测时需要）
+            if timeframe in self.scalers:
+                scaler_path = model_dir / f"{settings.SYMBOL}_{timeframe}_scaler.pkl"
+                with open(scaler_path, 'wb') as f:
+                    pickle.dump(self.scalers[timeframe], f)
+                saved_count += 1
+            
+            if timeframe in self.feature_columns_dict:
+                features_path = model_dir / f"{settings.SYMBOL}_{timeframe}_features.pkl"
+                with open(features_path, 'wb') as f:
+                    pickle.dump(self.feature_columns_dict[timeframe], f)
+                saved_count += 1
             
             if saved_count > 0:
-                logger.info(f"✅ {timeframe} 集成模型保存完成（{saved_count}个模型）")
+                logger.info(f"✅ {timeframe} 集成模型保存完成（{saved_count}个文件）")
             else:
                 logger.warning(f"⚠️ {timeframe} 没有模型被保存（键名: {list(models.keys())}）")
             
@@ -885,9 +895,20 @@ class EnsembleMLService(MLService):
                 filepath = model_dir / f"{settings.SYMBOL}_{timeframe}_{short_name}_model.pkl"
                 with open(filepath, 'rb') as f:
                     models[full_name] = pickle.load(f)  # 🔑 使用完整键名
-                logger.debug(f"✓ 加载 {timeframe} {full_name} 模型")
             
             self.ensemble_models[timeframe] = models
+            
+            # 🔥 加载scaler和features（关键！预测时需要）
+            scaler_path = model_dir / f"{settings.SYMBOL}_{timeframe}_scaler.pkl"
+            if scaler_path.exists():
+                with open(scaler_path, 'rb') as f:
+                    self.scalers[timeframe] = pickle.load(f)
+            
+            features_path = model_dir / f"{settings.SYMBOL}_{timeframe}_features.pkl"
+            if features_path.exists():
+                with open(features_path, 'rb') as f:
+                    self.feature_columns_dict[timeframe] = pickle.load(f)
+            
             logger.info(f"✅ {timeframe} 集成模型加载完成（{len(models)}个模型）")
             return True
             

@@ -39,15 +39,12 @@ class HealthMonitor:
     async def start(self):
         """启动健康监控"""
         try:
-            logger.info(f"启动健康监控服务（检查间隔: {self.check_interval}秒）")
+            logger.info(f"启动健康监控服务（由scheduler在每天00:00执行）")
             
             self.is_running = True
             
-            # 不在启动时立即检查，等待第一个定时周期
-            # await self.check_system_health()  # 注释掉，避免启动时数据未完成
-            
-            # 启动定期检查任务（第一次检查在5分钟后）
-            self.monitor_task = asyncio.create_task(self._monitor_loop())
+            # 不再启动自动循环，由scheduler统一调度
+            # self.monitor_task = asyncio.create_task(self._monitor_loop())
             
             logger.info("健康监控服务启动完成")
             
@@ -369,7 +366,7 @@ class HealthMonitor:
             missing_files = []
             
             for timeframe in settings.TIMEFRAMES:
-                # 检查Stacking集成模型的4个文件
+                # 🔧 检查Stacking集成模型的6个文件（4个模型 + scaler + features）
                 lgb_path = f"models/{settings.SYMBOL}_{timeframe}_lgb_model.pkl"
                 xgb_path = f"models/{settings.SYMBOL}_{timeframe}_xgb_model.pkl"
                 cat_path = f"models/{settings.SYMBOL}_{timeframe}_cat_model.pkl"

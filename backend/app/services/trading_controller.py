@@ -336,16 +336,16 @@ class TradingController:
         try:
             logger.info(f"收到交易信号: {signal.signal_type} {signal.symbol} (置信度: {signal.confidence:.4f})")
             
+            # 🔥 自动创建会话（如果不存在）
+            if not self.current_session:
+                await self._start_new_session()
+            
             # 更新会话统计
             if self.current_session:
                 self.current_session.signals_generated += 1
             
-            # 检查系统状态
-            if self.system_state != SystemState.RUNNING:
-                logger.info("系统未在运行状态，跳过信号执行")
-                return
-            
-            # 无论什么模式，都执行信号（trading_engine 内部会根据模式决定虚拟/实盘）
+            # 🔥 直接执行信号（不检查系统状态）
+            # trading_engine 内部会根据 TRADING_MODE 决定虚拟/实盘交易
             result = await self.trading_engine.execute_signal(signal)
             
             if result.get('success'):

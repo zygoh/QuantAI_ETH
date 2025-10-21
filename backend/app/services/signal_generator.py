@@ -110,7 +110,6 @@ class SignalGenerator:
                 logger.info(f"✅ 预热已完成（{self.signal_counter}个信号），系统处于正常交易模式")
             
             # 🔥 首次启动：立即对所有时间框架进行预测，填充信号缓存
-            logger.info("🎯 首次启动：预测所有时间框架以填充信号缓存...")
             await self._initial_predictions()
             
             logger.info("✅ 交易信号生成器启动完成")
@@ -137,7 +136,6 @@ class SignalGenerator:
                     
                     if buffer_size <= max_limit:
                         # 一次性获取
-                        logger.debug(f"获取 {timeframe} 初始数据（{buffer_size}条，覆盖{self.buffer_days}天）...")
                         klines = binance_client.get_klines(
                             symbol=symbol,
                             interval=timeframe,
@@ -162,7 +160,6 @@ class SignalGenerator:
                                 from datetime import datetime
                                 end_time = int(datetime.now().timestamp() * 1000)
                             
-                            logger.debug(f"  批次 {batch + 1}/{batches}: 获取{batch_limit}条...")
                             klines = binance_client.get_klines(
                                 symbol=symbol,
                                 interval=timeframe,
@@ -173,7 +170,6 @@ class SignalGenerator:
                             if klines:
                                 # 插入到开头（因为是倒序获取）
                                 all_klines = klines + all_klines
-                                logger.debug(f"  已获取 {len(all_klines)}/{buffer_size} 条")
                             else:
                                 logger.warning(f"  批次 {batch + 1} 未获取到数据")
                                 break
@@ -246,7 +242,6 @@ class SignalGenerator:
             
             # 2. 🔥 对该时间框架进行预测并缓存（每个时间框架独立预测）
             timeframe = kline_data.interval
-            logger.info(f"🎯 {timeframe} K线完成，开始预测该时间框架...")
             
             prediction = await self._predict_single_timeframe(kline_data.symbol, timeframe)
             
@@ -352,16 +347,16 @@ class SignalGenerator:
                     'taker_buy_quote_volume': kline_data.taker_buy_quote_volume  # ✅ 主动买入额
                 }
                 
-                write_start = datetime.now()
-                await postgresql_manager.write_kline_data([kline_dict])
-                write_duration = (datetime.now() - write_start).total_seconds()
+                # 🚀 异步写入数据库（不等待完成，避免阻塞信号生成）
+                import asyncio
+                asyncio.create_task(postgresql_manager.write_kline_data([kline_dict]))
                 
                 # ✅ 日志输出时转换为北京时间（仅用于展示）
                 shanghai_tz = pytz.timezone('Asia/Shanghai')
                 open_time_beijing = datetime.fromtimestamp(kline_data.open_time / 1000, tz=shanghai_tz)
                 
-                logger.info(f"💾 WebSocket数据已写入数据库: {timeframe}")
-                logger.info(f"   北京时间: {open_time_beijing.strftime('%Y-%m-%d %H:%M:%S')} | trades={kline_data.trades} | 耗时: {write_duration:.3f}秒")
+                logger.info(f"💾 WebSocket数据已提交写入: {timeframe}")
+                logger.info(f"   北京时间: {open_time_beijing.strftime('%Y-%m-%d %H:%M:%S')} | trades={kline_data.trades}")
             except Exception as db_error:
                 logger.error(f"❌ 写入数据库失败: {db_error}")
                 logger.error(f"   K线详情: symbol={kline_dict.get('symbol')} interval={kline_dict.get('interval')} timestamp={kline_dict.get('timestamp')}")
@@ -916,7 +911,6 @@ class SignalGenerator:
             }
             
             await postgresql_manager.write_signal_data(signal_data)
-            logger.debug(f"✅ 保存合成信号: {signal.signal_type} (confidence={signal.confidence:.4f})")
             
         except Exception as e:
             logger.error(f"保存信号失败: {e}")

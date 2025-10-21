@@ -70,8 +70,12 @@ class TaskScheduler:
                 interval_hours=6  # 每6小时检查一次
             )
             
-            # 系统健康检查已由 health_monitor 服务独立负责（每5分钟检查）
-            # 不在scheduler中重复设置
+            # 🔧 系统健康检查任务（每天00:00执行）
+            self.tasks['health_check'] = ScheduledTask(
+                name='系统健康检查',
+                func=self._run_health_check,
+                scheduled_time=dt_time(0, 0)  # 每天00:00
+            )
             
             # 数据清理任务（禁用：只在系统启动时清理，不在运行中清理）
             # self.tasks['data_cleanup'] = ScheduledTask(
@@ -80,7 +84,7 @@ class TaskScheduler:
             #     interval_hours=24
             # )
             
-            logger.info(f"初始化了{len(self.tasks)}个调度任务（健康检查由health_monitor服务负责，数据清理仅在启动时执行）")
+            logger.info(f"初始化了{len(self.tasks)}个调度任务（数据清理仅在启动时执行）")
             
         except Exception as e:
             logger.error(f"初始化调度任务失败: {e}")
@@ -133,19 +137,28 @@ class TaskScheduler:
             import os
             from app.core.config import settings
             
-            # 检查是否存在至少一个时间框架的模型文件
+            # 检查是否存在Stacking集成模型文件（4个模型：lgb, xgb, cat, meta）
             model_dir = "models"
             has_model = False
             
             if os.path.exists(model_dir):
                 for timeframe in settings.TIMEFRAMES:
-                    model_file = os.path.join(model_dir, f"{settings.SYMBOL}_{timeframe}_model.pkl")
-                    if os.path.exists(model_file):
+                    # 🔧 检查Stacking集成的4个模型文件
+                    required_models = ['lgb', 'xgb', 'cat', 'meta']
+                    timeframe_has_all_models = True
+                    
+                    for model_name in required_models:
+                        model_file = os.path.join(model_dir, f"{settings.SYMBOL}_{timeframe}_{model_name}_model.pkl")
+                        if not os.path.exists(model_file):
+                            timeframe_has_all_models = False
+                            break
+                    
+                    if timeframe_has_all_models:
                         has_model = True
                         break
             
             if not has_model:
-                logger.warning("⚠️ 未找到已保存的模型文件，开始首次训练...")
+                logger.warning("⚠️ 未找到已保存的Stacking集成模型文件，开始首次训练...")
                 logger.info("🎓 首次部署：立即执行模型训练（后续将在每天00:01自动训练）")
                 
                 # 立即执行模型训练
@@ -154,7 +167,7 @@ class TaskScheduler:
                     await self._execute_task('model_training', task)
                     logger.info("✅ 首次模型训练完成")
             else:
-                logger.info("✅ 检测到已保存的模型，跳过首次训练")
+                logger.info("✅ 检测到已保存的Stacking集成模型，跳过首次训练")
                 
         except Exception as e:
             logger.error(f"检查初始模型失败: {e}")
@@ -351,8 +364,26 @@ class TaskScheduler:
             logger.error(f"数据完整性检查失败: {e}")
             raise
     
-    # 系统健康检查已由 health_monitor 服务独立负责（每5分钟自动检查）
-    # 不在scheduler中重复实现
+    async def _run_health_check(self):
+        """运行系统健康检查（每天00:00执行）"""
+        try:
+            logger.info("开始系统健康检查")
+            
+            from app.services.health_monitor import health_monitor
+            
+            # 执行健康检查
+            health_status = await health_monitor.check_system_health()
+            
+            # 输出健康状态摘要
+            overall = health_status.get('overall', 'UNKNOWN')
+            status_icon = "✅" if overall == "HEALTHY" else "⚠️" if overall == "DEGRADED" else "❌"
+            logger.info(f"{status_icon} 每日健康检查完成: {overall}")
+            
+            logger.info("系统健康检查完成")
+            
+        except Exception as e:
+            logger.error(f"系统健康检查失败: {e}")
+            raise
     
     async def _run_data_cleanup(self):
         """运行数据清理任务"""
@@ -373,21 +404,30 @@ class TaskScheduler:
             raise
     
     async def _should_retrain_model(self) -> bool:
-        """检查是否应该重新训练模型（多时间框架版本）"""
+        """检查是否应该重新训练模型（Stacking集成版本）"""
         try:
-            # 检查是否有任何一个时间框架的模型缺失
-            if not self.ml_service.models or len(self.ml_service.models) == 0:
-                logger.info("📋 模型不存在，需要训练")
+            # 🔧 检查Stacking集成模型（ensemble_models字典）
+            if not hasattr(self.ml_service, 'ensemble_models') or not self.ml_service.ensemble_models:
+                logger.info("📋 Stacking集成模型不存在，需要训练")
                 return True
             
-            # 检查是否所有时间框架都有模型
+            # 检查是否所有时间框架都有完整的集成模型（4个模型）
             missing_timeframes = []
+            required_models = ['lightgbm', 'xgboost', 'catboost', 'meta_learner']
+            
             for timeframe in settings.TIMEFRAMES:
-                if timeframe not in self.ml_service.models or self.ml_service.models[timeframe] is None:
+                if timeframe not in self.ml_service.ensemble_models:
                     missing_timeframes.append(timeframe)
+                    continue
+                
+                # 检查该时间框架是否有完整的4个模型
+                ensemble = self.ml_service.ensemble_models[timeframe]
+                for model_name in required_models:
+                    if model_name not in ensemble or ensemble[model_name] is None:
+                        missing_timeframes.append(f"{timeframe}_{model_name}")
             
             if missing_timeframes:
-                logger.info(f"📋 部分时间框架模型缺失: {missing_timeframes}，需要训练")
+                logger.info(f"📋 部分集成模型缺失: {missing_timeframes}，需要训练")
                 return True
             
             # 所有模型都存在，按计划重新训练（保持模型更新）

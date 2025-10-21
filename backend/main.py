@@ -135,10 +135,10 @@ async def lifespan(app: FastAPI):
         await scheduler.start()
         logger.info("任务调度器启动完成")
         
-        # 启动健康监控服务
+        # 启动健康监控服务（由scheduler在每天00:00执行）
         health_monitor.set_signal_generator(signal_generator)
         await health_monitor.start()
-        logger.info("健康监控服务启动完成（检查间隔: 5分钟）")
+        logger.info("健康监控服务启动完成（检查时间: 每天00:00）")
         
         # 启动WebSocket推送任务
         from app.api.endpoints.websocket import start_websocket_tasks, on_signal_generated, on_risk_alert

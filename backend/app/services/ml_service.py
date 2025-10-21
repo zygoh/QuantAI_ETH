@@ -67,11 +67,11 @@ class MLService:
         # ✅ 差异化配置：根据新数据量调整模型复杂度
         self.lgb_params_by_timeframe = {
             '15m': {
-                'num_leaves': 95,        # 从127降低，防止过拟合
-                'min_child_samples': 50,  # 从30提高，更保守
-                'max_depth': 7,          # 从10降低，限制深度
-                'reg_alpha': 0.5,        # L1正则化
-                'reg_lambda': 0.5        # L2正则化
+                'num_leaves': 110,       # 95→110，适度增加复杂度
+                'min_child_samples': 45,  # 50→45，略微放松
+                'max_depth': 8,          # 7→8，增加深度
+                'reg_alpha': 0.4,        # 0.5→0.4，略微放松L1正则
+                'reg_lambda': 0.4        # 0.5→0.4，略微放松L2正则
             },
             '2h': {
                 'num_leaves': 63,        # 数据增加(5,184条)，增加复杂度
@@ -240,7 +240,6 @@ class MLService:
             if train_data.empty:
                 raise Exception(f"{timeframe} 训练数据为空")
             
-            logger.debug(f"📈 {timeframe} 原始数据: {len(train_data)}条")
             
             # 保存原始训练数据（用于后续写入数据库）
             train_data_with_timeframe = train_data.copy()
@@ -296,7 +295,6 @@ class MLService:
     async def predict(self, data: pd.DataFrame, timeframe: str) -> Dict[str, Any]:
         """模型预测（需指定时间框架）"""
         try:
-            logger.debug(f"🔮 开始{timeframe}预测 (输入数据: {len(data)}条)")
             
             # 检查该时间框架的模型是否加载
             if timeframe not in self.models or self.models[timeframe] is None:
@@ -313,7 +311,6 @@ class MLService:
             if processed_data.empty:
                 raise Exception("特征工程后数据为空")
             
-            logger.debug(f"✅ {timeframe} 特征工程完成: {len(processed_data)}条 -> {len(processed_data.columns)}列特征")
             
             # 获取最新一行数据（使用该时间框架的特征列）
             feature_columns = self.feature_columns_dict.get(timeframe, [])
@@ -325,14 +322,11 @@ class MLService:
             # ✅ 调试日志：验证输入数据
             if 'close' in processed_data.columns:
                 last_3_closes = processed_data['close'].tail(3).tolist()
-                logger.debug(f"📌 {timeframe} 最近3根K线收盘价: {[f'{c:.2f}' for c in last_3_closes]}")
             
-            logger.debug(f"📌 {timeframe} 使用最新数据预测 (特征列: {len(feature_columns)}个)")
             
             # ✅ 记录关键特征值（用于诊断）
             if 'price_change' in latest_data.columns:
                 price_change = latest_data['price_change'].iloc[0]
-                logger.debug(f"   关键特征 - price_change: {price_change:.6f}")
             
             # 数据预处理（使用该时间框架的scaler）
             X_scaled = self._scale_features(latest_data, timeframe=timeframe, fit=False)
@@ -615,7 +609,6 @@ class MLService:
             if short_count / total < 0.20 or long_count / total < 0.20:
                 logger.warning(f"⚠️ {timeframe} LONG/SHORT类别过少，建议降低阈值")
             
-            logger.debug("✅ 标签创建：无未来函数（只看下一根K线）")
             
             return df
             
@@ -704,7 +697,7 @@ class MLService:
             # 不同时间框架的最少样本数/特征系数
             # 🎯 调整策略：允许更多特征以达到50%准确率目标
             ratio_map = {
-                '15m': 150,  # 从200降低→允许更多特征（34360/150=229个，取150）
+                '15m': 120,  # 150→120，允许更多特征（34360/120=286个，取150）
                 '2h': 80,    # 从150降低→允许更多特征（3040/80=38个）
                 '4h': 50     # 从100降低→允许更多特征（1960/50=39个）
             }
@@ -945,7 +938,6 @@ class MLService:
                     
                     if timeframe in self.models:
                         feature_count = len(self.feature_columns_dict.get(timeframe, []))
-                        logger.info(f"✅ {timeframe} 模型加载成功 ({feature_count}个特征)")
                 
                 except Exception as e:
                     logger.warning(f"⚠️ {timeframe} 模型加载失败: {e}")
