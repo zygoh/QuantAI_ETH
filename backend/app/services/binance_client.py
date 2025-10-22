@@ -336,10 +336,24 @@ class BinanceWebSocketClient:
         self.connection_start_time = None
         self.monitor_task = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None  # 🔥 保存事件循环
+        self.reconnect_count = 0  # 重连次数统计
+        self.max_reconnect_attempts = 10  # 最大连续重连次数
+        self.last_message_time = None  # 最后收到消息的时间
+        self.health_check_task = None  # 健康检查任务
         
     def start_websocket(self):
         """启动WebSocket连接"""
         try:
+            # 🔥 如果事件循环还未设置，尝试获取当前循环
+            if self.loop is None:
+                try:
+                    self.loop = asyncio.get_running_loop()
+                    logger.info("✅ 事件循环已保存")
+                except RuntimeError:
+                    logger.warning("⚠️ 当前没有运行的事件循环，重连功能可能受限")
+            else:
+                logger.debug("✅ 使用已设置的事件循环")
+            
             # WebSocket: wss://n8n.do2ge.com/tail/ws/relay -> wss://fstream.binance.com
             stream_url = "wss://n8n.do2ge.com/tail/ws/relay"
             
@@ -353,20 +367,28 @@ class BinanceWebSocketClient:
             
             self.is_running = True
             self.connection_start_time = datetime.now()
+            self.last_message_time = datetime.now()
             
             # 启动连接监控任务（24小时重建连接）
             if self.monitor_task is None or self.monitor_task.done():
                 self.monitor_task = asyncio.create_task(self._monitor_connection())
             
+            # 启动健康检查任务（检测消息超时）
+            if self.health_check_task is None or self.health_check_task.done():
+                self.health_check_task = asyncio.create_task(self._health_check())
+            
             logger.info(f"WebSocket客户端启动 (URL: {stream_url})")
             
         except Exception as e:
             logger.error(f"启动WebSocket失败: {e}")
+            raise
     
     def _on_open(self, ws):
         """WebSocket连接打开"""
         self.is_connected = True
-        logger.info("WebSocket连接已建立")
+        self.reconnect_count = 0  # 重置重连计数
+        self.current_reconnect_delay = self.reconnect_delay  # 重置重连延迟
+        logger.info("✅ WebSocket连接已建立")
     
     def _on_close(self, ws, close_status_code=None, close_msg=None):
         """WebSocket连接关闭（同步回调，在WebSocket线程）"""
@@ -425,6 +447,9 @@ class BinanceWebSocketClient:
     def _on_message(self, ws, message):
         """处理WebSocket消息"""
         try:
+            # 更新最后消息时间（用于健康检查）
+            self.last_message_time = datetime.now()
+            
             data = json.loads(message)
             
             # 🔥 修复：兼容两种消息格式
@@ -473,63 +498,135 @@ class BinanceWebSocketClient:
     async def _reconnect(self):
         """自动重连"""
         try:
-            await asyncio.sleep(self.current_reconnect_delay)
+            # 检查是否超过最大重连次数
+            self.reconnect_count += 1
+            if self.reconnect_count > self.max_reconnect_attempts:
+                logger.error(f"❌ 已达到最大重连次数 ({self.max_reconnect_attempts})，停止重连")
+                self.is_reconnecting = False
+                self.is_running = False
+                return
             
-            logger.info("尝试重新建立WebSocket连接...")
+            logger.info(f"尝试重新建立WebSocket连接 (第 {self.reconnect_count}/{self.max_reconnect_attempts} 次)...")
+            await asyncio.sleep(self.current_reconnect_delay)
             
             # 停止旧连接
             if self.ws_client:
                 try:
                     self.ws_client.stop()
-                except:
-                    pass
+                    await asyncio.sleep(0.5)  # 等待连接完全关闭
+                except Exception as stop_error:
+                    logger.warning(f"停止旧连接时出错: {stop_error}")
             
             # 重新启动
             self.start_websocket()
             
-            # 恢复所有订阅
-            await asyncio.sleep(1)  # 等待连接建立
-            self._restore_subscriptions()
+            # 🔥 等待连接建立，增加重试机制
+            max_wait_time = 10  # 最多等待10秒
+            wait_time = 0
+            while not self.is_connected and wait_time < max_wait_time:
+                await asyncio.sleep(0.5)
+                wait_time += 0.5
             
-            # 重置重连延迟
-            self.current_reconnect_delay = self.reconnect_delay
-            self.is_reconnecting = False  # 🔓 释放重连锁
-            logger.info("WebSocket重连成功")
+            if self.is_connected:
+                logger.info("✅ WebSocket连接已建立，开始恢复订阅...")
+                # 再等待一点时间确保连接稳定
+                await asyncio.sleep(1)
+                self._restore_subscriptions()
+                
+                # 重置重连延迟和计数
+                self.current_reconnect_delay = self.reconnect_delay
+                self.reconnect_count = 0
+                self.is_reconnecting = False  # 🔓 释放重连锁
+                logger.info("✅ WebSocket重连成功")
+            else:
+                logger.error("❌ WebSocket连接建立超时，重连失败")
+                raise Exception("连接建立超时")
             
         except Exception as e:
-            logger.error(f"WebSocket重连失败: {e}")
+            logger.error(f"❌ WebSocket重连失败 (第 {self.reconnect_count} 次): {e}")
             
             # 指数退避，增加重连延迟
             self.current_reconnect_delay = min(
                 self.current_reconnect_delay * 2,
                 self.max_reconnect_delay
             )
-            logger.warning(f"重连失败，下次重连延迟: {self.current_reconnect_delay}秒")
+            logger.warning(f"⏱️ 下次重连延迟: {self.current_reconnect_delay}秒")
             
             # 🔄 重连失败后，再次尝试重连
             self.is_reconnecting = False  # 释放锁，允许下次重连
             
-            # 再次调度重连任务
-            if self.is_running and self.loop:
-                logger.info("调度下次重连...")
+            # 再次调度重连任务（如果还在运行且未超过最大次数）
+            if self.is_running and self.loop and self.reconnect_count < self.max_reconnect_attempts:
+                logger.info("📅 调度下次重连...")
                 future = asyncio.run_coroutine_threadsafe(self._reconnect(), self.loop)
                 self.reconnect_task = future
+            elif self.reconnect_count >= self.max_reconnect_attempts:
+                logger.error("❌ 已达到最大重连次数，停止重连尝试")
+                self.is_running = False
     
     def _restore_subscriptions(self):
         """恢复所有订阅"""
         try:
-            logger.info(f"恢复 {len(self.subscriptions)} 个订阅...")
+            logger.info(f"📋 开始恢复 {len(self.subscriptions)} 个订阅...")
+            success_count = 0
+            failed_subs = []
+            
             for sub_info in self.subscriptions:
-                if sub_info['type'] == 'kline':
-                    self._do_subscribe_kline(
-                        sub_info['symbol'],
-                        sub_info['interval']
-                    )
-                elif sub_info['type'] == 'ticker':
-                    self._do_subscribe_ticker(sub_info['symbol'])
-            logger.info("订阅恢复完成")
+                try:
+                    if sub_info['type'] == 'kline':
+                        self._do_subscribe_kline(
+                            sub_info['symbol'],
+                            sub_info['interval']
+                        )
+                        success_count += 1
+                    elif sub_info['type'] == 'ticker':
+                        self._do_subscribe_ticker(sub_info['symbol'])
+                        success_count += 1
+                except Exception as sub_error:
+                    logger.error(f"  └─ ❌ 恢复订阅失败: {sub_info}")
+                    failed_subs.append(sub_info)
+            
+            if success_count == len(self.subscriptions):
+                logger.info(f"✅ 订阅恢复完成: {success_count}/{len(self.subscriptions)} 全部成功")
+            else:
+                logger.warning(f"⚠️ 订阅恢复完成: {success_count}/{len(self.subscriptions)} 成功")
+                if failed_subs:
+                    logger.error(f"  失败列表: {failed_subs}")
+                    
         except Exception as e:
             logger.error(f"恢复订阅失败: {e}")
+    
+    async def _health_check(self):
+        """健康检查（检测消息超时）"""
+        # 15m K线周期需要更长的超时时间（至少20分钟）
+        message_timeout = 1200  # 20分钟（考虑最长15m周期 + 缓冲）
+        warning_timeout = 600  # 10分钟警告（但不重连）
+        
+        while self.is_running:
+            try:
+                await asyncio.sleep(60)  # 每分钟检查一次
+                
+                if self.is_connected and self.last_message_time:
+                    elapsed = (datetime.now() - self.last_message_time).total_seconds()
+                    
+                    if elapsed > message_timeout:
+                        logger.error(f"❌ WebSocket已 {elapsed:.0f} 秒未收到消息，连接异常！")
+                        logger.info("🔄 主动触发重连...")
+                        
+                        # 标记连接断开并触发重连
+                        self.is_connected = False
+                        if not self.is_reconnecting and self.loop:
+                            self.is_reconnecting = True
+                            future = asyncio.run_coroutine_threadsafe(self._reconnect(), self.loop)
+                            self.reconnect_task = future
+                    elif elapsed > warning_timeout:
+                        # 只警告，不重连（可能是正常的15m周期等待）
+                        logger.debug(f"ℹ️ WebSocket已 {elapsed:.0f} 秒未收到消息（正常，15m周期最长15分钟）")
+                        
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"健康检查异常: {e}")
     
     async def _monitor_connection(self):
         """监控连接状态（每24小时重建连接，Binance要求）"""
@@ -541,7 +638,7 @@ class BinanceWebSocketClient:
                     elapsed = (datetime.now() - self.connection_start_time).total_seconds()
                     # 23小时后重建连接（预留1小时缓冲）
                     if elapsed > 23 * 3600:
-                        logger.info("WebSocket连接已运行23小时，重建连接...")
+                        logger.info("⏰ WebSocket连接已运行23小时，重建连接...")
                         await self._rebuild_connection()
                         
             except asyncio.CancelledError:
@@ -550,9 +647,17 @@ class BinanceWebSocketClient:
                 logger.error(f"连接监控异常: {e}")
     
     async def _rebuild_connection(self):
-        """重建连接"""
+        """重建连接（定期维护）"""
         try:
-            logger.info("开始重建WebSocket连接...")
+            logger.info("🔧 开始重建WebSocket连接（定期维护）...")
+            
+            # 标记为正在重连，防止其他重连任务干扰
+            if self.is_reconnecting:
+                logger.warning("已有重连任务在进行，跳过定期重建")
+                return
+            
+            self.is_reconnecting = True
+            
             # 停止旧连接
             if self.ws_client:
                 self.ws_client.stop()
@@ -561,30 +666,54 @@ class BinanceWebSocketClient:
             
             # 重新启动
             self.start_websocket()
-            await asyncio.sleep(1)
-            self._restore_subscriptions()
             
-            logger.info("WebSocket连接重建完成")
+            # 等待连接建立
+            max_wait_time = 10
+            wait_time = 0
+            while not self.is_connected and wait_time < max_wait_time:
+                await asyncio.sleep(0.5)
+                wait_time += 0.5
+            
+            if self.is_connected:
+                await asyncio.sleep(1)
+                self._restore_subscriptions()
+                logger.info("✅ WebSocket连接重建完成")
+            else:
+                logger.error("❌ WebSocket连接重建失败")
+            
+            self.is_reconnecting = False
+            
         except Exception as e:
-            logger.error(f"重建连接失败: {e}")
+            logger.error(f"❌ 重建连接失败: {e}")
+            self.is_reconnecting = False
     
     def _do_subscribe_kline(self, symbol: str, interval: str):
         """执行K线订阅（内部方法）"""
+        if not self.ws_client:
+            raise Exception("WebSocket客户端未初始化")
+        if not self.is_connected:
+            raise Exception("WebSocket未连接")
+        
         try:
-            if self.ws_client:
-                self.ws_client.kline(symbol=symbol, interval=interval, id=1)
-                logger.info(f"订阅K线数据: {symbol} {interval}")
+            self.ws_client.kline(symbol=symbol, interval=interval, id=1)
+            logger.info(f"✓ 订阅K线: {symbol} {interval}")
         except Exception as e:
-            logger.error(f"订阅K线数据失败: {e}")
+            logger.error(f"✗ 订阅K线失败: {symbol} {interval} - {e}")
+            raise  # 🔑 向上抛出，让调用方知道失败
     
     def _do_subscribe_ticker(self, symbol: str):
         """执行价格订阅（内部方法）"""
+        if not self.ws_client:
+            raise Exception("WebSocket客户端未初始化")
+        if not self.is_connected:
+            raise Exception("WebSocket未连接")
+        
         try:
-            if self.ws_client:
-                self.ws_client.ticker(symbol=symbol, id=2)
-                logger.info(f"订阅价格数据: {symbol}")
+            self.ws_client.ticker(symbol=symbol, id=2)
+            logger.info(f"✓ 订阅价格: {symbol}")
         except Exception as e:
-            logger.error(f"订阅价格数据失败: {e}")
+            logger.error(f"✗ 订阅价格失败: {symbol} - {e}")
+            raise  # 🔑 向上抛出，让调用方知道失败
     
     def subscribe_kline(self, symbol: str, interval: str, callback: Callable):
         """订阅K线数据"""
@@ -628,23 +757,54 @@ class BinanceWebSocketClient:
     def stop_websocket(self):
         """停止WebSocket连接"""
         try:
+            logger.info("🛑 正在停止WebSocket连接...")
             self.is_running = False
+            
+            # 取消健康检查任务
+            if self.health_check_task and not self.health_check_task.done():
+                self.health_check_task.cancel()
+                logger.debug("健康检查任务已取消")
             
             # 取消监控任务
             if self.monitor_task and not self.monitor_task.done():
                 self.monitor_task.cancel()
+                logger.debug("连接监控任务已取消")
             
             # 取消重连任务
             if self.reconnect_task and not self.reconnect_task.done():
                 self.reconnect_task.cancel()
+                logger.debug("重连任务已取消")
             
             # 停止WebSocket
             if self.ws_client:
                 self.ws_client.stop()
                 self.is_connected = False
-                logger.info("WebSocket连接已停止")
+                logger.info("✅ WebSocket连接已停止")
         except Exception as e:
-            logger.error(f"停止WebSocket失败: {e}")
+            logger.error(f"❌ 停止WebSocket失败: {e}")
+    
+    def get_connection_stats(self) -> Dict[str, Any]:
+        """获取连接统计信息"""
+        stats = {
+            'is_connected': self.is_connected,
+            'is_running': self.is_running,
+            'is_reconnecting': self.is_reconnecting,
+            'reconnect_count': self.reconnect_count,
+            'current_reconnect_delay': self.current_reconnect_delay,
+            'subscriptions_count': len(self.subscriptions),
+            'callbacks_count': len(self.callbacks)
+        }
+        
+        if self.connection_start_time:
+            uptime = (datetime.now() - self.connection_start_time).total_seconds()
+            stats['uptime_seconds'] = uptime
+            stats['uptime_hours'] = uptime / 3600
+        
+        if self.last_message_time:
+            idle_time = (datetime.now() - self.last_message_time).total_seconds()
+            stats['last_message_seconds_ago'] = idle_time
+        
+        return stats
 
 # 全局客户端实例
 binance_client = BinanceClient()
