@@ -351,44 +351,147 @@ class EnsembleMLService(MLService):
             xgb_pred_proba = xgb_model.predict_proba(X_xgb_val)
             cat_pred_proba = cat_model.predict_proba(X_cat_val)
             
-            # 拼接元特征（三个模型的预测概率）
-            meta_features_val = np.hstack([
-                lgb_pred_proba,
-                xgb_pred_proba,
-                cat_pred_proba
-            ])
+            logger.info(f"概率形状: lgb={lgb_pred_proba.shape}, xgb={xgb_pred_proba.shape}, cat={cat_pred_proba.shape}")
+            
+            # 🔑 验证形状一致性
+            assert lgb_pred_proba.shape == xgb_pred_proba.shape == cat_pred_proba.shape, \
+                f"概率数组形状不一致: {lgb_pred_proba.shape} vs {xgb_pred_proba.shape} vs {cat_pred_proba.shape}"
+            
+            # 获取预测类别
+            lgb_pred_raw = lgb_model.predict(X_lgb_val)
+            xgb_pred_raw = xgb_model.predict(X_xgb_val)
+            cat_pred_raw = cat_model.predict(X_cat_val)
+            
+            # 🔑 统一转换为1D数组（CatBoost返回2D，需要ravel）
+            lgb_pred = lgb_pred_raw.ravel()
+            xgb_pred = xgb_pred_raw.ravel()
+            cat_pred = cat_pred_raw.ravel()
+            
+            # 🔑 严格验证预测数组形状
+            expected_shape = (len(y_lgb_val),)
+            assert lgb_pred.shape == expected_shape, f"lgb_pred形状错误: {lgb_pred.shape} != {expected_shape}"
+            assert xgb_pred.shape == expected_shape, f"xgb_pred形状错误: {xgb_pred.shape} != {expected_shape}"
+            assert cat_pred.shape == expected_shape, f"cat_pred形状错误: {cat_pred.shape} != {expected_shape}"
+            
+            logger.info(f"预测类别形状验证通过: {lgb_pred.shape} (已统一为1D数组)")
+            
+            # 🆕 增强元特征（提升元学习器决策能力）
+            logger.info(f"生成增强元特征...")
+            
+            # 1. 模型一致性（3个模型预测是否一致）
+            # 🔑 已确认都是1D数组，直接比较
+            agreement_bool = (lgb_pred == xgb_pred) & (xgb_pred == cat_pred)  # (6757,) boolean
+            agreement = agreement_bool.astype(float).reshape(-1, 1)  # (6757, 1)
+            
+            # 验证维度
+            assert agreement.shape == (len(y_lgb_val), 1), f"agreement形状错误: {agreement.shape}"
+            logger.debug(f"✓ agreement: {agreement.shape}")
+            
+            # 2. 最大概率（每个模型的最高置信度）
+            lgb_max_prob = lgb_pred_proba.max(axis=1).reshape(-1, 1)
+            xgb_max_prob = xgb_pred_proba.max(axis=1).reshape(-1, 1)
+            cat_max_prob = cat_pred_proba.max(axis=1).reshape(-1, 1)
+            assert lgb_max_prob.shape == (len(y_lgb_val), 1), f"lgb_max_prob形状错误: {lgb_max_prob.shape}"
+            logger.debug(f"✓ max_prob: {lgb_max_prob.shape}")
+            
+            # 3. 概率熵（不确定性，熵越高越不确定）
+            from scipy.special import entr
+            lgb_entropy = entr(lgb_pred_proba).sum(axis=1).reshape(-1, 1)
+            xgb_entropy = entr(xgb_pred_proba).sum(axis=1).reshape(-1, 1)
+            cat_entropy = entr(cat_pred_proba).sum(axis=1).reshape(-1, 1)
+            assert lgb_entropy.shape == (len(y_lgb_val), 1), f"lgb_entropy形状错误: {lgb_entropy.shape}"
+            logger.debug(f"✓ entropy: {lgb_entropy.shape}")
+            
+            # 4. 平均概率（三个模型的平均预测概率）
+            avg_proba = (lgb_pred_proba + xgb_pred_proba + cat_pred_proba) / 3
+            assert avg_proba.shape == lgb_pred_proba.shape, f"avg_proba形状错误: {avg_proba.shape}"
+            logger.debug(f"✓ avg_proba: {avg_proba.shape}")
+            
+            # 5. 概率标准差（模型间的预测差异）
+            prob_std = np.std(np.stack([lgb_pred_proba, xgb_pred_proba, cat_pred_proba]), axis=0)
+            prob_std_max = prob_std.max(axis=1).reshape(-1, 1)
+            assert prob_std_max.shape == (len(y_lgb_val), 1), f"prob_std_max形状错误: {prob_std_max.shape}"
+            logger.debug(f"✓ prob_std_max: {prob_std_max.shape}")
+            
+            # 🔑 拼接所有元特征（严格验证每一步）
+            logger.info(f"开始拼接元特征...")
+            
+            # 逐步拼接并验证
+            meta_list = [
+                lgb_pred_proba,      # (6757, 3)
+                xgb_pred_proba,      # (6757, 3)
+                cat_pred_proba,      # (6757, 3)
+                agreement,           # (6757, 1)
+                lgb_max_prob,        # (6757, 1)
+                xgb_max_prob,        # (6757, 1)
+                cat_max_prob,        # (6757, 1)
+                lgb_entropy,         # (6757, 1)
+                xgb_entropy,         # (6757, 1)
+                cat_entropy,         # (6757, 1)
+                avg_proba,           # (6757, 3)
+                prob_std_max         # (6757, 1)
+            ]
+            
+            # 验证所有数组的第0维度都相同
+            expected_rows = len(y_lgb_val)
+            for i, arr in enumerate(meta_list):
+                assert arr.shape[0] == expected_rows, \
+                    f"元特征{i}第0维度错误: {arr.shape[0]} != {expected_rows}, 完整形状: {arr.shape}"
+            
+            # 拼接
+            meta_features_val = np.hstack(meta_list)
+            
+            # 最终验证
+            expected_features = 20  # 3+3+3+1+1+1+1+1+1+1+3+1
+            assert meta_features_val.shape == (expected_rows, expected_features), \
+                f"元特征最终形状错误: {meta_features_val.shape} != ({expected_rows}, {expected_features})"
             
             # 元标签（使用LightGBM的y_val，因为验证集已对齐）
             meta_labels_val = y_lgb_val
             
-            logger.info(f"✅ 元特征生成完成: shape={meta_features_val.shape}")
+            logger.info(f"✅ 增强元特征生成完成: {meta_features_val.shape} (基础9+增强11=20个)")
             
-            # 3️⃣ 训练元学习器（Stacking） - 升级为LightGBM + HOLD惩罚
+            # 3️⃣ 训练元学习器（Stacking） - 升级为LightGBM + 动态HOLD惩罚
             logger.info(f"🧠 训练元学习器（LightGBM - 更强大的决策能力）...")
             
-            # 🔑 元学习器也需要HOLD惩罚（关键修复！）
+            # 🔑 检查HOLD比例，动态调整惩罚系数
             from sklearn.utils.class_weight import compute_sample_weight
+            hold_ratio = (meta_labels_val == 1).sum() / len(meta_labels_val)
+            
+            # 🔑 根据HOLD比例动态调整惩罚（平衡策略）
+            if hold_ratio > 0.60:  # HOLD占比>60%，重惩罚
+                meta_hold_penalty_weight = 0.45
+            elif hold_ratio > 0.50:  # HOLD占比>50%，中等
+                meta_hold_penalty_weight = 0.55
+            elif hold_ratio > 0.40:  # HOLD占比>40%，轻度
+                meta_hold_penalty_weight = 0.65
+            else:  # HOLD占比<=40%，正常
+                meta_hold_penalty_weight = 0.75
+            
+            logger.info(f"   HOLD占比: {hold_ratio*100:.1f}% → 惩罚系数: {meta_hold_penalty_weight}")
+            
             meta_class_weights = compute_sample_weight('balanced', meta_labels_val)
-            meta_hold_penalty = np.where(meta_labels_val == 1, 0.6, 1.0)  # 元学习器HOLD惩罚更重（0.6，更平衡）
+            meta_hold_penalty = np.where(meta_labels_val == 1, meta_hold_penalty_weight, 1.0)
             meta_sample_weights = meta_class_weights * meta_hold_penalty
             
             import lightgbm as lgb
+            # 🔑 元学习器：极简配置防止过拟合
             meta_learner = lgb.LGBMClassifier(
-                n_estimators=100,
-                max_depth=4,  # 浅层树，避免过拟合
-                learning_rate=0.1,
-                num_leaves=15,
-                min_child_samples=20,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                reg_alpha=0.1,
-                reg_lambda=0.1,
+                n_estimators=50,     # 减少树数量 100→50
+                max_depth=3,         # 更浅的树 4→3
+                learning_rate=0.15,  # 提高学习率 0.1→0.15（少量树）
+                num_leaves=7,        # 大幅减少叶子 15→7
+                min_child_samples=30,  # 增加最小样本 20→30
+                subsample=0.7,       # 降低采样 0.8→0.7
+                colsample_bytree=0.7,  # 降低特征采样 0.8→0.7
+                reg_alpha=0.3,       # 加强L1正则 0.1→0.3
+                reg_lambda=0.3,      # 加强L2正则 0.1→0.3
                 random_state=42,
                 verbose=-1
             )
             meta_learner.fit(meta_features_val, meta_labels_val, sample_weight=meta_sample_weights)
             
-            logger.info(f"✅ 元学习器训练完成（已应用HOLD惩罚0.6，更平衡）")
+            logger.info(f"✅ 元学习器训练完成（动态HOLD惩罚={meta_hold_penalty_weight}）")
             
             # 4️⃣ 保存模型到字典
             if timeframe not in self.ensemble_models:
@@ -399,15 +502,68 @@ class EnsembleMLService(MLService):
             self.ensemble_models[timeframe]['catboost'] = cat_model
             self.ensemble_models[timeframe]['meta_learner'] = meta_learner
             
-            # 5️⃣ 评估集成模型
-            ensemble_pred = meta_learner.predict(meta_features_val)
+            # 5️⃣ 评估集成模型 - 使用时间序列交叉验证
+            logger.info(f"📊 {timeframe} 时间序列交叉验证评估...")
             
+            from sklearn.model_selection import TimeSeriesSplit
             from sklearn.metrics import accuracy_score, precision_recall_fscore_support
             
+            # 🆕 时间序列5折交叉验证（更可靠的评估）
+            tscv = TimeSeriesSplit(n_splits=5)
+            cv_scores = []
+            
+            # 对验证集进行交叉验证
+            for fold, (train_idx, test_idx) in enumerate(tscv.split(meta_features_val), 1):
+                meta_train, meta_test = meta_features_val[train_idx], meta_features_val[test_idx]
+                y_train, y_test = meta_labels_val.iloc[train_idx], meta_labels_val.iloc[test_idx]
+                
+                # 训练元学习器（每个fold）- 与最终模型完全一致的配置
+                fold_meta = lgb.LGBMClassifier(
+                    n_estimators=50, max_depth=3, learning_rate=0.15,
+                    num_leaves=7, min_child_samples=30, subsample=0.7,
+                    colsample_bytree=0.7, reg_alpha=0.3, reg_lambda=0.3,
+                    random_state=42, verbose=-1
+                )
+                
+                # 🔑 HOLD惩罚（与最终模型一致，使用相同的动态策略）
+                fold_weights = compute_sample_weight('balanced', y_train)
+                fold_hold_ratio = (y_train == 1).sum() / len(y_train)
+                
+                # 动态惩罚（平衡策略，与最终模型完全一致）
+                if fold_hold_ratio > 0.60:
+                    fold_penalty = 0.45
+                elif fold_hold_ratio > 0.50:
+                    fold_penalty = 0.55
+                elif fold_hold_ratio > 0.40:
+                    fold_penalty = 0.65
+                else:
+                    fold_penalty = 0.75
+                
+                fold_hold_penalty = np.where(y_train == 1, fold_penalty, 1.0)
+                fold_sample_weights = fold_weights * fold_hold_penalty
+                
+                fold_meta.fit(meta_train, y_train, sample_weight=fold_sample_weights)
+                fold_pred = fold_meta.predict(meta_test)
+                fold_acc = accuracy_score(y_test, fold_pred)
+                cv_scores.append(fold_acc)
+                
+                logger.debug(f"  Fold {fold}: 准确率={fold_acc:.4f}")
+            
+            # 交叉验证准确率
+            cv_mean = np.mean(cv_scores)
+            cv_std = np.std(cv_scores)
+            
+            logger.info(f"✅ {timeframe} 时间序列CV结果: {cv_mean:.4f} ± {cv_std:.4f}")
+            logger.info(f"   CV分数: {[f'{s:.4f}' for s in cv_scores]}")
+            
+            # 使用完整验证集评估最终模型
+            ensemble_pred = meta_learner.predict(meta_features_val)
             accuracy = accuracy_score(meta_labels_val, ensemble_pred)
             precision, recall, f1, _ = precision_recall_fscore_support(
                 meta_labels_val, ensemble_pred, average='weighted', zero_division=0
             )
+            
+            logger.info(f"📊 {timeframe} 最终模型验证集准确率: {accuracy:.4f} (CV: {cv_mean:.4f}±{cv_std:.4f})")
             
             # 6️⃣ 评估各基础模型
             lgb_pred = lgb_model.predict(X_lgb_val)
@@ -421,7 +577,11 @@ class EnsembleMLService(MLService):
             training_time = time.time() - start_time
             
             result = {
-                'accuracy': accuracy,
+                'accuracy': cv_mean,  # 🔑 使用CV均值作为主准确率（更可靠）
+                'cv_mean': cv_mean,   # 交叉验证均值
+                'cv_std': cv_std,     # 交叉验证标准差
+                'cv_scores': cv_scores,  # 各折分数
+                'val_accuracy': accuracy,  # 验证集准确率
                 'precision': precision,
                 'recall': recall,
                 'f1_score': f1,
@@ -430,14 +590,16 @@ class EnsembleMLService(MLService):
                 'cat_accuracy': cat_acc,
                 'training_time': training_time,
                 'ensemble_size': len(self.ensemble_models[timeframe]),
-                'meta_features_shape': meta_features_val.shape
+                'meta_features_count': meta_features_val.shape[1]  # 元特征数量
             }
             
             logger.info(f"✅ Stacking训练完成（差异化数据）:")
             logger.info(f"  LightGBM(360天): {lgb_acc:.4f}")
             logger.info(f"  XGBoost(540天):  {xgb_acc:.4f}")
             logger.info(f"  CatBoost(720天): {cat_acc:.4f}")
-            logger.info(f"  Stacking集成:    {accuracy:.4f}")
+            logger.info(f"  Stacking验证集:  {accuracy:.4f}")
+            logger.info(f"  🎯 时间序列CV:  {cv_mean:.4f} ± {cv_std:.4f} (5-fold)")
+            logger.info(f"  📊 元特征: {meta_features_val.shape[1]}个（基础9+一致性/熵/差异度等11个）")
             logger.info(f"  训练耗时: {training_time:.2f}秒")
             
             return result
@@ -617,12 +779,12 @@ class EnsembleMLService(MLService):
             class_weights = compute_sample_weight('balanced', y_train)
             time_decay = np.exp(-np.arange(len(X_train)) / (len(X_train) * 0.1))[::-1]
             
-            # 🔑 HOLD类别降权（惩罚过度保守）
-            hold_penalty = np.where(y_train == 1, 0.7, 1.0)  # HOLD权重0.7，其他1.0
+            # 🔑 HOLD类别降权（适度惩罚策略）
+            hold_penalty = np.where(y_train == 1, 0.65, 1.0)  # HOLD权重0.65（适度惩罚 0.5→0.65）
             
             sample_weights = class_weights * time_decay * hold_penalty
             
-            logger.info(f"✅ 样本加权已启用：类别平衡 × 时间衰减 × HOLD惩罚(0.7)")
+            logger.info(f"✅ 样本加权已启用：类别平衡 × 时间衰减 × HOLD惩罚(0.65)")
             
             # 获取时间框架差异化参数
             timeframe_params = self.lgb_params_by_timeframe.get(timeframe, {})
@@ -653,8 +815,8 @@ class EnsembleMLService(MLService):
             class_weights = compute_sample_weight('balanced', y_train)
             time_decay = np.exp(-np.arange(len(X_train)) / (len(X_train) * 0.1))[::-1]
             
-            # 🔑 HOLD类别降权（惩罚过度保守）
-            hold_penalty = np.where(y_train == 1, 0.7, 1.0)
+            # 🔑 HOLD类别降权（适度惩罚，与LightGBM一致）
+            hold_penalty = np.where(y_train == 1, 0.65, 1.0)  # 0.5→0.65（回调）
             
             sample_weights = class_weights * time_decay * hold_penalty
             
@@ -692,8 +854,8 @@ class EnsembleMLService(MLService):
             class_weights = compute_sample_weight('balanced', y_train)
             time_decay = np.exp(-np.arange(len(X_train)) / (len(X_train) * 0.1))[::-1]
             
-            # 🔑 HOLD类别降权（惩罚过度保守）
-            hold_penalty = np.where(y_train == 1, 0.7, 1.0)
+            # 🔑 HOLD类别降权（适度惩罚，与LightGBM一致）
+            hold_penalty = np.where(y_train == 1, 0.65, 1.0)  # 0.5→0.65（回调）
             
             sample_weights = class_weights * time_decay * hold_penalty
             
@@ -772,10 +934,49 @@ class EnsembleMLService(MLService):
             xgb_proba = models['xgboost'].predict_proba(X_pred)[0]
             cat_proba = models['catboost'].predict_proba(X_pred)[0]
             
+            lgb_pred = models['lightgbm'].predict(X_pred)[0]
+            xgb_pred = models['xgboost'].predict(X_pred)[0]
+            cat_pred = models['catboost'].predict(X_pred)[0]
+            
             # Stacking预测（使用元学习器）
             if 'meta_learner' in models:
-                # 生成元特征
-                meta_features = np.hstack([lgb_proba, xgb_proba, cat_proba]).reshape(1, -1)
+                # 🆕 生成增强元特征（与训练时一致）
+                # 1. 模型一致性
+                agreement = float((lgb_pred == xgb_pred) and (xgb_pred == cat_pred))
+                
+                # 2. 最大概率
+                lgb_max_prob = lgb_proba.max()
+                xgb_max_prob = xgb_proba.max()
+                cat_max_prob = cat_proba.max()
+                
+                # 3. 概率熵（单个样本）
+                from scipy.special import entr
+                lgb_entropy = entr(lgb_proba).sum()
+                xgb_entropy = entr(xgb_proba).sum()
+                cat_entropy = entr(cat_proba).sum()
+                
+                # 4. 平均概率
+                avg_proba = (lgb_proba + xgb_proba + cat_proba) / 3
+                
+                # 5. 概率标准差
+                prob_std = np.std(np.stack([lgb_proba, xgb_proba, cat_proba]), axis=0)
+                prob_std_max = prob_std.max()
+                
+                # 🔑 拼接所有元特征（与训练时完全一致，20个）
+                meta_features = np.hstack([
+                    lgb_proba,           # 3个
+                    xgb_proba,           # 3个
+                    cat_proba,           # 3个
+                    [agreement],         # 1个
+                    [lgb_max_prob],      # 1个
+                    [xgb_max_prob],      # 1个
+                    [cat_max_prob],      # 1个
+                    [lgb_entropy],       # 1个
+                    [xgb_entropy],       # 1个
+                    [cat_entropy],       # 1个
+                    avg_proba,           # 3个
+                    [prob_std_max]       # 1个
+                ]).reshape(1, -1)  # (1, 20)
                 
                 # 元学习器预测
                 stacking_proba = models['meta_learner'].predict_proba(meta_features)[0]

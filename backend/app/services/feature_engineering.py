@@ -63,6 +63,14 @@ class FeatureEngineer:
             # 🆕 多时间框架特征融合
             df = self._add_multi_timeframe_features(df)
             
+            # 🆕 高级特征（Phase 2优化）
+            df = self._add_trend_strength_features(df)
+            df = self._add_support_resistance_features(df)
+            df = self._add_advanced_momentum_features(df)
+            df = self._add_pattern_features(df)
+            df = self._add_order_flow_features(df)
+            df = self._add_swing_features(df)
+            
             # 处理NaN值：训练用dropna，预测用fillna
             rows_before = len(df)
             
@@ -923,6 +931,307 @@ class FeatureEngineer:
         except Exception as e:
             logger.error(f"特征选择失败: {e}")
             return []
+    
+    def _add_trend_strength_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """添加趋势强度特征（~15个特征）"""
+        try:
+            new_features = {}
+            
+            # 1. ADX趋势强度分级
+            if 'adx' in df.columns:
+                new_features['trend_weak'] = (df['adx'] < 20).astype(int)
+                new_features['trend_moderate'] = ((df['adx'] >= 20) & (df['adx'] < 40)).astype(int)
+                new_features['trend_strong'] = (df['adx'] >= 40).astype(int)
+            
+            # 2. 线性回归斜率（趋势方向）
+            for window in [5, 10, 20]:
+                slopes = []
+                for i in range(len(df)):
+                    if i < window:
+                        slopes.append(0)
+                    else:
+                        y = df['close'].iloc[i-window:i].values
+                        x = np.arange(window)
+                        slope = np.polyfit(x, y, 1)[0] / (df['close'].iloc[i] + 1e-10)
+                        slopes.append(slope)
+                new_features[f'trend_slope_{window}'] = slopes
+            
+            # 3. 趋势一致性（多周期确认）
+            sma5 = df['close'].rolling(5).mean()
+            sma10 = df['close'].rolling(10).mean()
+            sma20 = df['close'].rolling(20).mean()
+            
+            new_features['trend_alignment'] = (
+                ((df['close'] > sma5) & (sma5 > sma10) & (sma10 > sma20)).astype(int) -
+                ((df['close'] < sma5) & (sma5 < sma10) & (sma10 < sma20)).astype(int)
+            )
+            
+            # 4. EMA趋势强度
+            ema12 = df['close'].ewm(span=12).mean()
+            ema26 = df['close'].ewm(span=26).mean()
+            new_features['ema_trend_strength'] = (ema12 - ema26) / (df['close'] + 1e-10)
+            
+            return df.assign(**new_features)
+            
+        except Exception as e:
+            logger.error(f"添加趋势强度特征失败: {e}")
+            return df
+    
+    def _add_support_resistance_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """添加支撑阻力特征（~18个特征）"""
+        try:
+            new_features = {}
+            
+            # 1. 近期高低点
+            for window in [10, 20, 50]:
+                new_features[f'high_{window}d'] = df['high'].rolling(window).max()
+                new_features[f'low_{window}d'] = df['low'].rolling(window).min()
+                
+                # 价格距离高低点的百分比
+                new_features[f'dist_to_high_{window}'] = (
+                    (df['close'] - new_features[f'high_{window}d']) / 
+                    (new_features[f'high_{window}d'] + 1e-10)
+                )
+                new_features[f'dist_to_low_{window}'] = (
+                    (df['close'] - new_features[f'low_{window}d']) / 
+                    (new_features[f'low_{window}d'] + 1e-10)
+                )
+            
+            # 2. 支撑阻力突破
+            for window in [20, 50]:
+                # 突破历史高点
+                new_features[f'breakout_high_{window}'] = (
+                    df['close'] > df['high'].rolling(window).max().shift(1)
+                ).astype(int)
+                
+                # 跌破历史低点
+                new_features[f'breakdown_low_{window}'] = (
+                    df['close'] < df['low'].rolling(window).min().shift(1)
+                ).astype(int)
+            
+            return df.assign(**new_features)
+            
+        except Exception as e:
+            logger.error(f"添加支撑阻力特征失败: {e}")
+            return df
+    
+    def _add_advanced_momentum_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """添加高级动量指标（~15个特征）"""
+        try:
+            new_features = {}
+            
+            # 1. TSI (True Strength Index)
+            price_change = df['close'].diff()
+            pc_ema25 = price_change.ewm(span=25).mean()
+            pc_ema13 = pc_ema25.ewm(span=13).mean()
+            abs_pc_ema25 = price_change.abs().ewm(span=25).mean()
+            abs_pc_ema13 = abs_pc_ema25.ewm(span=13).mean()
+            new_features['tsi'] = 100 * pc_ema13 / (abs_pc_ema13 + 1e-10)
+            new_features['tsi_signal'] = new_features['tsi'].ewm(span=7).mean()
+            
+            # 2. CMO (Chande Momentum Oscillator)
+            for period in [9, 14]:
+                price_diff = df['close'].diff()
+                gain = price_diff.where(price_diff > 0, 0).rolling(period).sum()
+                loss = -price_diff.where(price_diff < 0, 0).rolling(period).sum()
+                new_features[f'cmo_{period}'] = 100 * (gain - loss) / (gain + loss + 1e-10)
+            
+            # 3. Aroon指标
+            for period in [14, 25]:
+                aroon_up = []
+                aroon_down = []
+                
+                for i in range(len(df)):
+                    if i < period:
+                        aroon_up.append(50)
+                        aroon_down.append(50)
+                    else:
+                        window_high = df['high'].iloc[i-period:i+1]
+                        window_low = df['low'].iloc[i-period:i+1]
+                        
+                        days_since_high = period - window_high.argmax()
+                        days_since_low = period - window_low.argmin()
+                        
+                        aroon_up.append((period - days_since_high) / period * 100)
+                        aroon_down.append((period - days_since_low) / period * 100)
+                
+                new_features[f'aroon_up_{period}'] = aroon_up
+                new_features[f'aroon_down_{period}'] = aroon_down
+                new_features[f'aroon_osc_{period}'] = np.array(aroon_up) - np.array(aroon_down)
+            
+            return df.assign(**new_features)
+            
+        except Exception as e:
+            logger.error(f"添加高级动量特征失败: {e}")
+            return df
+    
+    def _add_pattern_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """添加价格形态识别特征（~14个特征）"""
+        try:
+            new_features = {}
+            
+            body = df['close'] - df['open']
+            upper_shadow = df['high'] - df[['close', 'open']].max(axis=1)
+            lower_shadow = df[['close', 'open']].min(axis=1) - df['low']
+            
+            # 1. 锤子线（Hammer）
+            new_features['hammer'] = (
+                (lower_shadow > body.abs() * 2) & 
+                (upper_shadow < body.abs() * 0.5) &
+                (body < 0)
+            ).astype(int)
+            
+            # 2. 上吊线（Hanging Man）
+            new_features['hanging_man'] = (
+                (lower_shadow > body.abs() * 2) & 
+                (upper_shadow < body.abs() * 0.5) &
+                (body > 0)
+            ).astype(int)
+            
+            # 3. 流星线（Shooting Star）
+            new_features['shooting_star'] = (
+                (upper_shadow > body.abs() * 2) & 
+                (lower_shadow < body.abs() * 0.5)
+            ).astype(int)
+            
+            # 4. 十字星（Doji）
+            new_features['doji'] = (body.abs() < (df['high'] - df['low']) * 0.1).astype(int)
+            
+            # 5. 吞噬形态
+            prev_body = body.shift(1)
+            
+            # 看涨吞噬
+            new_features['bullish_engulf'] = (
+                (body > 0) & 
+                (prev_body < 0) &
+                (df['open'] <= df['close'].shift(1)) &
+                (df['close'] >= df['open'].shift(1))
+            ).astype(int)
+            
+            # 看跌吞噬
+            new_features['bearish_engulf'] = (
+                (body < 0) & 
+                (prev_body > 0) &
+                (df['open'] >= df['close'].shift(1)) &
+                (df['close'] <= df['open'].shift(1))
+            ).astype(int)
+            
+            # 6. 三只乌鸦
+            new_features['three_black_crows'] = (
+                (body < 0) &
+                (body.shift(1) < 0) &
+                (body.shift(2) < 0) &
+                (df['close'] < df['close'].shift(1)) &
+                (df['close'].shift(1) < df['close'].shift(2))
+            ).astype(int)
+            
+            # 7. 三只白兵
+            new_features['three_white_soldiers'] = (
+                (body > 0) &
+                (body.shift(1) > 0) &
+                (body.shift(2) > 0) &
+                (df['close'] > df['close'].shift(1)) &
+                (df['close'].shift(1) > df['close'].shift(2))
+            ).astype(int)
+            
+            # 8. 缺口检测
+            new_features['gap_up'] = (df['low'] > df['high'].shift(1)).astype(int)
+            new_features['gap_down'] = (df['high'] < df['low'].shift(1)).astype(int)
+            new_features['gap_size'] = np.where(
+                new_features['gap_up'] == 1,
+                (df['low'] - df['high'].shift(1)) / (df['close'].shift(1) + 1e-10),
+                np.where(
+                    new_features['gap_down'] == 1,
+                    (df['high'] - df['low'].shift(1)) / (df['close'].shift(1) + 1e-10),
+                    0
+                )
+            )
+            
+            return df.assign(**new_features)
+            
+        except Exception as e:
+            logger.error(f"添加价格形态特征失败: {e}")
+            return df
+    
+    def _add_order_flow_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """添加订单流特征（~10个特征）"""
+        try:
+            new_features = {}
+            
+            if 'taker_buy_base_volume' in df.columns and 'volume' in df.columns:
+                # 1. 买卖比率
+                taker_sell_volume = df['volume'] - df['taker_buy_base_volume']
+                new_features['buy_sell_ratio'] = (
+                    df['taker_buy_base_volume'] / (taker_sell_volume + 1e-10)
+                )
+                
+                # 2. 净买入压力
+                new_features['net_buy_pressure'] = (
+                    df['taker_buy_base_volume'] - taker_sell_volume
+                ) / (df['volume'] + 1e-10)
+                
+                # 3. 大单检测
+                buy_ratio = df['taker_buy_base_volume'] / (df['volume'] + 1e-10)
+                buy_ratio_mean = buy_ratio.rolling(20).mean()
+                buy_ratio_std = buy_ratio.rolling(20).std()
+                
+                new_features['large_buy_orders'] = (
+                    buy_ratio > buy_ratio_mean + 2 * buy_ratio_std
+                ).astype(int)
+                
+                new_features['large_sell_orders'] = (
+                    buy_ratio < buy_ratio_mean - 2 * buy_ratio_std
+                ).astype(int)
+                
+                # 4. 累积买卖压力
+                for window in [5, 10, 20]:
+                    new_features[f'cumulative_buy_pressure_{window}'] = (
+                        new_features['net_buy_pressure'].rolling(window).sum()
+                    )
+            
+            return df.assign(**new_features)
+            
+        except Exception as e:
+            logger.error(f"添加订单流特征失败: {e}")
+            return df
+    
+    def _add_swing_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """添加波段识别特征（~10个特征）"""
+        try:
+            new_features = {}
+            
+            # 1. Swing High/Low检测
+            for window in [5, 10]:
+                # Swing High
+                rolling_max = df['high'].rolling(window*2+1, center=True).max()
+                new_features[f'swing_high_{window}'] = (
+                    df['high'] == rolling_max
+                ).astype(int)
+                
+                # Swing Low
+                rolling_min = df['low'].rolling(window*2+1, center=True).min()
+                new_features[f'swing_low_{window}'] = (
+                    df['low'] == rolling_min
+                ).astype(int)
+            
+            # 2. 价格在波段中的位置
+            for window in [20, 50]:
+                recent_high = df['high'].rolling(window).max()
+                recent_low = df['low'].rolling(window).min()
+                
+                new_features[f'position_in_range_{window}'] = (
+                    (df['close'] - recent_low) / (recent_high - recent_low + 1e-10)
+                )
+            
+            # 3. 波段频率
+            if 'swing_high_5' in new_features:
+                new_features['swing_frequency'] = new_features['swing_high_5'].rolling(50).sum()
+            
+            return df.assign(**new_features)
+            
+        except Exception as e:
+            logger.error(f"添加波段识别特征失败: {e}")
+            return df
 
 # 全局特征工程器实例
 feature_engineer = FeatureEngineer()

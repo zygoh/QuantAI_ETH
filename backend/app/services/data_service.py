@@ -49,6 +49,9 @@ class DataService:
         # 数据回调函数
         self.data_callbacks: List[Callable] = []
         
+        # 🆕 价格更新回调函数（用于虚拟仓位止损止盈监控）
+        self.price_callbacks: List[Callable] = []
+        
         # WebSocket重连回调函数
         self.reconnect_callbacks: List[Callable] = []
         
@@ -290,6 +293,14 @@ class DataService:
                 )
             )
             
+            # 🆕 通知价格更新回调（用于虚拟仓位止损止盈检查）
+            if self.loop and self.price_callbacks:
+                for callback in self.price_callbacks:
+                    asyncio.run_coroutine_threadsafe(
+                        callback(symbol, price),
+                        self.loop
+                    )
+            
             logger.debug(f"价格更新: {symbol} {price}")
             
         except Exception as e:
@@ -429,6 +440,11 @@ class DataService:
     def add_data_callback(self, callback: Callable):
         """添加数据回调函数"""
         self.data_callbacks.append(callback)
+    
+    def add_price_callback(self, callback: Callable):
+        """添加价格更新回调函数（用于虚拟仓位止损止盈监控）"""
+        self.price_callbacks.append(callback)
+        logger.debug(f"注册价格更新回调: {callback.__name__}")
     
     def add_reconnect_callback(self, callback: Callable):
         """添加WebSocket重连回调函数"""

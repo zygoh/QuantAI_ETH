@@ -1,1972 +1,966 @@
 ---
-description: QuantAI-ETH量化智能交易系统 - 通用规则
+description: QuantAI-ETH Quantitative Trading System - General Rules (English)
 globs:
   - "**/*"
 alwaysApply: true
 ---
 
-# QuantAI-ETH - 项目规则
+# QuantAI-ETH - Project Rules
 
-**项目全称**: QuantAI-ETH（Quantitative AI for Ethereum Trading）  
-**中文名称**: ETH量化智能交易系统  
-**版本**: v2.0
-
----
-
-## 🎯 专业定位与设计目标
-
-**角色定位**: 专业量化开发工程师
-
-**核心设计目标**: 
-- 🏆 **超高胜率中频交易系统**（胜率目标≥60%，盈亏比≥1.8:1）
-- 📊 模型准确率≥80%（当前已达成81%）
-- 💰 风险控制完善（最大回撤<10%）
-- ⚡ 信号质量优先于数量（宁缺毋滥）
-
-**设计理念**:
-- ✅ 准确性 > 信号频率
-- ✅ 风险控制 > 盈利激进
-- ✅ 代码质量 > 开发速度
-- ✅ 长期稳定 > 短期收益
+**Full Name**: QuantAI-ETH (Quantitative AI for Ethereum Trading)  
+**Version**: v8.0  
+**Last Updated**: 2025-10-21
 
 ---
 
-## 📋 项目概述
+## 🎯 Professional Positioning & Design Goals
 
-**QuantAI-ETH** 是一个**生产级加密货币量化交易系统**，使用多时间框架Stacking集成学习进行ETH/USDT合约中频交易。
+**Role**: Professional Quantitative Development Engineer
 
-**核心功能**：
-- 多时间框架模型训练（15m/2h/4h独立Stacking集成模型）
-- Stacking三模型融合（LightGBM + XGBoost + CatBoost + 元学习器）
-- 实时信号生成与多模型加权合成
-- **信号缓存机制**（每个时间框架独立缓存预测结果）
-- **训练后立即预测**（填充所有时间框架信号缓存）
-- **预热信号保护**（前5个信号仅记录不交易）
-- 自动交易执行与风险管理
-- WebSocket实时数据流处理（stream名称中所有交易对均为小写）
+**Core Design Objectives**:
+- High win-rate medium-frequency trading system (≥60% win rate, ≥1.8:1 risk-reward ratio)
+- Model accuracy target: ≥50% (current: improving)
+- Robust risk control (max drawdown <10%)
+- Signal quality over quantity
 
-**技术栈**：Python 3.12+ | FastAPI | LightGBM + XGBoost + CatBoost | PostgreSQL+TimescaleDB | Redis | React
-
-**当前性能**：平均准确率81%（15m:60%, 2h:90%, 4h:94%）
+**Design Philosophy**:
+- Accuracy > Signal frequency
+- Risk control > Aggressive profit
+- Code quality > Development speed
+- Long-term stability > Short-term gains
 
 ---
 
-## 🎯 核心架构原则
+## 📋 Project Overview
 
-### 1. Stacking集成模型架构（最重要）
+**QuantAI-ETH** is a production-grade cryptocurrency quantitative trading system using multi-timeframe Stacking ensemble learning for ETH/USDT contract medium-frequency trading.
 
-**每个时间框架使用独立的Stacking集成**：
-```python
-# ✅ 正确：每个时间框架包含4个模型
-self.ensemble_models = {
-    '15m': {
-        'lightgbm': lgb_model,    # 基础模型1
-        'xgboost': xgb_model,     # 基础模型2
-        'catboost': cat_model,    # 基础模型3
-        'meta_learner': meta_lgb  # 元学习器（LightGBM）
-    },
-    '2h': {...},  # 同样的结构
-    '4h': {...}   # 同样的结构
-}
-self.scalers = {'15m': scaler_15m, '2h': scaler_2h, '4h': scaler_4h}
-self.feature_columns_dict = {'15m': [...], '2h': [...], '4h': [...]}
-self.cached_predictions = {}  # 信号缓存
+**Core Features**:
+- Multi-timeframe model training (15m/2h/4h independent Stacking models)
+- Stacking ensemble: LightGBM + XGBoost + CatBoost + Meta-learner
+- Real-time signal generation with multi-model weighted synthesis
+- Signal caching mechanism (independent cache per timeframe)
+- Warmup signal protection (first 5 signals are record-only)
+- Automated trade execution and risk management
+- WebSocket real-time data stream processing
 
-# ❌ 错误：共享模型或单模型
-self.model = single_model  # ❌ 不允许
-self.models = {'15m': single_lgb}  # ❌ 应该用Stacking
-```
-
-**Stacking训练流程**：
-```python
-# 1. 训练3个基础模型（不同数据量增加多样性）
-lgb_model = train_lgb(360天数据)  # HOLD惩罚0.7
-xgb_model = train_xgb(540天数据)  # HOLD惩罚0.7
-cat_model = train_cat(720天数据)  # HOLD惩罚0.7
-
-# 2. 生成元特征（验证集）
-meta_features = [lgb_proba, xgb_proba, cat_proba]
-
-# 3. 训练元学习器（关键：也需要HOLD惩罚！）
-meta_learner = LightGBM(HOLD惩罚=0.5)  # 比基础模型更重的惩罚
-meta_learner.fit(meta_features, y_val, sample_weight=...)
-
-# 4. 保存所有模型
-```
-
-### 2. 信号生成架构（核心改进）
-
-**正确的信号生成流程**：
-```python
-# ✅ 训练完成后立即预测所有时间框架（关键！）
-训练完成 → 立即预测15m+2h+4h → 全部缓存 ✅
-
-# ✅ 各时间框架独立预测并缓存
-# 15m K线完成 → 预测15m → 缓存15m信号
-# 2h K线完成  → 预测2h  → 缓存2h信号  
-# 4h K线完成  → 预测4h  → 缓存4h信号
-
-# ✅ 只有15m触发合成（15m作为主时间框架）
-# 15m信号更新 → 合成所有缓存的信号（包含4h长期趋势）→ 发出交易信号
-
-# ❌ 错误：每次15m完成时同时预测3个时间框架
-# 这样会重复预测，效率低且没有必要
-
-# ❌ 错误：训练后不立即预测
-# 会导致4h信号缺失（4h每4小时才更新一次）
-```
-
-### 3. 预热信号保护（生产安全）
-
-**前5个信号仅记录不交易**：
-```python
-# 🔒 安全保护机制
-self.signal_counter = 0
-self.warmup_signals = 5  # 预热信号数量
-
-if self.signal_counter <= self.warmup_signals:
-    logger.warning(f"⚠️ 预热信号 [{self.signal_counter}/{self.warmup_signals}]：仅记录，不执行交易")
-    await self._save_signal(signal)  # 只保存
-    return  # 🔒 不发送给交易引擎
-```
-
-**目的**：
-- 观察模型稳定性
-- 确保资金安全
-- 避免启动初期误操作
-
-### 4. HOLD偏好解决方案（关键）
-
-**问题**：Stacking模型容易产生HOLD偏好（70-100%预测HOLD）
-
-**根本原因**：
-- 基础模型和元学习器都学到"不确定时选HOLD最安全"
-- 长周期（2h/4h）HOLD置信度过高（70-80%）
-- 加权合成时压制短周期（15m）信号
-
-**完整解决方案（三层防护）**：
-
-```python
-# 第1层：源头修复 - 基础模型HOLD惩罚
-class_weights = compute_sample_weight('balanced', y_train)
-hold_penalty = np.where(y_train == 1, 0.7, 1.0)  # HOLD权重0.7
-sample_weights = class_weights * time_decay * hold_penalty
-
-lgb_model.fit(X_train, y_train, sample_weight=sample_weights)  # LightGBM
-xgb_model.fit(X_train, y_train, sample_weight=sample_weights)  # XGBoost
-cat_model.fit(X_train, y_train, sample_weight=sample_weights)  # CatBoost
-
-# 第2层：元学习器HOLD惩罚（更重！）⭐⭐⭐
-meta_class_weights = compute_sample_weight('balanced', meta_labels)
-meta_hold_penalty = np.where(meta_labels == 1, 0.5, 1.0)  # HOLD权重0.5（更重）
-meta_sample_weights = meta_class_weights * meta_hold_penalty
-
-meta_learner.fit(meta_features, meta_labels, sample_weight=meta_sample_weights)
-
-# 第3层：信号合成时动态降权
-if timeframe in ['2h', '4h'] and signal == 'HOLD':
-    if hold_confidence > 0.65:
-        weight = base_weight * 0.5  # 权重减半，避免长周期HOLD压制短周期
-```
-
-**关键点**：
-- ✅ 基础模型HOLD惩罚：0.7
-- ✅ 元学习器HOLD惩罚：0.5（**必须更重**）
-- ✅ 合成时动态降权：HOLD>0.65时减半
-- ✅ 置信度阈值：0.35（适合81%准确率）
-- ✅ 15m权重70%：主导决策
-
-**禁止事项**：
-- ❌ 只惩罚基础模型，不惩罚元学习器
-- ❌ 使用"高置信度优先"策略（会导致4h信号主导4小时）
-- ❌ 置信度阈值>0.5（会过滤太多信号）
-
-### 5. 数据源分离原则
-
-- **模型训练**：Binance API（实时获取最新数据）
-- **信号生成**：WebSocket缓冲区（优先）→ Binance API（备用）
-- **数据库**：仅用于前端展示、历史查询、性能分析
-
-### 6. 无未来函数原则（关键）
-
-```python
-# ✅ 正确：只看下一根K线
-df['next_return'] = df['close'].shift(-1) / df['close'] - 1
-
-# ❌ 错误：看未来多根K线
-df['next_return'] = df['close'].shift(-5) / df['close'] - 1  # ❌
-
-# ✅ 正确：时间序列分割
-split_idx = int(len(X) * 0.8)
-X_train, X_val = X[:split_idx], X[split_idx:]
-
-# ❌ 错误：随机分割
-X_train, X_val = train_test_split(X, y, shuffle=True)  # ❌
-```
-
-### 7. 时区统一原则
-
-全系统使用 `Asia/Shanghai` 时区：
-```python
-import pytz
-from datetime import datetime
-
-shanghai_tz = pytz.timezone('Asia/Shanghai')
-
-# ✅ 正确
-now = datetime.now(shanghai_tz)
-ts = datetime.fromtimestamp(timestamp / 1000, tz=shanghai_tz)
-
-# ❌ 错误：naive datetime
-now = datetime.now()  # ❌ 没有时区信息
-```
-
-### 8. WebSocket订阅格式
-
-**必须使用小写交易对**：
-```python
-# ✅ 正确：小写
-stream_name = f"{symbol.lower()}@kline_{interval}"  # ethusdt@kline_15m
-
-# ❌ 错误：大写
-stream_name = f"{symbol}@kline_{interval}"  # ETHUSDT@kline_15m ❌
-```
+**Tech Stack**: Python 3.12+ | FastAPI | LightGBM + XGBoost + CatBoost | PostgreSQL+TimescaleDB | Redis | React
 
 ---
 
-## 🏗️ 关键配置参数
+## 🎯 Core Architecture Principles
 
-### 标签阈值（已优化）
+### 1. Stacking Ensemble Model Architecture
 
-```python
-# ✅ 当前生产配置（中频交易：灵敏策略）
-threshold_config = {
-    '15m': {
-        'up': 0.001,      # ±0.1% ← 中频交易：极度灵敏，HOLD<30%
-        'down': -0.001
-    },
-    '2h': {
-        'up': 0.0035,     # ±0.35% ← 中期辅助：HOLD<40%
-        'down': -0.0035
-    },
-    '4h': {
-        'up': 0.005,      # ±0.5% ← 长期确认：HOLD<45%
-        'down': -0.005
-    }
-}
+**Each timeframe uses independent Stacking ensemble**:
+- Each timeframe contains 4 models: LightGBM, XGBoost, CatBoost, Meta-learner
+- Each has its own scaler and feature list
+- Models are independent and differentiated
 
-# 预期标签分布（中频交易）
-# 15m: SHORT 32-38%, HOLD 24-32%, LONG 32-38%  ← 灵敏
-# 2h:  SHORT 28-32%, HOLD 36-40%, LONG 28-32%  ← 平衡
-# 4h:  SHORT 26-30%, HOLD 42-46%, LONG 26-30%  ← 稳健
+**Stacking Training Process**:
+1. Train 3 base models with different data durations for diversity
+2. Generate meta-features from validation predictions
+3. Train meta-learner with HOLD penalty (heavier than base models)
+4. Save all models
 
-# ❌ 过时配置（导致信号过少）
-# '15m': ±0.15% → HOLD 45% ❌ 对中频交易太保守
-# '15m': ±0.3%  → HOLD 74% ❌ 几乎无信号
-```
-
-### 时间框架权重
-
-```python
-# ✅ 短线策略权重分配
-timeframe_weights = {
-    '15m': 0.60,   # 主导：快速捕捉入场点
-    '2h': 0.25,    # 辅助：趋势过滤
-    '4h': 0.15     # 辅助：避免逆势交易
-}
-```
+**Prohibited**:
+- Sharing models across timeframes
+- Using single model instead of ensemble
 
 ---
 
-## 🎯 代码质量规范
+### 2. Signal Generation Architecture
 
-### 禁止冗余
+**Correct Signal Flow**:
+- Each timeframe predicts independently and caches results
+- 15m K-line completion triggers signal synthesis
+- Immediate prediction after training to fill all caches
+- 4h data is critical (updated every 4 hours)
 
-#### 文件级别
-- ❌ **禁止创建功能重复的文件**
-- ❌ **禁止创建冗余方法**（同一项目中存在功能相同的方法）
-- ❌ **验证完成之后需要删除验证文件，禁止保存冗余文件和方法函数**
-- ✅ 相似功能的模块必须合并或继承基类
-- ✅ 检查现有文件，避免重复造轮子
-- ✅ 超过 2 次使用的代码块必须提取为函数
-- 请注意：任何修改如果涉及了规则文件中的说明那么需要更新规则文件（始终保持规则文件最新。）
-- 检查修改后的代码，去除冗余代码
-- 检查数据的流转确保一致性
-- 检查代码是否没有报错通顺
-
-#### 公共方法管理
-- 公共方法统一放在 `backend/app/utils/` 或 `frontend/src/utils/`
-- 相同逻辑必须抽取为工具函数
-- 避免在多个文件中复制粘贴相同代码
+**Key Points**:
+- 15m acts as main trigger (70% weight)
+- 2h provides medium-term assistance (25% weight)
+- 4h confirms long-term trend (15% weight, with dynamic adjustment)
 
 ---
 
-### 解耦原则
+### 3. Warmup Signal Protection
 
-#### 单一职责
-```python
-# ✅ 正确：每个函数只做一件事
-def fetch_data():
-    """只负责获取数据"""
-    return data
-
-def process_data(data):
-    """只负责处理数据"""
-    return processed
-
-def save_data(data):
-    """只负责保存数据"""
-    db.save(data)
-```
-
-#### 依赖注入
-```python
-# ✅ 正确：通过构造函数注入依赖
-class SignalGenerator:
-    def __init__(self, ml_service: MLService, data_service: DataService):
-        self.ml_service = ml_service
-        self.data_service = data_service
-
-# ❌ 错误：直接导入具体实现
-class SignalGenerator:
-    def __init__(self):
-        from app.services.ml_service import ml_service
-        self.ml_service = ml_service
-```
+**Safety Mechanism**:
+- First 5 signals are record-only (no trading)
+- Purpose: Observe model stability, ensure fund safety
+- State persisted in Redis, survives restarts
+- Regular training does NOT reset warmup state
 
 ---
 
-## 💻 代码规范
+### 4. HOLD Bias Solution
 
-### Python代码规范
+**Problem**: Stacking models tend to over-predict HOLD (70-100%)
 
-```python
-# 1. 类型提示（必须）
-def predict(self, data: pd.DataFrame, timeframe: str) -> Dict[str, Any]:
-    ...
+**Three-Layer Defense**:
+1. **Layer 1**: Base model HOLD penalty (0.7 weight)
+2. **Layer 2**: Meta-learner HOLD penalty (0.5-0.7 weight, stronger)
+3. **Layer 3**: Dynamic weight reduction for long-term HOLD signals during synthesis
 
-# 2. 文档字符串（必须）
-def train_model(self) -> Dict[str, Any]:
-    """训练多时间框架模型
-    
-    Returns:
-        模型指标字典
-    """
-
-# 3. 错误处理（必须）
-try:
-    result = await some_operation()
-except Exception as e:
-    logger.error(f"操作失败: {e}")
-    return default_value
-
-# 4. 日志规范（使用emoji提高可读性）
-logger.info("✅ 成功信息")
-logger.warning("⚠️ 警告信息")
-logger.error("❌ 错误信息")
-logger.debug("🔍 调试信息")
-```
-
-### TypeScript/React代码规范
-
-```typescript
-// 1. 类型定义（必须）
-interface SignalData {
-  signalType: 'LONG' | 'SHORT' | 'HOLD';
-  confidence: number;
-  timestamp: string;
-}
-
-// 2. 函数组件（优先）
-const Dashboard: React.FC = () => {
-  return <div>Dashboard</div>;
-};
-
-// 3. 自定义Hook复用逻辑
-const useSignalData = () => {
-  const [signals, setSignals] = useState<SignalData[]>([]);
-  // ... 逻辑
-  return { signals, loading, error };
-};
-```
+**Key Point**: Meta-learner HOLD penalty must be heavier than base models
 
 ---
 
-## 🚫 禁止事项
+### 5. Data Source Separation
 
-### 代码层面
-```python
-# ❌ 禁止：未来函数
-df['label'] = df['close'].shift(-5)
-
-# ❌ 禁止：随机数据分割
-train_test_split(X, y, shuffle=True)
-
-# ❌ 禁止：所有时间框架共享模型
-self.model = single_model
-
-# ❌ 禁止：naive datetime
-datetime.now()  # 没有时区
-
-# ❌ 禁止：硬编码配置（应差异化）
-threshold = 0.005  # 所有时间框架使用相同值
-
-# ❌ 禁止：创建冗余文件和方法
-
-# ❌ 禁止：修改代码之后不做检查导致低级错误（需要保证修改之后代码没有语法错误）
-
-# ❌ 禁止：准确率<50%就停止优化（准确率<50%没有任何意义）
-```
-
-### 操作层面
-```python
-# ❌ 禁止：在训练/预测中依赖数据库
-data = await postgresql_manager.query_klines()  # ❌
-
-# ❌ 禁止：没有错误处理的关键操作
-result = critical_api_call()  # ❌ 可能崩溃
-
-# ❌ 禁止：循环依赖
-# ServiceA imports ServiceB, ServiceB imports ServiceA  # ❌
-
-# ❌ 禁止：WebSocket订阅使用大写交易对
-subscribe("ETHUSDT@kline_15m")  # ❌ 应该用小写
-```
+- **Model Training**: Binance API (real-time latest data)
+- **Signal Generation**: WebSocket buffer (primary) → Binance API (fallback)
+- **Database**: Only for frontend display, historical queries, performance analysis
 
 ---
 
-## ✅ 最佳实践
+### 6. No Future Function Principle
 
-### 1. 配置集中化
-
-```python
-# ✅ 差异化配置
-prediction_days_config = {
-    '15m': 15,   # 快速响应
-    '2h': 20,    # 中期平衡
-    '4h': 35     # 长期稳定
-}
-
-# ✅ 魔法数字常量化
-BUFFER_DAYS = 60
-WARMUP_SIGNALS = 5  # 预热信号数量
-MIN_SIGNAL_INTERVAL = 900
-```
-
-### 2. 组合优于继承
-
-```python
-# ✅ 正确：使用组合
-class TradingEngine:
-    def __init__(self, signal_generator, risk_manager):
-        self.signal_generator = signal_generator
-        self.risk_manager = risk_manager
-
-# ⚠️ 谨慎：继承（仅在明确的 is-a 关系时使用）
-class AdvancedTrader(BaseTrader):
-    pass
-```
-
-### 3. 日志最佳实践
-
-```python
-# ✅ 关键流程必须记录
-logger.info("🚀 开始模型训练...")
-logger.info(f"📊 {timeframe} 数据获取成功: {len(df)}条")
-
-# ✅ 信号生成全链路追踪
-logger.info(f"📥 收到WebSocket K线: {symbol} {interval}")
-logger.info(f"🎯 {timeframe} K线完成，开始预测该时间框架...")
-logger.info(f"✅ {timeframe} 预测完成并缓存: {signal_type}")
-logger.info(f"🔄 15m信号更新，触发合成")
-
-# ✅ 预热信号标注清晰
-logger.warning(f"⚠️ 预热信号 [{count}/{warmup}]：仅记录，不执行交易")
-```
+**Critical Rules**:
+- Only look at next candle for labels
+- Use time-series split (NOT random split)
+- Never use future data in features
+- Ensure proper temporal ordering
 
 ---
 
-## 📚 项目结构
+### 7. Timezone Consistency
 
-```
-backend/
-├── app/
-│   ├── core/          # 核心配置（database, config, cache）
-│   ├── services/      # 业务服务（ml, trading, signal等）
-│   ├── api/           # API接口
-│   ├── models/        # 数据模型
-│   └── utils/         # 公共工具函数 ⭐
-├── models/            # 训练好的模型文件（.pkl）
-├── logs/              # 日志文件
-└── main.py            # 启动入口
-
-frontend/
-├── src/
-│   ├── components/    # UI组件
-│   ├── services/      # API服务和业务逻辑
-│   ├── contexts/      # 全局状态
-│   ├── utils/         # 公共工具函数 ⭐
-│   └── App.tsx
-```
+**All system timestamps use Asia/Shanghai timezone**
 
 ---
 
-## 🔄 开发流程
+### 8. WebSocket Subscription Format
 
-### 添加新功能前
-
-1. **检查现有代码**：是否已有类似功能？
-2. **评估复用性**：能否扩展现有方法而非新建？
-3. **规划解耦**：新功能如何与现有系统集成？
-4. **确定位置**：放在哪个模块/服务最合适？
-
-### 代码审查要点
-
-- [ ] 是否有冗余代码？
-- [ ] 是否有重复方法？
-- [ ] 职责是否单一？
-- [ ] 依赖是否注入？
-- [ ] 是否有类型提示？
-- [ ] 是否有错误处理？
-- [ ] 是否有适当注释？
-- [ ] 日志是否完整可追踪？
+**Trading pairs MUST be lowercase** in stream names
 
 ---
 
-## 🎓 设计哲学
+## 🏗️ Key Configuration Parameters
 
-1. **独立性** - 每个时间框架完全独立
-2. **差异化** - 根据特性使用不同配置
-3. **实时性** - WebSocket优先，缓冲区加速
-4. **可靠性** - 多层容错，优雅降级
-5. **可维护性** - 清晰架构，详细日志
-6. **无冗余** - 一个功能，一个实现 ⭐
-7. **高内聚低耦合** - 模块独立，接口清晰 ⭐
-8. **安全第一** - 预热保护，资金安全 🆕
+### Label Thresholds (Optimized for Medium-Frequency)
 
----
+**Current Production Configuration**:
+- 15m: ±0.1% (highly sensitive, HOLD <30%)
+- 2h: ±0.35% (balanced, HOLD <40%)
+- 4h: ±0.5% (stable, HOLD <45%)
 
----
-
-## 🏛️ 服务模块职责矩阵
-
-| 服务模块 | 核心职责 | 不应该做 |
-|---------|---------|----------|
-| **SignalGenerator** | 信号生成、缓存、合成、预热保护 | ❌ 计算仓位（委托给 position_manager） |
-| **TradingEngine** | 执行交易、虚拟/实盘切换、订单管理 | ❌ 生成信号、计算仓位 |
-| **PositionManager** | 🎯 仓位计算（唯一）、查询持仓、设置杠杆 | ❌ 管理本地持仓状态 |
-| **RiskService** | 计算风险指标、生成报告 | ❌ 阻止交易（仅供展示） |
-| **MLService** | 模型训练、预测、特征工程 | ❌ 访问数据库（用 API） |
-| **DataService** | WebSocket 数据流、缓冲区管理 | ❌ 模型训练 |
-| **Scheduler** | 定时任务调度（训练、更新、检查） | ❌ 重置预热状态 |
-| **TradingController** | 系统启停、信号路由、会话管理 | ❌ 直接交易执行 |
+**Expected Label Distribution**:
+- 15m: SHORT 32-38%, HOLD 24-32%, LONG 32-38%
+- 2h: SHORT 28-32%, HOLD 36-40%, LONG 28-32%
+- 4h: SHORT 26-30%, HOLD 42-46%, LONG 26-30%
 
 ---
 
-## 🎯 虚拟交易 vs 实盘交易
+### Timeframe Weights
 
-### 交易模式配置
-
-```python
-# config.py - 单一配置源
-TRADING_MODE: str = "SIGNAL_ONLY"  # ✅ 唯一字段，控制所有行为
-```
-
-### 两种模式对比
-
-| 特性 | SIGNAL_ONLY（默认） | AUTO |
-|------|---------------------|------|
-| **配置** | `TRADING_MODE="SIGNAL_ONLY"` | `TRADING_MODE="AUTO"` |
-| **余额来源** | 虚拟（10000 USDT） | Binance API 实盘 |
-| **订单类型** | 虚拟订单（数据库） | 真实订单（Binance） |
-| **手续费** | 模拟（开仓0.02%+平仓0.05%） | 真实扣除 |
-| **风险** | ✅ 无风险，测试策略 | ⚠️ 真实资金风险 |
-| **切换方式** | API 动态切换，无需重启 | API 动态切换，无需重启 |
-| **持久化** | Redis: `system:trading_mode` | Redis: `system:trading_mode` |
-
-### 仓位计算逻辑
-
-```python
-# position_manager.py - 统一的仓位计算
-async def calculate_position_size(
-    symbol, signal_type, confidence, current_price,
-    is_virtual: bool = True  # 根据交易模式动态传入
-):
-    if is_virtual:
-        # SIGNAL_ONLY 模式
-        available_balance = VIRTUAL_ACCOUNT_BALANCE  # 10000 USDT
-    else:
-        # AUTO 模式
-        account_info = binance_client.get_account_info()
-        available_balance = float(account_info['availableBalance'])
-    
-    # 统一的计算逻辑
-    position_ratio = 0.1 * confidence  # 基础10% × 置信度
-    position_value = available_balance * position_ratio * leverage
-    position_size = position_value / current_price
-    return position_size
-```
-
-### 虚拟订单手续费
-
-```python
-# trading_engine.py
-VIRTUAL_OPEN_FEE_RATE = 0.0002   # 开仓 0.02% (Maker)
-VIRTUAL_CLOSE_FEE_RATE = 0.0005  # 平仓 0.05% (Taker)
-
-# 净盈亏计算
-price_pnl = (exit_price - entry_price) * quantity  # 价差
-open_fee = entry_price * quantity * 0.0002
-close_fee = exit_price * quantity * 0.0005
-net_pnl = price_pnl - open_fee - close_fee  # ✅ 扣除双边手续费
-```
-
-### 模式切换流程
-
-```python
-# 1. 通过 API 切换（推荐）
-POST /api/trading/mode
-{"mode": "SIGNAL_ONLY"}  或  {"mode": "AUTO"}
-
-# 2. 内部同步
-trading_engine.set_trading_mode(mode)
-    ↓
-Redis["system:trading_mode"] = "SIGNAL_ONLY"  # 同步到 Redis
-    ↓
-signal_generator 从 Redis 读取
-    ↓
-position_manager(is_virtual=True/False)  # 动态决定余额来源
-```
+**Short-term Strategy Weight Distribution**:
+- 15m: 0.70 (dominant, quick entry detection)
+- 2h: 0.25 (auxiliary, trend filtering)
+- 4h: 0.15 (auxiliary, avoid counter-trend trading)
 
 ---
 
-## 🗄️ 缓存策略与 Redis 键规范
+## 🎯 Code Quality Standards
 
-### 通用缓存方法
+### Zero Tolerance for Redundancy
 
-```python
-# cache.py - 基础方法
-await cache_manager.get(key)              # 智能反序列化（JSON/字符串）
-await cache_manager.set(key, value, expire=None)  # 智能序列化，支持永久缓存
-```
+**File Level**:
+- Prohibit creating files with duplicate functionality
+- Prohibit redundant methods (same function exists elsewhere)
+- Delete verification files after completion
+- Similar modules must be merged or inherit from base class
+- Extract functions for code used >2 times
 
-### Redis 键命名规范
-
-| 键模式 | 用途 | 过期时间 | 示例 |
-|--------|------|----------|------|
-| `system:*` | 系统配置 | ❌ 永久 | `system:trading_mode` |
-| `warmup:*` | 预热状态 | ❌ 永久 | `warmup:signal_counter:ETHUSDT` |
-| `signal:*` | 交易信号 | ❌ 永久（去重用） | `signal:last:ETHUSDT` |
-| `market_data:*` | 市场数据 | ✅ 60秒 | `market_data:ETHUSDT:15m` |
-| `prediction:*` | 模型预测 | ✅ 300秒 | `prediction:ETHUSDT` |
-| `account_info` | 账户信息 | ✅ 30秒 | `account_info` |
-| `position_info` | 持仓信息 | ✅ 30秒 | `position_info` |
-
-### 缓存设计原则
-
-```python
-# ✅ 关键状态永久缓存
-await cache_manager.set("system:trading_mode", mode, expire=None)
-await cache_manager.set("warmup:signal_counter:ETHUSDT", count, expire=None)
-
-# ✅ 临时数据设置过期
-await cache_manager.set("market_data:ETHUSDT:15m", data, expire=60)
-
-# ✅ 处理 None 值
-await cache_manager.set(key, None, expire=None)  # 自动跳过，不报错
-```
-
-### 常见错误处理
-
-```python
-# ❌ 错误：expire=None 导致 setex 失败
-await redis.client.setex(key, None, value)  # Invalid input type: NoneType
-
-# ✅ 正确：区分永久和临时缓存
-if expire is None:
-    await redis.client.set(key, value)  # 永久
-else:
-    await redis.client.setex(key, expire, value)  # 临时
-```
+**Common Methods Management**:
+- Place common methods in `backend/app/utils/` or `frontend/src/utils/`
+- Extract same logic as utility functions
+- Avoid copy-pasting same code across files
 
 ---
 
-## 🔄 数据流与状态同步
+### Decoupling Principles
 
-### 预热状态持久化
+**Single Responsibility**:
+- Each function does one thing only
+- Separate concerns clearly
 
-```python
-# ✅ 启动时加载
-async def _load_warmup_state(self):
-    cached_counter = await cache_manager.get(f"warmup:signal_counter:{settings.SYMBOL}")
-    if cached_counter is not None:
-        self.signal_counter = int(cached_counter)
-        logger.info(f"📂 已加载预热状态: {self.signal_counter}/5")
-    else:
-        logger.info(f"📂 首次部署，初始化预热状态: 0/5")
-
-# ✅ 每次计数后保存
-self.signal_counter += 1
-await self._save_warmup_state()  # 立即持久化
-
-# ❌ 错误：定期训练重置预热状态
-# 训练完成后不应该触发 _initial_predictions()
-```
-
-### 交易模式同步
-
-```python
-# ✅ 启动时同步到 Redis
-async def start(self):
-    await self._sync_trading_mode_to_cache()
-
-# ✅ 切换时立即同步
-async def set_trading_mode(self, mode):
-    self.trading_mode = mode
-    await self._sync_trading_mode_to_cache()  # 同步到 Redis
-
-# ✅ 其他模块动态读取
-current_mode = await cache_manager.get("system:trading_mode")
-is_virtual = (current_mode != "AUTO")
-```
+**Dependency Injection**:
+- Pass dependencies through constructor
+- Avoid direct import of global instances
 
 ---
 
-## 🐛 常见错误模式与修复
+## 💻 Code Standards
 
-### 错误1：datetime 序列化
+### Python Code Standards
 
-```python
-# ❌ 错误：直接存储 datetime
-predictions = {
-    '15m': {'timestamp': datetime.now()}  # ❌ JSON 不支持
-}
-await postgresql_manager.write_signal_data({'predictions': predictions})
-# Error: Object of type datetime is not JSON serializable
+**Required**:
+- Type hints (must have)
+- Docstrings (must have)
+- Error handling (must have)
+- Logging with emojis for readability
+- Async for I/O operations
+- UTC+8 timezone for all timestamps
 
-# ✅ 正确：转换为 ISO 字符串
-for tf, pred in predictions.items():
-    if 'timestamp' in pred and hasattr(pred['timestamp'], 'isoformat'):
-        pred['timestamp'] = pred['timestamp'].isoformat()
-```
-
-### 错误2：CacheManager 缺少方法
-
-```python
-# ❌ 错误：调用不存在的方法
-await cache_manager.get(key)  # AttributeError: no attribute 'get'
-await cache_manager.set(key, value)  # AttributeError: no attribute 'set'
-
-# ✅ 正确：必须实现通用 get/set 方法
-class CacheManager:
-    async def get(self, key: str) -> Optional[Any]:
-        # 通用获取，自动 JSON 反序列化
-        
-    async def set(self, key: str, value: Any, expire: Optional[int] = None):
-        # 通用设置，支持永久缓存（expire=None）
-```
-
-### 错误3：None 值缓存
-
-```python
-# ❌ 错误：Redis 不接受 None
-await cache_manager.set(key, None, expire=None)
-# Error: Invalid input of type: 'NoneType'
-
-# ✅ 正确：检查并跳过
-if value is None:
-    logger.debug(f"跳过设置缓存（值为None）")
-    return
-```
-
-### 错误4：虚拟模式查询实盘余额
-
-```python
-# ❌ 错误：SIGNAL_ONLY 模式查询实盘账户
-account_info = binance_client.get_account_info()  # 返回 0 USDT
-if available_balance <= 0:
-    logger.warning("可用余额不足")  # 反复报错
-
-# ✅ 正确：根据模式选择余额
-if is_virtual:
-    available_balance = 10000.0  # 虚拟余额
-else:
-    account_info = binance_client.get_account_info()
-    available_balance = float(account_info['availableBalance'])
-```
-
-### 错误5：WebSocket 错误不重连
-
-```python
-# ❌ 错误：只在 _on_close 触发重连
-def _on_error(self, ws, error):
-    logger.error(f"错误: {error}")  # 只记录，不重连
-
-# ✅ 正确：error 也触发重连
-def _on_error(self, ws, error):
-    self.is_connected = False
-    if self.is_running and not self.is_reconnecting:
-        self.is_reconnecting = True  # 🔒 防重复
-        asyncio.run_coroutine_threadsafe(self._reconnect(), self.loop)
-```
-
-### 错误6：代码重复
-
-```python
-# ❌ 错误：同一功能写两遍
-# signal_generator.py
-async def _calculate_position_size(...):
-    position_ratio = 0.1 * confidence
-    ...
-
-# position_manager.py
-async def calculate_position_size(...):
-    position_ratio = 0.1 * confidence
-    ...  # 完全相同的逻辑
-
-# ✅ 正确：统一使用 position_manager
-from app.services.position_manager import position_manager
-position_size = await position_manager.calculate_position_size(...)
-```
+**Prohibited**:
+- Future functions in features
+- Random data split (use time-series split)
+- Shared models across timeframes
+- Naive datetime (without timezone)
+- Hardcoded configuration
+- Creating redundant files/methods
+- Modifications without verification
 
 ---
 
-## 📊 配置管理最佳实践
+### TypeScript/React Code Standards
 
-### 单一配置源原则
+**Required**:
+- Type definitions (interfaces)
+- Function components (preferred)
+- Custom hooks for logic reuse
 
-```python
-# ✅ 正确：只用一个字段控制
-TRADING_MODE: str = "SIGNAL_ONLY"
-
-# ❌ 错误：冗余字段
-TRADING_MODE: str = "SIGNAL_ONLY"
-AUTO_TRADING_ENABLED: bool = False  # ❌ 可以从 TRADING_MODE 推导
-```
-
-### 配置读取顺序
-
-```
-1. config.py（默认值）
-   ↓
-2. .env 文件（覆盖）
-   ↓
-3. Redis 运行时状态（动态切换）
-   ↓
-4. API 调用（即时生效）
-```
-
-### 差异化配置示例
-
-```python
-# ✅ 正确：根据时间框架特性配置
-threshold_config = {
-    '15m': {'up': 0.001, 'down': -0.001},   # 短线灵敏
-    '2h': {'up': 0.0035, 'down': -0.0035},  # 中期平衡
-    '4h': {'up': 0.005, 'down': -0.005}     # 长期稳健
-}
-
-training_days_config = {
-    '15m': 180,  # 短期数据充足
-    '2h': 360,   # 中期需要更多
-    '4h': 540    # 长期需要最多
-}
-
-# ❌ 错误：所有时间框架用相同配置
-threshold = 0.005  # 不合理，应差异化
-```
+**Prohibited**:
+- Hardcoded API URLs
+- Direct state mutation
+- Missing error handling
+- Missing dependency arrays in useEffect
+- Duplicate logic across components
 
 ---
 
-## 🔧 常量命名规范
+## 🚫 Prohibited Actions
 
-```python
-# 虚拟交易常量（大写，模块级）
-VIRTUAL_ACCOUNT_BALANCE = 10000.0
-VIRTUAL_OPEN_FEE_RATE = 0.0002
-VIRTUAL_CLOSE_FEE_RATE = 0.0005
+### Code Level
+- Future functions
+- Random train-test split
+- Shared models across timeframes
+- Naive datetime
+- Hardcoded configuration
+- Creating redundant files
+- Not checking code after modifications (ensure no syntax errors)
+- Stopping optimization when accuracy <50% (meaningless below 50%)
 
-# 系统常量
-BUFFER_DAYS = 60
-WARMUP_SIGNALS = 5
-MIN_SIGNAL_INTERVAL = 900
-
-# ❌ 禁止：魔法数字
-position_value = balance * 0.1  # ❌ 0.1 是什么？
-# ✅ 应该：
-BASE_POSITION_RATIO = 0.1  # 基础10%仓位
-position_value = balance * BASE_POSITION_RATIO
-```
+### Operation Level
+- Using database data in training/prediction (use API)
+- Missing error handling for critical operations
+- Circular dependencies
+- Uppercase in WebSocket subscriptions (must be lowercase)
 
 ---
 
-## 🔄 异步编程最佳实践
+## ✅ Best Practices
 
-### 正确的异步调用
+### 1. Centralized Configuration
 
-```python
-# ✅ I/O 操作必须异步
-async def fetch_data(symbol: str):
-    return await binance_client.get_klines(symbol)
+**Differentiated Config**:
+- Prediction days: 15m (15d), 2h (20d), 4h (35d)
+- Training days: 15m (180d), 2h (360d), 4h (540d)
+- Model complexity: 15m (complex), 2h (medium), 4h (simple)
 
-# ✅ CPU 密集型可以同步
-def train_model(X, y):
-    model = lgb.train(params, train_set)
-    return model
-
-# ❌ 错误：同步 I/O 阻塞
-def fetch_data(symbol: str):
-    return requests.get(url)  # ❌ 阻塞事件循环
-```
-
-### 跨线程调用
-
-```python
-# ✅ 正确：WebSocket 回调（子线程）调用主事件循环
-def _on_close(self, ws):
-    if self.loop:
-        future = asyncio.run_coroutine_threadsafe(
-            self._reconnect(), 
-            self.loop  # 提交到主事件循环
-        )
-        self.reconnect_task = future  # 保存 future 防止 GC
-
-# ❌ 错误：直接调用 async 函数
-def _on_close(self, ws):
-    await self._reconnect()  # ❌ 同步函数不能 await
-```
+**Magic Numbers**:
+- Define as constants
+- Example: BUFFER_DAYS, WARMUP_SIGNALS, MIN_SIGNAL_INTERVAL
 
 ---
 
-## 🚫 本次会话修复的错误（记录）
+### 2. Composition Over Inheritance
 
-### 修复清单
-
-1. ✅ 置信度过滤日志不显示 → 改为 INFO 级别
-2. ✅ 预热状态不持久化 → 添加 Redis 持久化
-3. ✅ 定期训练重置预热 → 删除训练后触发预测
-4. ✅ CacheManager 缺 get/set → 添加通用方法
-5. ✅ None 值序列化错误 → 添加 None 处理
-6. ✅ datetime 序列化错误 → 转换为 ISO 字符串
-7. ✅ 虚拟模式余额不足 → 添加虚拟余额支持（10000）
-8. ✅ 虚拟订单无手续费 → 添加 0.02%/0.05%
-9. ✅ 交易模式配置冗余 → 删除 AUTO_TRADING_ENABLED
-10. ✅ 代码重复（仓位计算） → 统一到 position_manager
-11. ✅ WebSocket 错误不重连 → _on_error 触发重连
-12. ✅ 重复重连风险 → 添加 is_reconnecting 锁
-13. ✅ 重连失败不再尝试 → 失败后再次调度
+Use composition for flexibility, inheritance only for clear is-a relationships.
 
 ---
 
-## 🎯 架构设计原则（更新）
+### 3. Logging Best Practices
 
-### 1. 单一职责原则（SRP）
-- 每个服务模块只负责一件事
-- 仓位计算**只在** position_manager
-- 信号生成**只在** signal_generator
-- 交易执行**只在** trading_engine
+**Critical Flow Logs** (must have):
+- Model training start/completion
+- Data fetch success/failure
+- Signal generation full chain tracking
+- Warmup signal clear marking
+- Label distribution (critical metric in production)
 
-### 2. 依赖注入原则（DI）
-- 通过构造函数传递依赖
-- 避免在类内部直接导入全局实例
-- 便于测试和解耦
-
-### 3. 配置集中化
-- 所有配置在 config.py
-- 单一数据源，避免冗余
-- 支持 .env 文件覆盖
-
-### 4. 状态持久化
-- 关键状态存储到 Redis（预热、交易模式）
-- 重启后恢复，避免中断
-- 支持动态切换，无需重启
-
-### 5. 错误优雅降级
-- WebSocket 断开 → 自动重连
-- 缓存失败 → 降级到 API
-- 模型未训练 → 等待训练完成
+**Warning Conditions**:
+- HOLD ratio >60%
+- Accuracy <target threshold
+- Data integrity issues
 
 ---
 
-## 🚀 系统优化规范
+## 🏛️ Service Module Responsibility Matrix
 
-### 1. 性能优化原则
-
-**关键指标**：
-- 模型准确率：**已达成81%**（15m:60%, 2h:90%, 4h:94%）✅ 超额完成
-- 实际信号准确率：基本要求 ≥50%，目标 ≥55%，长期目标 ≥60%
-- 预测延迟：目标 <1秒
-- 系统稳定性：目标 99.9%
-
-**性能基准**（三分类）：
-- 随机猜测: 33.3%
-- 基本可用: **50%** ← 最低要求
-- 良好: 55%
-- 优秀: 60%+
-
-### 2. 优化优先级
-
-**立即执行** ⭐⭐⭐：
-- 标签阈值配置修复（15m: ±0.1%, 2h: ±0.35%, 4h: ±0.5%）
-- 置信度阈值调整（0.44 → 0.40）
-- 样本加权训练（解决类别不平衡）
-- 动态仓位管理（根据市场状态调整）
-- 动态止损止盈（基于ATR）
-
-**短期优化** ⭐⭐（1-2周）：
-- 市场微观结构特征（买卖压力、K线形态）
-- 模型集成（LightGBM + XGBoost + CatBoost）
-- 市场情绪特征（恐慌指数、连续涨跌）
-- 信号增强过滤（趋势一致性、量能确认）
-- 回撤保护机制（分级保护）
-
-**中期优化** ⭐（1-2月）：
-- 多时间框架特征融合（长周期趋势融入短周期）
-- 动态标签阈值（根据波动率调整）
-- 超参数自动优化（Optuna）
-- 特征缓存机制（避免重复计算）
-- 实时性能监控
-
-**长期探索**：
-- 多目标标签（方向+幅度+持续时间）
-- 强化学习
-- A/B测试框架
-- 增量特征计算
-
-### 3. 特征工程规范
-
-**禁止事项**：
-- ❌ 添加未来函数（使用未来数据）
-- ❌ 过度拟合（特征数>样本数/10）
-- ❌ 重复特征（相关系数>0.95）
-- ❌ 忽略异常值处理
-
-**最佳实践**：
-- ✅ 特征标准化/归一化
-- ✅ 移除高缺失率特征（>20%）
-- ✅ 特征重要性分析（保留Top 50）
-- ✅ 交叉验证防止过拟合
-- ✅ 增量计算提升效率
-
-### 4. 模型训练规范
-
-**差异化配置**（必须遵守）：
-```python
-# 标签阈值（关键配置）
-'15m': ±0.1%  (0.001)   # 目标HOLD 24-32%
-'2h': ±0.35% (0.0035)  # 目标HOLD 36-40%
-'4h': ±0.5%  (0.005)   # 目标HOLD 42-46%
-
-# 训练天数
-'15m': 180天  # 短期数据充足
-'2h': 270天   # 中期需要更多
-'4h': 360天   # 长期需要最多
-
-# 模型复杂度
-'15m': num_leaves=127  # 数据多，模型复杂
-'2h': num_leaves=63    # 中等
-'4h': num_leaves=47    # 数据少，模型简单
-```
-
-**样本权重策略**：
-```python
-# 1. 类别权重（解决不平衡）
-class_weights = compute_sample_weight('balanced', y_train)
-
-# 2. 时间衰减权重（重视最近数据）
-time_decay = np.exp(-np.arange(len(X)) / (len(X) * 0.1))[::-1]
-
-# 3. 组合权重
-sample_weights = class_weights * time_decay
-```
-
-### 5. 风险管理规范
-
-**动态仓位计算**：
-```python
-# 基础仓位
-base_ratio = 0.1 * confidence  # 最高10%
-
-# 调整因子
-volatility_adj = f(市场波动率)     # 0.5-1.5
-exposure_adj = f(当前持仓)         # 0.5-1.0
-loss_adj = f(连续亏损次数)         # 0.5-1.0
-
-# 最终仓位
-position_ratio = base_ratio * volatility_adj * exposure_adj * loss_adj
-position_ratio = clip(position_ratio, 0.02, 0.15)  # 限制2%-15%
-```
-
-**回撤保护**（强制执行）：
-```python
-# 分级保护
-if drawdown > 15%: 暂停交易
-elif drawdown > 10%: 仓位降至50%
-elif drawdown > 5%: 仓位降至75%
-
-# 恢复条件
-if drawdown < 3%: 恢复正常交易
-```
-
-### 6. 系统性能规范
-
-**响应时间要求**：
-- 特征计算：<500ms
-- 模型预测：<200ms
-- 信号生成：<1000ms
-- 订单执行：<2000ms
-
-**优化策略**：
-- 特征缓存（最近100个）
-- 增量计算（只计算新K线）
-- GPU加速（如果可用）
-- 异步并发（I/O操作）
-
-### 7. 监控指标
-
-**必须监控**：
-- 模型准确率（每次训练后）
-- 实际信号准确率（实时更新）
-- 胜率（7日/30日）
-- 盈亏比（7日/30日）
-- 最大回撤（实时）
-- 夏普比率（30日）
-- 信号数量（日均）
-- 系统延迟（p99）
-
-**告警阈值**：
-```python
-if win_rate < 45%: 发送告警
-if drawdown > 10%: 紧急告警
-if accuracy < 40%: 模型需重训
-if latency_p99 > 3s: 性能告警
-```
-
-### 8. 优化文档规范
-
-**必须文档化**：
-- 每次优化的目标、方法、结果
-- A/B测试对比数据
-- 参数调整前后对比
-- 失败的尝试和原因
-
-**文档位置**：
-- 总体规划：`OPTIMIZATION_ROADMAP.md`
-- 实施记录：`docs/optimization/`
-- 性能报告：`docs/performance/`
-
-### 9. 代码质量规范
-
-**优化相关代码必须**：
-- 添加详细注释（说明优化目的）
-- 包含性能测试（before/after）
-- 可配置开关（便于对比）
-- 向后兼容（不破坏现有功能）
-
-**示例**：
-```python
-# ✅ 好的优化代码
-def create_features_cached(self, df: pd.DataFrame) -> pd.DataFrame:
-    """
-    创建特征（带缓存优化）
-    
-    优化目标：减少重复计算，提升响应速度50%+
-    
-    Args:
-        df: 原始K线数据
-    
-    Returns:
-        带特征的DataFrame
-    
-    Performance:
-        Before: ~800ms
-        After:  ~300ms (缓存命中时)
-    """
-    # ... 实现
-```
-
-### 10. 测试规范
-
-**优化必须测试**：
-- 单元测试（新增功能）
-- 性能测试（before/after对比）
-- 回测验证（历史数据）
-- 压力测试（极端情况）
-
-**测试通过标准**：
-- 准确率提升 ≥2%（或其他目标指标）
-- 无性能退化（延迟不增加）
-- 无功能破坏（现有功能正常）
-- 代码覆盖率 ≥80%
+| Service Module | Core Responsibility | Should NOT Do |
+|---|---|---|
+| **SignalGenerator** | Signal generation, caching, synthesis, warmup protection | Calculate position size (delegate to position_manager) |
+| **TradingEngine** | Execute trades, virtual/live switching, order management | Generate signals, calculate positions |
+| **PositionManager** | Position calculation (ONLY), query positions, set leverage | Manage local position state |
+| **RiskService** | Calculate risk metrics, generate reports | Block trades (display only) |
+| **MLService** | Model training, prediction, feature engineering | Access database (use API) |
+| **DataService** | WebSocket data stream, buffer management | Model training |
+| **Scheduler** | Schedule periodic tasks (training, updates, checks) | Reset warmup state |
+| **TradingController** | System start/stop, signal routing, session management | Direct trade execution |
 
 ---
 
-## 🎓 专业量化工程师代码规范
+## 🎯 Virtual Trading vs Live Trading
 
-**项目**: QuantAI-ETH  
-**重要性**: 🔴 **CRITICAL** - 必须严格遵守  
-**目标**: 避免低级错误，确保代码质量
+### Trading Modes
 
----
+**Configuration**:
+- Single field: `TRADING_MODE = "SIGNAL_ONLY"` or `"AUTO"`
 
-### 1. 代码质量基本要求
+**Mode Comparison**:
 
-#### 1.1 零容忍错误
-
-**严格禁止以下低级错误**：
-
-```python
-# ❌ 禁止1: 重复定义
-new_features['price'] = ...  # 第一次
-# ... 100行代码后 ...
-new_features['price'] = ...  # ❌ 重复定义！
-
-# ❌ 禁止2: 变量未定义就使用
-result = calculate(data, label)  # ❌ label未定义
-label = df['label']  # 定义太晚了
-
-# ❌ 禁止3: 逻辑错误
-if accuracy > 0.5:
-    logger.info("准确率低于50%")  # ❌ 逻辑反了
-
-# ❌ 禁止4: 硬编码
-threshold = 0.001  # ❌ 应该用配置
-data = pd.read_csv("C:\\Users\\data.csv")  # ❌ 绝对路径
-
-# ❌ 禁止5: 缺少错误处理
-result = risky_operation()  # ❌ 可能失败但没有try-except
-
-# ❌ 禁止6: 未来函数
-df['label'] = df['close'].shift(-5)  # ❌ 使用未来数据
-
-# ❌ 禁止7: 时区错误
-now = datetime.now()  # ❌ 没有时区信息
-
-# ❌ 禁止8: 类型错误
-def process(data):  # ❌ 缺少类型提示
-    return data * 2
-```
-
-#### 1.2 代码质量检查清单
-
-**每次提交代码前必须检查**：
-
-- [ ] ✅ 无重复定义（特征、变量、函数）
-- [ ] ✅ 无未定义变量使用
-- [ ] ✅ 所有变量先定义后使用
-- [ ] ✅ 类型提示完整
-- [ ] ✅ 错误处理完善
-- [ ] ✅ 日志记录充分
-- [ ] ✅ 注释清晰准确
-- [ ] ✅ 无硬编码常量
-- [ ] ✅ 无魔法数字
-- [ ] ✅ 通过语法检查
-- [ ] ✅ 通过单元测试
-- [ ] ✅ 代码格式规范
+| Feature | SIGNAL_ONLY (Default) | AUTO |
+|---|---|---|
+| Balance Source | Virtual (100 USDT) | Binance API |
+| Order Type | Virtual (database) | Real (Binance) |
+| Fees | Simulated (0.02% open + 0.05% close) | Real deduction |
+| Risk | Zero risk, strategy testing | Real money risk |
+| Switching | API dynamic switch, no restart | API dynamic switch |
 
 ---
 
-### 2. 特征工程专业规范
+### Position Calculation Logic
 
-#### 2.1 特征定义规范
-
-**强制规则**：
-
-```python
-# ✅ 规则1: 特征名称唯一性检查
-def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
-    """创建特征"""
-    # ... 特征计算 ...
-    
-    # 🔑 强制检查重复
-    duplicates = df.columns[df.columns.duplicated()].tolist()
-    if duplicates:
-        raise ValueError(f"❌ 重复特征: {duplicates}")
-    
-    return df
-
-# ✅ 规则2: 添加特征前检查是否存在
-if 'price_change' not in new_features:
-    new_features['price_change'] = df['close'].pct_change()
-
-# ✅ 规则3: 使用注释标记特征来源
-# 注：upper_shadow 在微观结构特征中定义（避免重复）
-
-# ✅ 规则4: 特征分组管理
-def _add_price_features(self, df):      # 价格特征组
-def _add_volume_features(self, df):     # 成交量特征组
-def _add_technical_indicators(self, df):# 技术指标组
-```
-
-#### 2.2 特征命名规范
-
-```python
-# ✅ 好的命名
-price_acceleration     # 清晰、语义明确
-rsi_14                # 包含参数
-sma_cross_5_20        # 描述具体含义
-volume_spike          # 表达意图
-
-# ❌ 差的命名
-pa                    # 太简短
-temp                  # 临时变量不应该保存
-feature_1             # 无意义
-data                  # 太泛化
-```
-
-#### 2.3 特征验证规范
-
-```python
-# ✅ 必须验证的内容
-def validate_features(self, df: pd.DataFrame):
-    """验证特征质量"""
-    
-    # 1. 检查重复特征
-    duplicates = df.columns[df.columns.duplicated()].tolist()
-    assert len(duplicates) == 0, f"重复特征: {duplicates}"
-    
-    # 2. 检查NaN比例
-    for col in df.columns:
-        nan_pct = df[col].isna().sum() / len(df)
-        assert nan_pct < 0.2, f"{col} NaN比例过高: {nan_pct:.1%}"
-    
-    # 3. 检查数值范围
-    for col in df.select_dtypes(include=[np.number]).columns:
-        assert not np.isinf(df[col]).any(), f"{col} 含有无穷大"
-    
-    # 4. 检查特征数量合理性
-    n_samples = len(df)
-    n_features = len(df.columns)
-    ratio = n_samples / n_features
-    assert ratio > 50, f"样本/特征比太低: {ratio:.1f}"
-```
+**Unified calculation**:
+- Virtual mode: Use virtual balance (100 USDT)
+- Live mode: Query Binance account balance
+- Same calculation logic for both modes
+- Returns USDT value directly (not converted to quantity)
 
 ---
 
-### 3. 机器学习专业规范
+### Virtual Order Fees
 
-#### 3.1 训练流程规范
-
-**严格遵守的顺序**：
-
-```python
-async def train_model(self, timeframe: str):
-    """标准训练流程"""
-    
-    # 1️⃣ 数据获取
-    data = await self._get_training_data(timeframe)
-    logger.info(f"✅ 数据获取: {len(data)}条")
-    
-    # 2️⃣ 数据验证
-    self._validate_data(data)
-    logger.info(f"✅ 数据验证通过")
-    
-    # 3️⃣ 特征工程
-    data = self.feature_engineer.create_features(data)
-    logger.info(f"✅ 特征工程: {len(data.columns)}个特征")
-    
-    # 4️⃣ 创建标签（必须传入timeframe）
-    data = self._create_labels(data, timeframe=timeframe)
-    logger.info(f"✅ 标签创建完成")
-    
-    # 5️⃣ 准备特征和标签
-    X, y = self._prepare_features_labels(data, timeframe)
-    logger.info(f"✅ 特征准备: X={X.shape}, y={y.shape}")
-    
-    # 6️⃣ 数据分割（时间序列！）
-    X_train, X_val, y_train, y_val = self._time_series_split(X, y)
-    logger.info(f"✅ 数据分割: 训练{len(X_train)}, 验证{len(X_val)}")
-    
-    # 7️⃣ 特征缩放
-    X_train_scaled = self._scale_features(X_train, timeframe, fit=True)
-    X_val_scaled = self._scale_features(X_val, timeframe, fit=False)
-    logger.info(f"✅ 特征缩放完成")
-    
-    # 8️⃣ 模型训练
-    model = self._train_lightgbm(X_train_scaled, y_train, timeframe)
-    logger.info(f"✅ 模型训练完成")
-    
-    # 9️⃣ 模型评估
-    metrics = self._evaluate_model(model, X_val_scaled, y_val)
-    logger.info(f"✅ 模型评估: 准确率={metrics['accuracy']:.4f}")
-    
-    # 🔟 保存模型
-    self._save_model(model, timeframe)
-    logger.info(f"✅ 模型保存完成")
-    
-    return model, metrics
-```
-
-#### 3.2 数据验证规范
-
-```python
-def _validate_data(self, df: pd.DataFrame):
-    """数据质量检查（强制执行）"""
-    
-    # 1. 基础检查
-    assert len(df) > 0, "数据为空"
-    assert not df.empty, "DataFrame为空"
-    
-    # 2. 必需列检查
-    required_cols = ['open', 'high', 'low', 'close', 'volume']
-    missing = set(required_cols) - set(df.columns)
-    assert len(missing) == 0, f"缺少列: {missing}"
-    
-    # 3. 数据类型检查
-    for col in required_cols:
-        assert pd.api.types.is_numeric_dtype(df[col]), f"{col}不是数值类型"
-    
-    # 4. 数据范围检查
-    assert (df['high'] >= df['low']).all(), "存在high < low"
-    assert (df['high'] >= df['close']).all(), "存在high < close"
-    assert (df['low'] <= df['close']).all(), "存在low > close"
-    assert (df['volume'] >= 0).all(), "存在负成交量"
-    
-    # 5. 时间排序检查
-    if 'timestamp' in df.columns:
-        assert df['timestamp'].is_monotonic_increasing, "时间序列未排序"
-    
-    # 6. 重复数据检查
-    if 'timestamp' in df.columns:
-        duplicates = df['timestamp'].duplicated().sum()
-        assert duplicates == 0, f"存在{duplicates}个重复时间戳"
-```
-
-#### 3.3 标签创建规范
-
-```python
-def _create_labels(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
-    """创建标签（严格规范）"""
-    
-    # ❌ 禁止：使用未来多个K线
-    # df['label'] = df['close'].shift(-5)  # ❌ 看未来5根
-    
-    # ✅ 正确：只看下一根K线
-    df['next_return'] = df['close'].shift(-1) / df['close'] - 1
-    
-    # ✅ 使用差异化阈值配置
-    threshold_config = {
-        '15m': {'up': 0.001, 'down': -0.001},
-        '2h': {'up': 0.0035, 'down': -0.0035},
-        '4h': {'up': 0.005, 'down': -0.005}
-    }
-    
-    threshold = threshold_config[timeframe]
-    
-    # ✅ 三分类标签
-    conditions = [
-        df['next_return'] <= threshold['down'],  # SHORT
-        df['next_return'] > threshold['up']      # LONG
-    ]
-    choices = [0, 2]
-    df['label'] = np.select(conditions, choices, default=1)  # HOLD
-    
-    # ✅ 标签分布验证
-    label_counts = df['label'].value_counts()
-    for label in [0, 1, 2]:
-        pct = label_counts.get(label, 0) / len(df) * 100
-        logger.info(f"  标签{label}: {pct:.1f}%")
-        
-        # 检查标签分布是否合理
-        if label == 1:  # HOLD
-            assert 20 < pct < 50, f"HOLD比例异常: {pct:.1f}%"
-    
-    return df
-```
+**Fee Structure**:
+- Open fee: 0.02% (Maker)
+- Close fee: 0.05% (Taker)
+- Net PnL: Price PnL - Open fee - Close fee
 
 ---
 
-### 4. 错误预防措施
+## 🗄️ Caching Strategy & Redis Key Schema
 
-#### 4.1 自动检测机制
+### General Cache Methods
 
-**必须实施的检测**：
-
-```python
-# 1. 重复特征检测
-def check_duplicate_features(df: pd.DataFrame):
-    """检测重复特征（每次特征工程后调用）"""
-    duplicates = df.columns[df.columns.duplicated()].tolist()
-    if duplicates:
-        raise ValueError(f"❌ 发现重复特征: {duplicates}")
-
-# 2. 变量定义检测
-def check_variable_defined(var_name: str, local_vars: dict):
-    """检查变量是否已定义"""
-    if var_name not in local_vars:
-        raise NameError(f"❌ 变量未定义: {var_name}")
-
-# 3. 数据类型检测
-def check_data_types(df: pd.DataFrame, expected_types: dict):
-    """检查数据类型"""
-    for col, expected_type in expected_types.items():
-        if col not in df.columns:
-            raise ValueError(f"❌ 列不存在: {col}")
-        actual_type = df[col].dtype
-        if not pd.api.types.is_dtype_equal(actual_type, expected_type):
-            raise TypeError(f"❌ {col}类型错误: 期望{expected_type}, 实际{actual_type}")
-```
-
-#### 4.2 代码审查清单
-
-**每次提交前必须检查**：
-
-```markdown
-## 代码审查清单
-
-### 基础检查
-- [ ] 无语法错误
-- [ ] 无拼写错误
-- [ ] 无未使用的导入
-- [ ] 无未使用的变量
-- [ ] 无注释掉的代码（应删除）
-
-### 逻辑检查
-- [ ] 变量先定义后使用
-- [ ] 循环逻辑正确
-- [ ] 条件判断正确
-- [ ] 返回值类型正确
-- [ ] 边界条件处理
-
-### 数据检查
-- [ ] 无未来函数
-- [ ] 时间序列正确排序
-- [ ] 标签创建正确
-- [ ] 特征无重复
-- [ ] 数据类型正确
-
-### 性能检查
-- [ ] 无性能瓶颈
-- [ ] 无内存泄漏
-- [ ] 无无限循环
-- [ ] 合理使用缓存
-- [ ] 异步操作正确
-
-### 安全检查
-- [ ] 无SQL注入风险
-- [ ] 无密钥硬编码
-- [ ] 输入验证完整
-- [ ] 错误处理完善
-- [ ] 日志不含敏感信息
-```
-
-#### 4.3 单元测试规范
-
-**关键功能必须测试**：
-
-```python
-import pytest
-import pandas as pd
-import numpy as np
-
-# ✅ 测试1: 特征无重复
-def test_no_duplicate_features():
-    """测试特征工程无重复"""
-    from app.services.feature_engineering import FeatureEngineer
-    
-    fe = FeatureEngineer()
-    data = create_test_data()
-    result = fe.create_features(data)
-    
-    # 检查重复
-    duplicates = result.columns[result.columns.duplicated()].tolist()
-    assert len(duplicates) == 0, f"发现重复特征: {duplicates}"
-
-# ✅ 测试2: 标签分布合理
-def test_label_distribution():
-    """测试标签分布合理性"""
-    from app.services.ml_service import MLService
-    
-    ml = MLService()
-    data = create_test_data()
-    data = ml._create_labels(data, timeframe='15m')
-    
-    # 检查标签分布
-    counts = data['label'].value_counts()
-    for label in [0, 1, 2]:
-        pct = counts[label] / len(data) * 100
-        assert 20 < pct < 50, f"标签{label}分布异常: {pct:.1f}%"
-
-# ✅ 测试3: 无未来函数
-def test_no_future_function():
-    """测试无未来数据泄露"""
-    from app.services.ml_service import MLService
-    
-    ml = MLService()
-    data = create_test_data()
-    
-    # 检查shift方向
-    assert 'next_return' in data.columns
-    # next_return应该只使用shift(-1)
-    # 不应该使用shift(-n) where n > 1
-
-# ✅ 测试4: 时间序列分割
-def test_time_series_split():
-    """测试时间序列分割正确性"""
-    from app.services.ml_service import MLService
-    
-    ml = MLService()
-    X, y = create_test_features_labels()
-    
-    X_train, X_val, y_train, y_val = ml._time_series_split(X, y)
-    
-    # 训练集应该在验证集之前
-    assert len(X_train) > 0
-    assert len(X_val) > 0
-    # 不应该使用shuffle=True
-```
+**Base Methods**:
+- `cache_manager.get(key)` - Smart deserialization
+- `cache_manager.set(key, value, expire=None)` - Smart serialization, supports permanent cache
 
 ---
 
-### 5. 代码提交规范
+### Redis Key Naming Convention
 
-#### 5.1 提交前检查流程
-
-```bash
-# 1. 代码格式化
-black backend/app/services/
-isort backend/app/services/
-
-# 2. 语法检查
-pylint backend/app/services/ml_service.py
-mypy backend/app/services/ml_service.py
-
-# 3. 运行测试
-pytest tests/ -v
-
-# 4. 检查覆盖率
-pytest tests/ --cov=app --cov-report=html
-
-# 5. 手动审查清单
-# - 无重复特征
-# - 无未定义变量
-# - 无低级错误
-# - 日志充分
-# - 注释清晰
-```
-
-#### 5.2 提交信息规范
-
-```bash
-# ✅ 好的提交信息
-git commit -m "fix: 修复upper_shadow重复定义错误
-
-- 删除价格特征中的重复定义
-- 保留微观结构特征中的版本（更好的归一化）
-- 添加注释防止未来重复
-- 通过单元测试验证
-
-Issue: #123
-"
-
-# ❌ 差的提交信息
-git commit -m "修复bug"
-git commit -m "更新"
-git commit -m "临时提交"
-```
+| Key Pattern | Purpose | Expiry | Example |
+|-----|---|---|---|
+| `system:*` | System config | Permanent | `system:trading_mode` |
+| `warmup:*` | Warmup state | Permanent | `warmup:signal_counter:ETHUSDT` |
+| `signal:*` | Trading signals | Permanent | `signal:last:ETHUSDT` |
+| `market_data:*` | Market data | 60s | `market_data:ETHUSDT:15m` |
+| `prediction:*` | Model predictions | 300s | `prediction:ETHUSDT` |
+| `account_info` | Account info | 30s | `account_info` |
+| `position_info` | Position info | 30s | `position_info` |
 
 ---
 
-### 6. 性能优化规范
+### Cache Design Principles
 
-#### 6.1 优化前必须测试
-
-```python
-import time
-import cProfile
-import memory_profiler
-
-# ✅ 性能测试模板
-def benchmark_feature_engineering():
-    """基准测试特征工程性能"""
-    from app.services.feature_engineering import FeatureEngineer
-    
-    fe = FeatureEngineer()
-    data = load_large_dataset()  # 10000行
-    
-    # 测试前
-    start_time = time.time()
-    result = fe.create_features(data)
-    end_time = time.time()
-    
-    duration = end_time - start_time
-    
-    print(f"特征工程耗时: {duration:.2f}秒")
-    print(f"处理速度: {len(data)/duration:.0f}行/秒")
-    print(f"特征数量: {len(result.columns)}")
-    
-    return duration
-
-# ✅ 内存测试
-@memory_profiler.profile
-def test_memory_usage():
-    """测试内存使用"""
-    from app.services.ml_service import MLService
-    
-    ml = MLService()
-    # ... 测试代码 ...
-```
-
-#### 6.2 优化后必须对比
-
-```python
-# ✅ A/B测试对比
-def compare_performance():
-    """对比优化前后性能"""
-    
-    # 优化前
-    time_before = benchmark_old_method()
-    
-    # 优化后
-    time_after = benchmark_new_method()
-    
-    # 计算改进
-    improvement = (time_before - time_after) / time_before * 100
-    
-    print(f"优化前: {time_before:.2f}秒")
-    print(f"优化后: {time_after:.2f}秒")
-    print(f"性能提升: {improvement:.1f}%")
-    
-    # 必须有提升
-    assert improvement > 0, "优化后性能反而下降"
-```
+**Critical State**: Permanent cache (expire=None)
+**Temporary Data**: Set expiration
+**None Values**: Auto-skip, no error
 
 ---
 
-### 7. 文档规范
+## 🔄 Data Flow & State Synchronization
 
-#### 7.1 代码注释规范
+### Warmup State Persistence
 
-```python
-# ✅ 好的注释
-def _select_features_intelligent(
-    self, 
-    X: pd.DataFrame, 
-    y: pd.Series, 
-    timeframe: str
-) -> list:
-    """
-    智能特征选择（两阶段 + 动态预算）
-    
-    阶段1: Filter过滤低重要性特征（基于LightGBM重要性）
-    阶段2: 嵌入式选择（SelectFromModel + 动态预算）
-    
-    Args:
-        X: 特征DataFrame
-        y: 标签Series
-        timeframe: 时间框架（'15m', '2h', '4h'）
-    
-    Returns:
-        选中的特征列表
-    
-    优化目标:
-        - 提升准确率5-10%
-        - 样本/特征比>100:1
-        - 防止过拟合
-    
-    Example:
-        >>> features = self._select_features_intelligent(X, y, '15m')
-        >>> print(len(features))  # 150
-    """
-    # ... 实现
+**Load on Startup**:
+- Load counter from Redis
+- Continue from previous state
 
-# ❌ 差的注释
-def select(X, y, t):
-    """选择特征"""  # 太简短
-    # ... 实现
-```
+**Save After Each Signal**:
+- Increment counter immediately
+- Persist to Redis
 
-#### 7.2 修复文档规范
-
-**每次修复Bug必须文档化**：
-
-```markdown
-# Bug修复报告模板
-
-## 问题描述
-- 错误信息: XXX
-- 影响范围: XXX
-- 严重性: CRITICAL/HIGH/MEDIUM/LOW
-
-## 根本原因
-- 为什么会出现这个错误？
-- 什么时候引入的？
-- 为什么之前没发现？
-
-## 修复方案
-- 修改了哪些文件？
-- 修改了哪些代码？
-- 为什么这样修复？
-
-## 验证方法
-- 如何验证修复成功？
-- 测试用例？
-- 性能影响？
-
-## 预防措施
-- 如何避免类似错误？
-- 需要添加什么检测机制？
-- 需要更新什么文档？
-```
+**Never Reset During Training**:
+- Regular training should NOT trigger initial predictions
+- Warmup state persists across training cycles
 
 ---
 
-### 8. 禁止的操作
+### Trading Mode Synchronization
 
-**严格禁止以下操作**：
+**Sync to Redis on Startup**:
+- Ensure consistency across modules
 
-```python
-# ❌ 禁止1: 修改后不测试
-# 修改代码 → 直接提交 ❌
-# ✅ 正确: 修改代码 → 测试 → 提交
-
-# ❌ 禁止2: 跳过代码审查
-git push origin main  # ❌ 直接推送到主分支
-
-# ❌ 禁止3: 删除测试
-# 为了让代码通过而删除测试 ❌
-
-# ❌ 禁止4: 忽略警告
-# pylint: disable=all  # ❌ 禁用所有警告
-
-# ❌ 禁止5: 临时修复不记录
-# 临时解决问题，不记录不文档化 ❌
-
-# ❌ 禁止6: 复制粘贴不重构
-# 复制相同代码到多个地方 ❌
-
-# ❌ 禁止7: 修改后不更新文档
-# 修改代码但不更新注释和文档 ❌
-
-# ❌ 禁止8: 使用全局变量
-global_data = []  # ❌ 避免使用全局可变变量
-
-# ❌ 禁止9: 捕获所有异常
-try:
-    risky_operation()
-except:  # ❌ 不指定异常类型
-    pass  # ❌ 忽略异常
-
-# ❌ 禁止10: 硬编码配置
-API_KEY = "abc123"  # ❌ 应该用环境变量
-```
+**Sync on Mode Switch**:
+- Immediate sync to Redis
+- Other modules dynamically read from Redis
 
 ---
 
-### 9. 专业工程师检查清单
+## 🐛 Common Error Patterns & Fixes
 
-**每天开发结束前检查**：
+### Error 1: datetime Serialization
 
-```markdown
-## 今日代码质量检查
-
-### 代码质量 ✅
-- [ ] 无重复定义
-- [ ] 无未定义变量
-- [ ] 类型提示完整
-- [ ] 错误处理完善
-- [ ] 日志记录充分
-- [ ] 注释清晰准确
-
-### 测试覆盖 ✅
-- [ ] 单元测试通过
-- [ ] 集成测试通过
-- [ ] 性能测试通过
-- [ ] 边界条件测试
-
-### 文档更新 ✅
-- [ ] 代码注释更新
-- [ ] API文档更新
-- [ ] README更新
-- [ ] 修复文档记录
-
-### 性能优化 ✅
-- [ ] 无性能退化
-- [ ] 无内存泄漏
-- [ ] 响应时间达标
-- [ ] 资源使用合理
-
-### 安全检查 ✅
-- [ ] 无密钥泄露
-- [ ] 输入验证完整
-- [ ] 错误信息安全
-- [ ] 日志脱敏处理
-```
+**Problem**: datetime not JSON serializable  
+**Solution**: Convert to ISO string before saving
 
 ---
 
-### 10. 持续改进
+### Error 2: Missing CacheManager Methods
 
-#### 10.1 定期审查
-
-```markdown
-## 每周代码审查（周五下午）
-
-1. 代码质量回顾
-   - 本周发现的Bug
-   - 低级错误统计
-   - 代码复杂度分析
-
-2. 性能指标回顾
-   - 准确率趋势
-   - 系统延迟
-   - 资源使用
-
-3. 改进措施
-   - 需要添加的检测
-   - 需要优化的代码
-   - 需要更新的文档
-
-4. 下周计划
-   - 重点优化项
-   - 技术债务清理
-   - 新功能开发
-```
-
-#### 10.2 知识积累
-
-```markdown
-## 问题记录与总结
-
-### Bug记录
-- 日期: 2025-10-17
-- 问题: 重复特征定义
-- 原因: 未检查现有特征
-- 修复: 删除重复 + 添加检测
-- 预防: 添加自动检测机制
-
-### 经验总结
-- 教训: 不要盲目添加特征
-- 改进: 先检查后添加
-- 工具: 使用自动检测
-- 文档: 更新规则文件
-```
+**Problem**: Missing generic get/set methods  
+**Solution**: Implement universal get/set with auto serialization
 
 ---
 
-## 📚 参考文档
+### Error 3: None Value Caching
 
-- **优化路线图**：`OPTIMIZATION_ROADMAP.md`（完整优化计划）
-- **后端规则**：`.cursor/rules/backend.mdc`
-- **前端规则**：`.cursor/rules/frontend.mdc`
-- **部署文档**：`DEPLOYMENT.md`
-- **项目总结**：`PROJECT_SUMMARY.md`
-- **Bug修复记录**：`docs/CRITICAL_*.md`
+**Problem**: Redis doesn't accept None  
+**Solution**: Check and skip if value is None
 
 ---
 
-**版本**: v7.0  
-**更新日期**: 2025-10-17  
-**更新内容**: 
-- 🆕 **添加专业量化工程师代码规范章节**
-- 严格定义零容忍错误清单
-- 完善特征工程专业规范
-- 添加错误预防措施
-- 建立代码审查清单
-- 制定单元测试规范
-- 规范代码提交流程
-- 定义性能优化标准
-- 完善文档规范
-- 明确禁止操作清单
-- 建立持续改进机制
-**适用范围**: 全项目（前端+后端）
+### Error 4: Virtual Mode Balance Query
+
+**Problem**: Querying live balance in SIGNAL_ONLY mode  
+**Solution**: Select balance source based on mode
+
+---
+
+### Error 5: WebSocket Error No Reconnect
+
+**Problem**: Only reconnect on close, not on error  
+**Solution**: Trigger reconnect on error as well
+
+---
+
+### Error 6: Code Duplication
+
+**Problem**: Same logic in multiple files  
+**Solution**: Centralize in one location, use dependency injection
+
+---
+
+## 📊 Configuration Management Best Practices
+
+### Single Source of Truth Principle
+
+- Use one field to control behavior
+- Avoid redundant fields
+- Derivable values should not be stored separately
+
+---
+
+### Configuration Read Order
+
+1. `config.py` (defaults)
+2. `.env` file (overrides)
+3. Redis runtime state (dynamic switching)
+4. API calls (immediate effect)
+
+---
+
+### Differentiated Configuration
+
+**Critical**: Different timeframes need different configurations based on characteristics:
+- Label thresholds differ by timeframe
+- Training days differ by data needs
+- Model complexity differs by sample size
+
+**Prohibited**: Using same configuration for all timeframes
+
+---
+
+## 🔧 Constant Naming Convention
+
+**Module-level constants**: UPPERCASE  
+**Examples**: VIRTUAL_ACCOUNT_BALANCE, WARMUP_SIGNALS, MIN_SIGNAL_INTERVAL
+
+**Prohibited**: Magic numbers without constants
+
+---
+
+## 🔄 Async Programming Best Practices
+
+### Correct Async Usage
+
+**I/O Operations**: Must be async  
+**CPU-Intensive**: Can be sync (e.g., model training)
+
+**Prohibited**: Sync I/O blocking event loop
+
+---
+
+### Cross-Thread Calls
+
+**From WebSocket callback (thread) to main event loop**:
+- Use `asyncio.run_coroutine_threadsafe()`
+- Pass main event loop reference
+- Save future to prevent GC
+
+---
+
+## 🚀 System Optimization Standards
+
+### 1. Performance Optimization Principles
+
+**Key Metrics**:
+- Model accuracy: Target ≥50% (basic), ≥55% (good), ≥60% (excellent)
+- Actual signal accuracy: ≥50% minimum requirement
+- Prediction latency: <1 second target
+- System stability: 99.9% target
+
+**Performance Baselines** (3-class classification):
+- Random guess: 33.3%
+- Basic usable: 50% ← Minimum requirement
+- Good: 55%
+- Excellent: 60%+
+
+---
+
+### 2. Optimization Priority
+
+**P0 - Immediate** ⭐⭐⭐:
+- Label threshold configuration fix
+- Confidence threshold adjustment
+- Sample weighting training
+- Time-series cross-validation
+- Enhanced meta-features
+
+**P1 - Short-term** ⭐⭐ (1-2 weeks):
+- Market microstructure features
+- Advanced technical indicators
+- Signal enhancement filtering
+- Drawdown protection mechanism
+
+**P2 - Medium-term** ⭐ (1-2 months):
+- Multi-timeframe feature fusion
+- Dynamic label thresholds
+- Hyperparameter auto-optimization
+- Feature caching mechanism
+
+**P3 - Long-term Exploration**:
+- Multi-target labels
+- Reinforcement learning
+- A/B testing framework
+- Incremental feature calculation
+
+---
+
+### 3. Feature Engineering Standards
+
+**Prohibited**:
+- Adding future functions (using future data)
+- Overfitting (features > samples/10)
+- Duplicate features (correlation >0.95)
+- Ignoring outlier handling
+
+**Best Practices**:
+- Feature standardization/normalization
+- Remove high missing-rate features (>20%)
+- Feature importance analysis (keep top features)
+- Cross-validation to prevent overfitting
+- Incremental calculation for efficiency
+
+---
+
+### 4. Model Training Standards
+
+**Differentiated Configuration** (must follow):
+- Label thresholds: 15m (±0.1%), 2h (±0.35%), 4h (±0.5%)
+- Training days: 15m (180d), 2h (270d), 4h (360d)
+- Model complexity: 15m (high), 2h (medium), 4h (low)
+
+**Sample Weighting Strategy**:
+1. Class weights (solve imbalance)
+2. Time decay weights (emphasize recent data)
+3. HOLD penalty (reduce HOLD bias)
+4. Combined weights application
+
+---
+
+### 5. Risk Management Standards
+
+**Dynamic Position Sizing** (when enabled):
+- Base ratio: 10% × confidence
+- Volatility adjustment: 0.5-1.5x
+- Exposure adjustment: 0.5-1.0x
+- Loss protection: 0.5-1.0x
+- Final limit: 2%-15%
+
+**Full Position Mode** (default):
+- Position value = Available balance × Leverage
+- Suitable for medium-frequency with high confidence
+
+**Drawdown Protection** (enforced):
+- >15%: Suspend trading
+- >10%: Reduce position to 50%
+- >5%: Reduce position to 75%
+- <3%: Resume normal trading
+
+---
+
+### 6. System Performance Standards
+
+**Response Time Requirements**:
+- Feature calculation: <500ms
+- Model prediction: <200ms
+- Signal generation: <1000ms
+- Order execution: <2000ms
+
+**Optimization Strategies**:
+- Feature caching (last 100)
+- Incremental calculation (only new candles)
+- GPU acceleration (if available)
+- Async concurrency (I/O operations)
+
+---
+
+### 7. Monitoring Metrics
+
+**Must Monitor**:
+- Model accuracy (after each training)
+- Actual signal accuracy (real-time)
+- Win rate (7d/30d)
+- Risk-reward ratio (7d/30d)
+- Max drawdown (real-time)
+- Sharpe ratio (30d)
+- Signal count (daily average)
+- System latency (p99)
+
+**Alert Thresholds**:
+- Win rate <45%: Send alert
+- Drawdown >10%: Emergency alert
+- Accuracy <40%: Model needs retraining
+- Latency p99 >3s: Performance alert
+
+---
+
+## 🎓 Professional Engineer Code Standards
+
+**Zero Tolerance Errors**:
+- Duplicate definitions
+- Undefined variable usage
+- Logic errors (inverted conditions)
+- Hardcoded values
+- Missing error handling
+- Future functions
+- Timezone errors
+- Type errors
+
+---
+
+### Code Quality Checklist
+
+**Before Each Commit**:
+- [ ] No duplicate definitions (features, variables, functions)
+- [ ] No undefined variable usage
+- [ ] All variables defined before use
+- [ ] Complete type hints
+- [ ] Comprehensive error handling
+- [ ] Sufficient logging
+- [ ] Clear and accurate comments
+- [ ] No hardcoded constants
+- [ ] No magic numbers
+- [ ] Pass syntax check
+- [ ] Pass unit tests
+- [ ] Code format compliant
+
+---
+
+### Feature Engineering Professional Standards
+
+**Strict Rules**:
+1. Feature name uniqueness check (mandatory)
+2. Check existence before adding feature
+3. Use comments to mark feature source (avoid duplication)
+4. Group features by category
+
+**Feature Naming**:
+- Clear and semantic
+- Include parameters if applicable
+- Express intent clearly
+
+**Feature Validation** (must validate):
+1. Check duplicate features
+2. Check NaN ratio (<20%)
+3. Check numerical range (no infinity)
+4. Check feature count vs sample ratio (>50:1)
+
+---
+
+### Machine Learning Professional Standards
+
+**Training Flow** (strict order):
+1. Data acquisition (API, auto-batch if >1500 records)
+2. Feature engineering
+3. Label creation (must pass timeframe parameter)
+4. Feature preparation (must pass timeframe parameter)
+5. Scaling (must pass timeframe parameter)
+6. Time-series split (NOT random)
+7. Model training
+8. Save to dictionary
+
+**Data Acquisition & Sorting** (triple guarantee):
+1. Reverse batch order (new→old to old→new)
+2. Convert and deduplicate
+3. Explicit sorting (100% ensure old→new)
+4. Set index
+
+---
+
+### Data Validation Standards
+
+**Mandatory Checks**:
+1. Basic check (not empty)
+2. Required columns check
+3. Data type check
+4. Data range check (high≥low, high≥close, etc.)
+5. Time ordering check (monotonic increasing)
+6. Duplicate data check (by timestamp)
+
+---
+
+### Label Creation Standards
+
+**Strict Requirements**:
+- Only look at next candle
+- Use differentiated threshold configuration
+- Three-class labels: SHORT (0), HOLD (1), LONG (2)
+- Validate label distribution (20-50% per class)
+
+---
+
+## 📚 Testing Requirements
+
+### Model Training Tests
+- Data fetch success
+- Data sorting correct (old→new)
+- Label distribution balanced (30-35% each class)
+- Accuracy meets target
+- Model files saved
+
+### Signal Generation Tests
+- Initial prediction on startup
+- Independent prediction per timeframe
+- Only 15m triggers synthesis
+- Weighted synthesis correct
+- Confidence filtering works
+- Signal deduplication works
+
+### Warmup Signal Tests
+- First 5 signals record-only
+- 6th signal trades normally
+- Clear log marking of warmup/official status
+
+### WebSocket Tests
+- Subscription format correct (lowercase)
+- Real-time data reception
+- Completed candles processed correctly
+- Buffer updates normally
+
+### Data Integrity Tests
+- Batch fetch data sorted correctly
+- Deduplication works
+- PostgreSQL write is idempotent
+
+---
+
+## 🚀 Phase 1 Optimization Implementation Standards
+
+### Intelligent Feature Selection (mandatory)
+
+**Two-Stage Selection**:
+- Stage 1: Filter low-importance features (fast)
+- Stage 2: Embedded selection (precise)
+
+**Dynamic Budget Calculation**:
+- Adaptive to sample count
+- Prevent overfitting
+- Differentiated by timeframe
+
+**Sample/Feature Ratio**:
+- >100:1 ideal
+- >50:1 acceptable
+- <50:1 overfitting risk
+
+---
+
+### Sample Weighting Training (must enable)
+
+**Purpose**: Solve class imbalance, emphasize recent data
+
+**Weighting Strategy**:
+1. Class weights (balance classes)
+2. Time decay weights (recent data more important)
+3. HOLD penalty (reduce HOLD bias)
+4. Combined application
+
+---
+
+### Market Microstructure Features (enhanced)
+
+**Feature Categories** (30+ new features):
+1. Price position
+2. Candlestick patterns
+3. Candlestick strength
+4. Trend continuation
+5. Price dynamics
+6. Volatility range
+
+**Prohibited**:
+- Using future data
+- Adding high missing-rate features (>20%)
+- Duplicate existing features
+
+---
+
+### Market Sentiment Features (added)
+
+**New Features** (15+):
+1. Fear index
+2. Trend fatigue
+3. RSI sentiment
+4. Price-volume relationship
+5. Composite sentiment
+
+---
+
+### Dynamic Stop-Loss/Take-Profit (enforced)
+
+**Data Source**: Binance API (must fetch in real-time)
+
+**Calculation**:
+1. Fetch 50 candles to calculate ATR
+2. Stop-loss: ±1.5 × ATR
+3. Take-profit: Based on confidence (3.0-4.0 × ATR)
+4. Trailing stop: 1.0 × ATR
+
+**Fallback**: Fixed percentage stop-loss (±1.5%/±3-4%)
+
+---
+
+## 🔍 Phase 1 Optimization Verification Checklist
+
+### Training Phase
+
+- [ ] Sample weighting log shows: "Sample weighting enabled"
+- [ ] Label distribution meets expectations (HOLD 28-45%)
+- [ ] Microstructure features calculated successfully (30+ features)
+- [ ] Sentiment features calculated successfully (15+ features)
+- [ ] Model accuracy ≥48%
+
+### Signal Generation Phase
+
+- [ ] Dynamic position log shows all adjustment factors
+- [ ] ATR stop-loss calculation log complete
+- [ ] Risk-reward ratio ≥1.8:1
+- [ ] Signal count increases
+
+### Performance Validation
+
+- [ ] Actual signal accuracy ≥50% (observe 20+ signals)
+- [ ] No over-trading (daily average <10 signals)
+- [ ] Virtual trading profitable (after fees)
+
+---
+
+## 📚 Reference Documentation
+
+- **Optimization Roadmap**: `OPTIMIZATION_ROADMAP.md`
+- **Backend Rules**: `.cursor/rules/backend.mdc`
+- **Frontend Rules**: `.cursor/rules/frontend.mdc`
+- **Deployment**: `DEPLOYMENT.md`
+- **Project Summary**: `PROJECT_SUMMARY.md`
+- **Bug Fix Records**: `docs/CRITICAL_*.md`
+
+---
+
+## 🎯 Latest Optimizations (2025-10-21)
+
+### Time-Series Cross-Validation
+
+**Implementation**: 5-fold TimeSeriesSplit  
+**Purpose**: More reliable accuracy evaluation  
+**Expected**: +1-2% accuracy improvement
+
+---
+
+### Enhanced Meta-Features
+
+**Expansion**: 9 → 20 meta-features
+
+**New Features**:
+1. Model agreement (consistency)
+2. Max probability per model (confidence)
+3. Probability entropy (uncertainty)
+4. Average probability (ensemble baseline)
+5. Probability std (model disagreement)
+
+**Expected**: +3-5% accuracy improvement
+
+---
+
+### Dynamic HOLD Penalty
+
+**Adaptive Strategy**:
+- HOLD >40%: penalty 0.5 (heavy)
+- HOLD >35%: penalty 0.6 (medium)
+- HOLD ≤35%: penalty 0.7 (light)
+
+**Purpose**: Auto-adjust based on data distribution
+
+---
+
+### Virtual Position Real-time Monitoring
+
+**Implementation**:
+- WebSocket ticker push → Real-time check
+- Memory cache (zero DB queries)
+- Immediate close on trigger
+
+**Performance**: Database queries from 10/sec → 0/sec
+
+---
+
+### Position Calculation Simplification
+
+**Changes**:
+- Virtual account: 10000U → 100U
+- Position unit: Quantity → USDT value
+- Full position: 100U × 20x = 2000 USDT
+
+---
+
+## 🚨 Critical Rules Summary
+
+1. **No Redundancy**: One function, one implementation
+2. **High Cohesion, Low Coupling**: Modules independent, interfaces clear
+3. **Safety First**: Warmup protection, fund safety
+4. **No Future Functions**: Only use past and current data
+5. **Time-Series Split**: Never use random split
+6. **Differentiated Config**: Different settings per timeframe
+7. **Single Responsibility**: Each service does one thing
+8. **Error Handling**: All critical operations must have try-except
+9. **Strict Validation**: Verify array dimensions at each step
+10. **Professional Standards**: Zero tolerance for low-level errors
+
+---
+
+**Version**: v8.0  
+**Last Update**: 2025-10-21  
+**Update Content**:
+- Added time-series cross-validation (5-fold)
+- Enhanced meta-features (9→20)
+- Dynamic HOLD penalty
+- Virtual position real-time monitoring
+- Position calculation simplification
+- Strict array dimension validation
+- Professional code quality standards
+
+**Scope**: Full project (frontend + backend)

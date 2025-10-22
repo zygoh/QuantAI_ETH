@@ -91,7 +91,7 @@ async def lifespan(app: FastAPI):
         # 初始化服务
         data_service = DataService()
         ml_service = ensemble_ml_service  # 🆕 使用Stacking集成ML服务
-        trading_engine = TradingEngine()
+        trading_engine = TradingEngine(data_service=data_service)  # 🔑 传入data_service
         risk_service = RiskService(data_service)
         signal_generator = SignalGenerator(ml_service, data_service)
         trading_controller = TradingController(

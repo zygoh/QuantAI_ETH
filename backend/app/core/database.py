@@ -695,6 +695,39 @@ class PostgreSQLManager:
             logger.error(f"获取虚拟仓位失败: {e}")
             return []
     
+    async def get_virtual_position_by_id(self, position_id: int) -> Dict[str, Any]:
+        """根据ID获取虚拟仓位信息"""
+        try:
+            async with self.SessionLocal() as session:
+                query = text("""
+                    SELECT id, symbol, side, entry_price, quantity, entry_time,
+                           stop_loss, take_profit, signal_id, status
+                    FROM virtual_positions
+                    WHERE id = :position_id
+                """)
+                result = await session.execute(query, {'position_id': position_id})
+                row = result.fetchone()
+                
+                if row:
+                    return {
+                        'id': row[0],
+                        'symbol': row[1],
+                        'side': row[2],
+                        'entry_price': float(row[3]),
+                        'quantity': float(row[4]),
+                        'entry_time': row[5],
+                        'stop_loss': float(row[6]) if row[6] else 0,
+                        'take_profit': float(row[7]) if row[7] else 0,
+                        'signal_id': row[8],
+                        'status': row[9]
+                    }
+                
+                return None
+            
+        except Exception as e:
+            logger.error(f"获取虚拟仓位失败: {e}")
+            return None
+    
     async def close(self):
         """关闭连接"""
         if self.engine:

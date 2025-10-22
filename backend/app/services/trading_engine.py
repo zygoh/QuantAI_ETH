@@ -85,8 +85,11 @@ class Position:
 class TradingEngine:
     """交易执行引擎"""
     
-    def __init__(self):
+    def __init__(self, data_service=None):
         self.is_running = False
+        
+        # 🔑 保存 data_service 引用（用于注册价格回调）
+        self.data_service = data_service
         
         # 从配置文件读取默认交易模式
         default_mode = settings.TRADING_MODE
@@ -95,6 +98,9 @@ class TradingEngine:
         self.orders: Dict[str, Order] = {}
         self.positions: Dict[str, Position] = {}
         self.order_monitor_task = None
+        
+        # 🆕 虚拟仓位缓存（内存）
+        self.virtual_positions_cache: Dict[str, List[Dict[str, Any]]] = {}
         
         # 风险控制参数
         self.max_position_size = 1000  # 最大持仓数量
@@ -115,6 +121,16 @@ class TradingEngine:
             
             # 启动订单监控任务
             self.order_monitor_task = asyncio.create_task(self._monitor_orders())
+            
+            # 🆕 加载虚拟仓位到缓存
+            await self._load_virtual_positions_cache()
+            
+            # 🆕 注册价格更新回调（用于虚拟仓位止损止盈监控）
+            if self.data_service:
+                self.data_service.add_price_callback(self._on_price_update)
+                logger.info("✅ 已注册虚拟仓位止损止盈监控（使用内存缓存，零数据库查询）")
+            else:
+                logger.warning("⚠️ data_service未传入，虚拟仓位止损止盈监控未启用")
             
             self.is_running = True
             logger.info(f"交易执行引擎启动完成 (模式: {self.trading_mode.value})")
@@ -499,24 +515,26 @@ class TradingEngine:
         try:
             symbol = signal.symbol
             
-            # 先平掉现有虚拟仓位
-            existing_positions = await postgresql_manager.get_open_virtual_positions(symbol)
+            # 🔑 先平掉现有虚拟仓位（使用缓存，避免查询数据库）
+            existing_positions = self.virtual_positions_cache.get(symbol, [])
             if existing_positions:
                 logger.info(f"检测到现有虚拟仓位，先平仓...")
                 for pos in existing_positions:
                     await postgresql_manager.close_virtual_position(pos['id'], current_price)
                     
-                    # 计算价差盈亏
+                    # 🔑 计算价差盈亏（quantity现在是USDT价值，需要转换成币的数量）
+                    coin_amount = pos['quantity'] / pos['entry_price']  # 币的数量
                     if pos['side'] == 'LONG':
-                        price_pnl = (current_price - pos['entry_price']) * pos['quantity']
+                        price_pnl = (current_price - pos['entry_price']) * coin_amount
                     else:  # SHORT
-                        price_pnl = (pos['entry_price'] - current_price) * pos['quantity']
+                        price_pnl = (pos['entry_price'] - current_price) * coin_amount
                     
-                    # 计算手续费
-                    close_position_value = pos['quantity'] * current_price
-                    close_commission = close_position_value * VIRTUAL_CLOSE_FEE_RATE
-                    open_position_value = pos['quantity'] * pos['entry_price']
+                    # 🔑 计算手续费（quantity已经是USDT价值）
+                    open_position_value = pos['quantity']  # 开仓时的USDT价值
                     open_commission = open_position_value * VIRTUAL_OPEN_FEE_RATE
+                    
+                    close_position_value = coin_amount * current_price  # 平仓时的USDT价值
+                    close_commission = close_position_value * VIRTUAL_CLOSE_FEE_RATE
                     
                     # 净盈亏
                     net_pnl = price_pnl - open_commission - close_commission
@@ -543,11 +561,12 @@ class TradingEngine:
                     await postgresql_manager.write_order_data(close_order)
             
             # 创建新的虚拟仓位
+            # 🔑 position_size 现在直接是USDT价值
             position_data = {
                 'symbol': symbol,
                 'side': signal.signal_type,  # LONG or SHORT
                 'entry_price': current_price,
-                'quantity': signal.position_size,
+                'quantity': signal.position_size,  # USDT价值
                 'entry_time': int(datetime.now().timestamp() * 1000),  # ✅ 毫秒时间戳
                 'stop_loss': signal.stop_loss,
                 'take_profit': signal.take_profit,
@@ -556,8 +575,8 @@ class TradingEngine:
             
             position_id = await postgresql_manager.create_virtual_position(position_data)
             
-            # 计算开仓手续费（0.02%）
-            position_value = signal.position_size * current_price
+            # 🔑 计算开仓手续费（0.02%），position_size已经是USDT价值
+            position_value = signal.position_size
             open_commission = position_value * VIRTUAL_OPEN_FEE_RATE
             
             # 创建虚拟开仓订单
@@ -579,9 +598,12 @@ class TradingEngine:
             
             await postgresql_manager.write_order_data(order_data)
             
-            logger.info(f"✅ 虚拟开仓: {symbol} {signal.signal_type} {signal.position_size}张 @{current_price}")
-            logger.info(f"   止损: {signal.stop_loss} | 止盈: {signal.take_profit}")
+            logger.info(f"✅ 虚拟开仓: {symbol} {signal.signal_type} {signal.position_size:.2f} USDT @{current_price:.2f}")
+            logger.info(f"   止损: {signal.stop_loss:.2f} | 止盈: {signal.take_profit:.2f}")
             logger.info(f"   开仓手续费: ${open_commission:.4f} (0.02%)")
+            
+            # 🔑 刷新虚拟仓位缓存
+            await self._refresh_virtual_positions_cache(symbol)
             
             return {
                 'success': True,
@@ -617,19 +639,19 @@ class TradingEngine:
                 # 平仓
                 await postgresql_manager.close_virtual_position(pos['id'], current_price)
                 
-                # 计算价差盈亏
+                # 🔑 计算价差盈亏（quantity现在是USDT价值，需要转换成币的数量）
+                coin_amount = pos['quantity'] / pos['entry_price']  # 币的数量
                 if pos['side'] == 'LONG':
-                    price_pnl = (current_price - pos['entry_price']) * pos['quantity']
+                    price_pnl = (current_price - pos['entry_price']) * coin_amount
                 else:  # SHORT
-                    price_pnl = (pos['entry_price'] - current_price) * pos['quantity']
+                    price_pnl = (pos['entry_price'] - current_price) * coin_amount
                 
-                # 计算平仓手续费（0.05%）
-                close_position_value = pos['quantity'] * current_price
-                close_commission = close_position_value * VIRTUAL_CLOSE_FEE_RATE
-                
-                # 计算开仓手续费（0.02%，从历史订单获取或重新计算）
-                open_position_value = pos['quantity'] * pos['entry_price']
+                # 🔑 计算手续费（quantity已经是USDT价值）
+                open_position_value = pos['quantity']  # 开仓时的USDT价值
                 open_commission = open_position_value * VIRTUAL_OPEN_FEE_RATE
+                
+                close_position_value = coin_amount * current_price  # 平仓时的USDT价值
+                close_commission = close_position_value * VIRTUAL_CLOSE_FEE_RATE
                 
                 # 净盈亏 = 价差盈亏 - 开仓手续费 - 平仓手续费
                 net_pnl = price_pnl - open_commission - close_commission
@@ -662,6 +684,9 @@ class TradingEngine:
             logger.info(f"✅ 虚拟平仓: {symbol} 平仓{closed_count}个仓位 @{current_price}")
             logger.info(f"   净盈亏: ${total_pnl:+.2f} (已扣除开仓0.02%+平仓0.05%手续费)")
             
+            # 🔑 刷新虚拟仓位缓存
+            await self._refresh_virtual_positions_cache(symbol)
+            
             return {
                 'success': True,
                 'message': f'虚拟平仓成功',
@@ -674,6 +699,88 @@ class TradingEngine:
             return {
                 'success': False,
                 'message': f"平虚拟仓位失败: {str(e)}"
+            }
+    
+    async def _close_virtual_position_by_trigger(
+        self,
+        pos_id: int,
+        current_price: float,
+        reason: str
+    ):
+        """
+        因止损止盈触发而平仓（WebSocket实时监控触发）
+        
+        Args:
+            pos_id: 仓位ID
+            current_price: 当前价格
+            reason: 平仓原因
+        """
+        try:
+            # 获取仓位信息
+            pos = await postgresql_manager.get_virtual_position_by_id(pos_id)
+            if not pos or pos['status'] != 'OPEN':
+                return
+            
+            symbol = pos['symbol']
+            
+            # 平仓
+            await postgresql_manager.close_virtual_position(pos_id, current_price)
+            
+            # 🔑 计算盈亏（quantity是USDT价值）
+            coin_amount = pos['quantity'] / pos['entry_price']  # 币的数量
+            
+            if pos['side'] == 'LONG':
+                price_pnl = (current_price - pos['entry_price']) * coin_amount
+            else:  # SHORT
+                price_pnl = (pos['entry_price'] - current_price) * coin_amount
+            
+            # 手续费
+            open_commission = pos['quantity'] * VIRTUAL_OPEN_FEE_RATE  # 0.02%
+            close_commission = coin_amount * current_price * VIRTUAL_CLOSE_FEE_RATE  # 0.05%
+            
+            # 净盈亏
+            net_pnl = price_pnl - open_commission - close_commission
+            pnl_percent = (net_pnl / pos['quantity']) * 100
+            
+            # 记录平仓订单
+            order_data = {
+                'order_id': None,
+                'symbol': symbol,
+                'side': 'SELL' if pos['side'] == 'LONG' else 'BUY',
+                'type': 'MARKET',
+                'status': 'FILLED',
+                'quantity': pos['quantity'],
+                'price': current_price,
+                'filled_quantity': pos['quantity'],
+                'commission': close_commission,
+                'timestamp': int(datetime.now().timestamp() * 1000),
+                'is_virtual': True,
+                'signal_id': pos.get('signal_id', ''),
+                'entry_price': pos['entry_price'],
+                'exit_price': current_price,
+                'pnl': net_pnl,
+                'pnl_percent': pnl_percent
+            }
+            
+            await postgresql_manager.write_order_data(order_data)
+            
+            logger.info(f"✅ 虚拟平仓: {symbol} {pos['side']} {pos['quantity']:.2f} USDT @{current_price:.2f}")
+            logger.info(f"   {reason}")
+            logger.info(f"   净盈亏: ${net_pnl:+.2f} ({pnl_percent:+.2f}%)")
+            
+            # 🔑 缓存刷新由调用方统一处理（避免多次刷新）
+            
+            return {
+                'success': True,
+                'reason': reason,
+                'pnl': net_pnl
+            }
+            
+        except Exception as e:
+            logger.error(f"止损止盈触发平仓失败: {e}")
+            return {
+                'success': False,
+                'message': str(e)
             }
     
     async def _check_trading_risks(self, signal: TradingSignal) -> Dict[str, Any]:
@@ -806,6 +913,89 @@ class TradingEngine:
                     
         except asyncio.CancelledError:
             logger.info("订单监控任务已取消")
+    
+    async def _on_price_update(self, symbol: str, price: float):
+        """
+        处理价格更新（WebSocket实时推送）
+        用于检查虚拟仓位的止损止盈
+        
+        🔑 性能优化：使用内存缓存，避免频繁查询数据库
+        """
+        try:
+            # 只在虚拟交易模式下检查
+            if self.trading_mode != TradingMode.SIGNAL_ONLY:
+                return
+            
+            # 🔑 从内存缓存获取虚拟仓位（零数据库查询！）
+            positions = self.virtual_positions_cache.get(symbol, [])
+            if not positions:
+                return
+            
+            # 记录触发平仓的仓位ID
+            closed_position_ids = []
+            
+            # 检查每个仓位的止损止盈
+            for pos in positions:
+                should_close = False
+                reason = ""
+                
+                # 检查止损
+                if pos['side'] == 'LONG' and price <= pos['stop_loss']:
+                    should_close = True
+                    reason = f"止损触发 ({price:.2f} <= {pos['stop_loss']:.2f})"
+                elif pos['side'] == 'SHORT' and price >= pos['stop_loss']:
+                    should_close = True
+                    reason = f"止损触发 ({price:.2f} >= {pos['stop_loss']:.2f})"
+                
+                # 检查止盈
+                if not should_close:
+                    if pos['side'] == 'LONG' and price >= pos['take_profit']:
+                        should_close = True
+                        reason = f"止盈触发 ({price:.2f} >= {pos['take_profit']:.2f})"
+                    elif pos['side'] == 'SHORT' and price <= pos['take_profit']:
+                        should_close = True
+                        reason = f"止盈触发 ({price:.2f} <= {pos['take_profit']:.2f})"
+                
+                # 触发平仓
+                if should_close:
+                    logger.info(f"🎯 {symbol} {pos['side']} {reason}")
+                    await self._close_virtual_position_by_trigger(
+                        pos_id=pos['id'],
+                        current_price=price,
+                        reason=reason
+                    )
+                    closed_position_ids.append(pos['id'])
+            
+            # 🔑 如果有仓位被平掉，统一刷新缓存（避免循环中多次刷新）
+            if closed_position_ids:
+                await self._refresh_virtual_positions_cache(symbol)
+                logger.debug(f"🔄 已平仓{len(closed_position_ids)}个仓位，缓存已刷新")
+            
+        except Exception as e:
+            logger.error(f"处理价格更新失败: {e}")
+    
+    async def _load_virtual_positions_cache(self):
+        """加载虚拟仓位到内存缓存"""
+        try:
+            # 获取所有开仓的虚拟仓位
+            positions = await postgresql_manager.get_open_virtual_positions(settings.SYMBOL)
+            self.virtual_positions_cache[settings.SYMBOL] = positions
+            
+            logger.info(f"✅ 虚拟仓位缓存已加载: {len(positions)}个仓位")
+            
+        except Exception as e:
+            logger.error(f"加载虚拟仓位缓存失败: {e}")
+            self.virtual_positions_cache[settings.SYMBOL] = []
+    
+    async def _refresh_virtual_positions_cache(self, symbol: str):
+        """刷新虚拟仓位缓存（开仓/平仓后调用）"""
+        try:
+            positions = await postgresql_manager.get_open_virtual_positions(symbol)
+            self.virtual_positions_cache[symbol] = positions
+            logger.debug(f"🔄 虚拟仓位缓存已刷新: {len(positions)}个仓位")
+            
+        except Exception as e:
+            logger.error(f"刷新虚拟仓位缓存失败: {e}")
     
     async def _update_order_status(self, order: Order):
         """更新订单状态"""

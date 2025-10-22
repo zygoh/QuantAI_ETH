@@ -255,7 +255,7 @@ class SignalGenerator:
             
             # 3. 🔥 只有15m信号更新时才触发合成（15m作为主时间框架）
             if timeframe != settings.TIMEFRAMES[0]:
-                logger.debug(f"⏭️ {timeframe} 信号已缓存，等待15m触发合成")
+                logger.info(f"⏭️ {timeframe} 信号已缓存，等待15m触发合成")
                 return
             
             logger.info(f"🔄 15m信号更新，触发合成 (当前已缓存: {list(self.cached_predictions.keys())})")
@@ -734,16 +734,19 @@ class SignalGenerator:
                 take_profit = stop_levels['take_profit']
                 logger.debug(f"✅ 使用动态止损: 盈亏比 1:{stop_levels.get('risk_reward_ratio', 0):.2f}")
             
-            # 🆕 统一使用 position_manager 计算仓位大小
+            # 🆕 统一使用 position_manager 计算仓位大小（USDT价值）
             # 从 Redis 读取当前交易模式（支持动态切换）
             from app.services.position_manager import position_manager
             current_mode = await cache_manager.get("system:trading_mode")
             is_virtual_mode = (current_mode != "AUTO")  # 默认虚拟模式，只有明确是 AUTO 才用实盘
             
+            # 🔑 获取仓位大小（直接使用USDT价值，不换算张数）
             position_size = await position_manager.calculate_position_size(
                 symbol, signal_type, confidence, current_price,
                 is_virtual=is_virtual_mode  # 动态根据 Redis 中的模式决定
             )
+            
+            logger.debug(f"💰 仓位大小: {position_size:.2f} USDT @ {current_price:.2f}")
             
             # 创建信号对象
             signal = TradingSignal(

@@ -24,7 +24,7 @@ from app.services.binance_client import binance_client
 logger = logging.getLogger(__name__)
 
 # 🎯 虚拟账户配置（用于 SIGNAL_ONLY 模式）
-VIRTUAL_ACCOUNT_BALANCE = 10000.0  # 虚拟账户初始余额（USDT）
+VIRTUAL_ACCOUNT_BALANCE = 100.0  # 虚拟账户初始余额（USDT）
 
 @dataclass
 class PositionInfo:
@@ -59,7 +59,7 @@ class PositionManager:
     def __init__(self):
         self.positions: Dict[str, PositionInfo] = {}
         self.leverage = settings.LEVERAGE
-        self.max_position_value = 10000  # 最大持仓价值（USDT）
+        self.max_position_value = 500000  # 最大持仓价值（USDT）- 全仓模式需要较大值
         self.min_position_value = 20  # ✅ U本位最小仓位价值（币安要求）
         
     async def initialize(self):
@@ -189,12 +189,15 @@ class PositionManager:
             if use_full_position:
                 # ✅ 全仓策略：使用全部可用余额
                 position_value = available_balance * self.leverage
+                original_value = position_value
                 
-                # 限制最大仓位价值
+                # 限制最大仓位价值（安全保护）
                 position_value = min(position_value, self.max_position_value)
                 
-                logger.info(f"💰 全仓仓位计算: {symbol} {position_value:.2f} USDT")
-                logger.info(f"  余额: {available_balance:.2f} USDT | 杠杆: {self.leverage}x | 策略: 全仓")
+                logger.info(f"💰 全仓仓位计算: {symbol}")
+                logger.info(f"  余额: {available_balance:.2f} USDT | 杠杆: {self.leverage}x")
+                logger.info(f"  仓位价值: {position_value:.2f} USDT" + 
+                           (f" (已限制，原始: {original_value:.2f})" if original_value > self.max_position_value else ""))
                 
             else:
                 # 动态仓位策略（可选）
