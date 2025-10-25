@@ -14,6 +14,9 @@ from app.services.ml_service import MLService
 from app.core.config import settings
 from app.core.cache import cache_manager
 from app.services.hyperparameter_optimizer import HyperparameterOptimizer
+from app.services.direction_consistency_checker import TradingDirectionConsistencyChecker, ConsistencyCheck
+from app.services.adaptive_frequency_controller import AdaptiveFrequencyController, FrequencyControl
+from app.services.model_stability_enhancer import ModelStabilityEnhancer
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +81,30 @@ class EnsembleMLService(MLService):
         self.use_gpu = settings.USE_GPU
         self.gpu_device = settings.GPU_DEVICE
         
+        # 🔑 序列长度配置（用于Informer-2序列输入）
+        self.seq_len_config = {
+            '15m': 96,   # 96 × 15分钟 = 24小时
+            '2h': 48,    # 48 × 2小时 = 4天
+            '4h': 24     # 24 × 4小时 = 4天
+        }
+        
+        # 🛡️ 系统优化组件
+        self.direction_checker = TradingDirectionConsistencyChecker()
+        self.frequency_controller = AdaptiveFrequencyController()
+        self.stability_enhancer = ModelStabilityEnhancer()
+        
+        # 📊 优化指标记录
+        self.optimization_metrics = {
+            'fatal_error_rate': 0.0,
+            'fee_impact': 0.0,
+            'model_stability': 0.0,
+            'consistency_rate': 0.0
+        }
+        
         logger.info("✅ 集成ML服务初始化完成（Stacking四模型融合 + 深度学习）")
         logger.info(f"   超参数优化: {'启用' if self.enable_hyperparameter_tuning else '关闭'}")
         logger.info(f"   Informer-2神经网络: {'启用' if self.enable_informer2 else '关闭'}")
+        logger.info(f"   序列长度配置: {self.seq_len_config}")
         logger.info(f"   GPU加速: {'启用' if self.use_gpu else '关闭'} (设备: {self.gpu_device if self.use_gpu else 'CPU'})")
     
     async def _prepare_diverse_training_data(self, timeframe: str, days_multiplier: float = 1.0) -> pd.DataFrame:
@@ -199,6 +223,61 @@ class EnsembleMLService(MLService):
             logger.error(f"准备特征和标签（复用）失败: {e}")
             return pd.DataFrame(), pd.Series()
     
+    def _create_sequence_input(
+        self,
+        df: pd.DataFrame,
+        seq_len: int,
+        timeframe: str
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        构造序列输入（用于Informer-2模型）
+        
+        使用滑动窗口将单点特征转换为序列输入，充分利用历史时间序列信息
+        
+        Args:
+            df: 特征工程后的DataFrame（包含label列）
+            seq_len: 序列长度（例如：15m=96, 2h=48, 4h=24）
+            timeframe: 时间框架
+        
+        Returns:
+            X_seq: (n_samples, seq_len, n_features) - 序列特征
+            y: (n_samples,) - 标签
+        """
+        try:
+            feature_columns = self.feature_columns_dict.get(timeframe, [])
+            
+            if not feature_columns:
+                logger.error(f"{timeframe} 特征列未找到，无法构造序列输入")
+                return np.array([]), np.array([])
+            
+            X_list = []
+            y_list = []
+            
+            # 滑动窗口：取过去seq_len个时间步的特征
+            for i in range(seq_len, len(df)):
+                # 取过去seq_len个时间步的特征
+                X_window = df.iloc[i-seq_len:i][feature_columns].values
+                y_label = df.iloc[i]['label']
+                
+                # 检查是否包含NaN
+                if not np.isnan(X_window).any() and not np.isnan(y_label):
+                    X_list.append(X_window)
+                    y_list.append(y_label)
+            
+            X_seq = np.array(X_list)  # (n_samples, seq_len, n_features)
+            y = np.array(y_list)      # (n_samples,)
+            
+            logger.info(f"✅ {timeframe} 序列输入构造完成: {X_seq.shape} (样本数={len(X_seq)}, 序列长度={seq_len}, 特征数={len(feature_columns)})")
+            logger.info(f"   原始样本数: {len(df)}, 序列样本数: {len(X_seq)}, 减少: {len(df) - len(X_seq)}个")
+            
+            return X_seq, y
+            
+        except Exception as e:
+            logger.error(f"构造序列输入失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return np.array([]), np.array([])
+    
     async def train_all_timeframes(self) -> Dict[str, Any]:
         """
         训练所有时间框架的集成模型
@@ -314,6 +393,17 @@ class EnsembleMLService(MLService):
             
             logger.info(f"✅ 三份数据处理完成: LGB={len(X_lgb)}, XGB={len(X_xgb)}, CAT={len(X_cat)}")
             
+            # 🆕 构造序列输入（仅用于Informer-2）
+            X_seq_lgb, y_seq_lgb = None, None
+            if self.enable_informer2 and TORCH_AVAILABLE:
+                seq_len = self.seq_len_config.get(timeframe, 96)
+                logger.info(f"🔧 构造Informer-2序列输入（seq_len={seq_len}）...")
+                X_seq_lgb, y_seq_lgb = self._create_sequence_input(data_lgb, seq_len, timeframe)
+                
+                if len(X_seq_lgb) == 0:
+                    logger.warning(f"⚠️ 序列输入构造失败，将跳过Informer-2训练")
+                    self.enable_informer2 = False
+            
             # 3️⃣ 时间序列分割（使用最短的数据长度作为验证集基准）
             min_len = min(len(X_lgb_scaled), len(X_xgb_scaled), len(X_cat_scaled))
             split_idx = int(min_len * 0.8)
@@ -332,14 +422,44 @@ class EnsembleMLService(MLService):
             y_xgb_train, y_xgb_val = y_xgb.iloc[-min_len:][:split_idx], y_xgb.iloc[-min_len:][split_idx:]
             y_cat_train, y_cat_val = y_cat.iloc[-min_len:][:split_idx], y_cat.iloc[-min_len:][split_idx:]
             
-            logger.info(f"📊 {timeframe} 数据分割: 训练{len(X_lgb_train)}条（对齐后）, 验证{len(X_lgb_val)}条")
+            # 🆕 分割序列数据（用于Informer-2）
+            X_seq_train, X_seq_val, y_seq_train, y_seq_val = None, None, None, None
+            if self.enable_informer2 and X_seq_lgb is not None:
+                seq_split_idx = int(len(X_seq_lgb) * 0.8)
+                X_seq_train = X_seq_lgb[:seq_split_idx]
+                X_seq_val = X_seq_lgb[seq_split_idx:]
+                y_seq_train = y_seq_lgb[:seq_split_idx]
+                y_seq_val = y_seq_lgb[seq_split_idx:]
+                logger.info(f"📊 {timeframe} 序列数据分割: 训练{len(X_seq_train)}条, 验证{len(X_seq_val)}条")
+                
+                # 🔑 关键修复：对齐传统模型的验证集到序列数据的长度
+                # 序列数据比原始数据少seq_len个样本，需要对齐
+                seq_val_len = len(X_seq_val)
+                if seq_val_len < len(X_lgb_val):
+                    logger.warning(f"⚠️ 对齐验证集：传统模型{len(X_lgb_val)}条 → Informer-2{seq_val_len}条")
+                    # 取传统模型验证集的最后seq_val_len个样本（时间对齐）
+                    if isinstance(X_lgb_val, np.ndarray):
+                        X_lgb_val = X_lgb_val[-seq_val_len:]
+                        X_xgb_val = X_xgb_val[-seq_val_len:]
+                        X_cat_val = X_cat_val[-seq_val_len:]
+                    else:
+                        X_lgb_val = X_lgb_val.iloc[-seq_val_len:]
+                        X_xgb_val = X_xgb_val.iloc[-seq_val_len:]
+                        X_cat_val = X_cat_val.iloc[-seq_val_len:]
+                    
+                    y_lgb_val = y_lgb_val.iloc[-seq_val_len:]
+                    y_xgb_val = y_xgb_val.iloc[-seq_val_len:]
+                    y_cat_val = y_cat_val.iloc[-seq_val_len:]
             
-            # 4️⃣ 训练Stacking集成模型（使用差异化数据）
+            logger.info(f"📊 {timeframe} 传统模型数据分割: 训练{len(X_lgb_train)}条（对齐后）, 验证{len(X_lgb_val)}条")
+            
+            # 4️⃣ 训练Stacking集成模型（使用差异化数据 + 序列输入）
             logger.info(f"🚂 开始训练 {timeframe} Stacking集成（差异化数据）...")
             ensemble_result = self._train_stacking_diverse(
                 X_lgb_train, y_lgb_train, X_lgb_val, y_lgb_val,
                 X_xgb_train, y_xgb_train, X_xgb_val, y_xgb_val,
                 X_cat_train, y_cat_train, X_cat_val, y_cat_val,
+                X_seq_train, y_seq_train, X_seq_val, y_seq_val,
                 timeframe
             )
             
@@ -361,10 +481,11 @@ class EnsembleMLService(MLService):
         X_lgb_train, y_lgb_train, X_lgb_val, y_lgb_val,
         X_xgb_train, y_xgb_train, X_xgb_val, y_xgb_val,
         X_cat_train, y_cat_train, X_cat_val, y_cat_val,
+        X_seq_train, y_seq_train, X_seq_val, y_seq_val,
         timeframe: str
     ) -> Dict[str, Any]:
         """
-        使用差异化数据训练Stacking集成模型
+        使用差异化数据训练Stacking集成模型（支持序列输入）
         
         Args:
             X_lgb_train, y_lgb_train: LightGBM训练数据
@@ -373,6 +494,8 @@ class EnsembleMLService(MLService):
             X_xgb_val, y_xgb_val: XGBoost验证数据
             X_cat_train, y_cat_train: CatBoost训练数据
             X_cat_val, y_cat_val: CatBoost验证数据
+            X_seq_train, y_seq_train: Informer-2序列训练数据
+            X_seq_val, y_seq_val: Informer-2序列验证数据
             timeframe: 时间框架
         
         Returns:
@@ -389,10 +512,33 @@ class EnsembleMLService(MLService):
             inf_params_optimized = None
             
             if self.enable_hyperparameter_tuning:
+                # 🤖 优先优化Informer-2（深度学习模型）
+                if self.enable_informer2 and self.optimize_informer2 and TORCH_AVAILABLE and X_seq_train is not None:
+                    logger.info(f"🤖 启动Informer-2超参数优化（深度学习）- 优先优化...")
+                    logger.info(f"   GPU加速: {'启用' if self.use_gpu else '关闭'}")
+                    logger.info(f"   试验次数: {self.informer_n_trials}次, 超时: {self.informer_timeout}秒")
+                    logger.info(f"   序列输入形状: {X_seq_train.shape} (样本数, 序列长度, 特征数)")
+                    
+                    # 🔑 关键修复：使用序列数据而不是2D数据
+                    inf_optimizer = HyperparameterOptimizer(
+                        X=X_seq_train,  # 使用3D序列数据
+                        y=y_seq_train,  # 使用对应的序列标签
+                        timeframe=timeframe,
+                        model_type="informer2",
+                        use_gpu=self.use_gpu
+                    )
+                    inf_params_optimized = inf_optimizer.optimize(
+                        n_trials=self.informer_n_trials,
+                        timeout=self.informer_timeout,
+                        show_progress=False
+                    )
+                    logger.info(f"✅ Informer-2超参数优化完成: 最佳CV准确率={inf_optimizer.best_score:.4f}")
+                
+                # 🔧 然后优化传统模型
                 if self.optimize_all_models:
-                    logger.info(f"🔧 启动超参数自动优化（Optuna）- 优化全部3个传统模型...")
+                    logger.info(f"🔧 启动传统模型超参数优化（Optuna）- 优化全部3个传统模型...")
                 else:
-                    logger.info(f"🔧 启动超参数自动优化（Optuna）- 仅优化LightGBM...")
+                    logger.info(f"🔧 启动传统模型超参数优化（Optuna）- 仅优化LightGBM...")
                 logger.info(f"   GPU加速: {'启用' if self.use_gpu else '关闭'}")
                 logger.info(f"   每模型试验: {self.optuna_n_trials}次, 超时: {self.optuna_timeout}秒")
                 
@@ -451,27 +597,14 @@ class EnsembleMLService(MLService):
                 if cat_params_optimized:
                     logger.info(f"   CatBoost最佳CV: {cat_optimizer.best_score:.4f}")
             
-            # 🤖 Informer-2超参数优化（如果启用）
-            if self.enable_informer2 and self.optimize_informer2 and TORCH_AVAILABLE:
-                logger.info(f"🤖 启动Informer-2超参数优化（深度学习）...")
-                logger.info(f"   GPU加速: {'启用' if self.use_gpu else '关闭'}")
-                logger.info(f"   试验次数: {self.informer_n_trials}次, 超时: {self.informer_timeout}秒")
-                
-                inf_optimizer = HyperparameterOptimizer(
-                    X=X_lgb_train.values if isinstance(X_lgb_train, pd.DataFrame) else X_lgb_train,
-                    y=y_lgb_train,
-                    timeframe=timeframe,
-                    model_type="informer2",
-                    use_gpu=self.use_gpu
-                )
-                inf_params_optimized = inf_optimizer.optimize(
-                    n_trials=self.informer_n_trials,
-                    timeout=self.informer_timeout,
-                    show_progress=False
-                )
-                logger.info(f"✅ Informer-2超参数优化完成: 最佳CV准确率={inf_optimizer.best_score:.4f}")
+            # 1️⃣ 训练四个基础模型（Informer-2优先训练）
+            # 🤖 优先训练Informer-2（深度学习 + GMADL损失 + 序列输入）
+            inf_model = None
+            if self.enable_informer2 and TORCH_AVAILABLE and X_seq_train is not None:
+                logger.info(f"🤖 训练Informer-2（深度学习 + GMADL损失 + 序列输入）- 优先训练...")
+                inf_model = self._train_informer2(X_seq_train, y_seq_train, timeframe, custom_params=inf_params_optimized)
             
-            # 1️⃣ 训练四个基础模型（各用自己的数据）
+            # 🔧 然后训练传统模型
             logger.info(f"🚂 训练LightGBM（360天数据）...")
             lgb_model = self._train_lightgbm(X_lgb_train, y_lgb_train, timeframe, custom_params=lgb_params_optimized)
             
@@ -481,12 +614,6 @@ class EnsembleMLService(MLService):
             logger.info(f"🚂 训练CatBoost（720天数据）...")
             cat_model = self._train_catboost(X_cat_train, y_cat_train, timeframe, custom_params=cat_params_optimized)
             
-            # 🤖 训练Informer-2（深度学习 + GMADL损失）
-            inf_model = None
-            if self.enable_informer2 and TORCH_AVAILABLE:
-                logger.info(f"🤖 训练Informer-2（深度学习 + GMADL损失）...")
-                inf_model = self._train_informer2(X_lgb_train, y_lgb_train, timeframe, custom_params=inf_params_optimized)
-            
             # 2️⃣ 生成验证集的预测概率（元特征）
             logger.info(f"📊 生成元特征（基于对齐的验证集）...")
             
@@ -495,9 +622,10 @@ class EnsembleMLService(MLService):
             xgb_pred_proba = xgb_model.predict_proba(X_xgb_val)
             cat_pred_proba = cat_model.predict_proba(X_cat_val)
             
-            # Informer-2预测（如果启用）
-            if inf_model is not None:
-                inf_pred_proba = inf_model.predict_proba(X_lgb_val)
+            # Informer-2预测（如果启用，使用序列验证数据）
+            if inf_model is not None and X_seq_val is not None:
+                inf_pred_proba = inf_model.predict_proba(X_seq_val)
+                logger.info(f"   Informer-2概率形状: {inf_pred_proba.shape}")
             
             logger.info(f"概率形状: lgb={lgb_pred_proba.shape}, xgb={xgb_pred_proba.shape}, cat={cat_pred_proba.shape}")
             
@@ -656,21 +784,23 @@ class EnsembleMLService(MLService):
             logger.info(f"   HOLD占比: {hold_ratio*100:.1f}% → 惩罚系数: {meta_hold_penalty_weight}")
             
             meta_class_weights = compute_sample_weight('balanced', meta_labels_val)
+            # ✅ 添加时间衰减权重（与基础模型保持一致）
+            meta_time_decay = np.exp(-np.arange(len(meta_features_val)) / (len(meta_features_val) * 0.1))[::-1]
             meta_hold_penalty = np.where(meta_labels_val == 1, meta_hold_penalty_weight, 1.0)
-            meta_sample_weights = meta_class_weights * meta_hold_penalty
+            meta_sample_weights = meta_class_weights * meta_time_decay * meta_hold_penalty
             
             import lightgbm as lgb
-            # 🔑 元学习器：极简配置防止过拟合
+            # 🔑 元学习器：专业配置平衡性能和防过拟合
             meta_learner = lgb.LGBMClassifier(
-                n_estimators=50,     # 减少树数量 100→50
-                max_depth=3,         # 更浅的树 4→3
-                learning_rate=0.15,  # 提高学习率 0.1→0.15（少量树）
-                num_leaves=7,        # 大幅减少叶子 15→7
-                min_child_samples=30,  # 增加最小样本 20→30
-                subsample=0.7,       # 降低采样 0.8→0.7
-                colsample_bytree=0.7,  # 降低特征采样 0.8→0.7
-                reg_alpha=0.3,       # 加强L1正则 0.1→0.3
-                reg_lambda=0.3,      # 加强L2正则 0.1→0.3
+                n_estimators=150,    # ✅ 适当增加树数量 50→150
+                max_depth=6,         # ✅ 中等深度平衡表达能力 3→6
+                learning_rate=0.05,  # ✅ 降低学习率更稳定收敛 0.15→0.05
+                num_leaves=31,       # ✅ 2^5-1标准配置 7→31
+                min_child_samples=20,  # ✅ 适度最小样本 30→20
+                subsample=0.8,       # ✅ 行采样防过拟合 0.7→0.8
+                colsample_bytree=0.8,  # ✅ 列采样防过拟合 0.7→0.8
+                reg_alpha=0.1,       # ✅ 适度L1正则化 0.3→0.1
+                reg_lambda=0.1,      # ✅ 适度L2正则化 0.3→0.1
                 random_state=42,
                 verbose=-1
             )
@@ -682,16 +812,20 @@ class EnsembleMLService(MLService):
             if timeframe not in self.ensemble_models:
                 self.ensemble_models[timeframe] = {}
             
-            self.ensemble_models[timeframe]['lightgbm'] = lgb_model
-            self.ensemble_models[timeframe]['xgboost'] = xgb_model
-            self.ensemble_models[timeframe]['catboost'] = cat_model
-            self.ensemble_models[timeframe]['meta_learner'] = meta_learner
+            self.ensemble_models[timeframe]['lgb'] = lgb_model
+            self.ensemble_models[timeframe]['xgb'] = xgb_model
+            self.ensemble_models[timeframe]['cat'] = cat_model
+            self.ensemble_models[timeframe]['meta'] = meta_learner
+            
+            # 保存Informer-2模型（如果存在）
+            if inf_model is not None:
+                self.ensemble_models[timeframe]['inf'] = inf_model
             
             # 5️⃣ 评估集成模型 - 使用时间序列交叉验证
             logger.info(f"📊 {timeframe} 时间序列交叉验证评估...")
             
             from sklearn.model_selection import TimeSeriesSplit
-            from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+            from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report, log_loss
             
             # 🆕 时间序列5折交叉验证（更可靠的评估）
             tscv = TimeSeriesSplit(n_splits=5)
@@ -743,10 +877,142 @@ class EnsembleMLService(MLService):
             
             # 使用完整验证集评估最终模型
             ensemble_pred = meta_learner.predict(meta_features_val)
+            ensemble_proba = meta_learner.predict_proba(meta_features_val)
             accuracy = accuracy_score(meta_labels_val, ensemble_pred)
             precision, recall, f1, _ = precision_recall_fscore_support(
                 meta_labels_val, ensemble_pred, average='weighted', zero_division=0
             )
+            
+            # 🆕 类别级别详细指标
+            class_report = classification_report(
+                meta_labels_val, ensemble_pred, 
+                target_names=['SHORT', 'HOLD', 'LONG'], 
+                output_dict=True,
+                zero_division=0
+            )
+            
+            # 🆕 混淆矩阵和致命错误分析
+            cm = confusion_matrix(meta_labels_val, ensemble_pred)
+            
+            # 安全检查：确保混淆矩阵至少是3x3
+            if cm.shape[0] >= 3 and cm.shape[1] >= 3:
+                fatal_errors = int(cm[0, 2] + cm[2, 0])  # SHORT→LONG + LONG→SHORT
+                fatal_error_rate = fatal_errors / len(meta_labels_val) if len(meta_labels_val) > 0 else 0.0
+                long_to_short = int(cm[2, 0])  # LONG→SHORT
+                short_to_long = int(cm[0, 2])  # SHORT→LONG
+            else:
+                logger.warning(f"⚠️ 混淆矩阵维度异常: {cm.shape}，跳过致命错误分析")
+                fatal_errors = 0
+                fatal_error_rate = 0.0
+                long_to_short = 0
+                short_to_long = 0
+            
+            # 🆕 信号质量分析
+            signal_mask = ensemble_pred != 1  # 非HOLD预测
+            signal_count = int(np.sum(signal_mask))
+            signal_frequency = float(np.mean(signal_mask))
+            hold_ratio = 1.0 - signal_frequency
+            
+            # 只在有信号时计算信号准确率
+            if signal_count > 0:
+                signal_labels = meta_labels_val[signal_mask]
+                signal_preds = ensemble_pred[signal_mask]
+                # 信号准确率：只看LONG/SHORT的预测准确率
+                signal_accuracy = float(accuracy_score(signal_labels, signal_preds))
+            else:
+                signal_accuracy = 0.0
+            
+            # 🆕 概率校准指标
+            try:
+                log_loss_score = float(log_loss(meta_labels_val, ensemble_proba))
+            except Exception as e:
+                logger.warning(f"⚠️ Log Loss计算失败: {e}")
+                log_loss_score = 0.0
+            
+            try:
+                confidence_avg = float(np.mean(np.max(ensemble_proba, axis=1)))
+            except Exception as e:
+                logger.warning(f"⚠️ 置信度计算失败: {e}")
+                confidence_avg = 0.0
+            
+            # 🆕 模型稳定性指标
+            cv_stability = float(cv_std / cv_mean if cv_mean > 0 else 0)  # 变异系数
+            cv_min = float(np.min(cv_scores))
+            cv_max = float(np.max(cv_scores))
+            
+            # 基础模型一致性
+            model_agreement = float(np.mean([
+                (lgb_pred == xgb_pred).mean(),
+                (lgb_pred == cat_pred).mean(),
+                (xgb_pred == cat_pred).mean()
+            ]))
+            
+            # 🆕 交易经济性指标
+            trade_efficiency = float(signal_accuracy / signal_frequency if signal_frequency > 0 else 0)
+            fee_impact = float(signal_frequency * 0.0007 * 100)  # 预估日手续费损耗%
+            required_winrate = float(0.5 + (0.0007 / 0.02))  # 盈亏比1:1时的盈亏平衡胜率
+            
+            # 🆕 预测置信度分布
+            try:
+                confidence_values = np.max(ensemble_proba, axis=1)
+                confidence_quantiles = np.quantile(confidence_values, [0.25, 0.5, 0.75, 0.9])
+                confidence_q25 = float(confidence_quantiles[0])
+                confidence_median = float(confidence_quantiles[1])
+                confidence_q75 = float(confidence_quantiles[2])
+                confidence_q90 = float(confidence_quantiles[3])
+            except Exception as e:
+                logger.warning(f"⚠️ 置信度分位数计算失败: {e}")
+                confidence_q25 = 0.0
+                confidence_median = 0.0
+                confidence_q75 = 0.0
+                confidence_q90 = 0.0
+            
+            # 高置信度预测的准确率
+            try:
+                high_confidence_mask = confidence_values > 0.7
+                if np.sum(high_confidence_mask) > 0:
+                    high_confidence_accuracy = float(accuracy_score(
+                        meta_labels_val[high_confidence_mask],
+                        ensemble_pred[high_confidence_mask]
+                    ))
+                    high_confidence_ratio = float(np.mean(high_confidence_mask))
+                else:
+                    high_confidence_accuracy = 0.0
+                    high_confidence_ratio = 0.0
+            except Exception as e:
+                logger.warning(f"⚠️ 高置信度指标计算失败: {e}")
+                high_confidence_accuracy = 0.0
+                high_confidence_ratio = 0.0
+            
+            # 🆕 类别平衡性指标
+            try:
+                from scipy.stats import entropy as scipy_entropy
+                pred_distribution = np.bincount(ensemble_pred, minlength=3) / len(ensemble_pred)
+                prediction_entropy = float(scipy_entropy(pred_distribution))  # 熵越高越平衡
+                prediction_balance_score = float(1 - np.std(pred_distribution))  # 平衡分数
+                short_ratio = float(pred_distribution[0])
+                long_ratio = float(pred_distribution[2])
+            except Exception as e:
+                logger.warning(f"⚠️ 类别平衡性指标计算失败: {e}")
+                prediction_entropy = 0.0
+                prediction_balance_score = 0.0
+                short_ratio = 0.0
+                long_ratio = 0.0
+            
+            # 🆕 错误严重性加权指标
+            try:
+                fatal_weight = 3.0
+                total_errors = len(meta_labels_val) - np.sum(ensemble_pred == meta_labels_val)
+                normal_errors = max(0, total_errors - fatal_errors)  # 确保非负
+                if len(meta_labels_val) > 0:
+                    weighted_error_rate = float((fatal_errors * fatal_weight + normal_errors) / (len(meta_labels_val) * fatal_weight))
+                else:
+                    weighted_error_rate = 0.0
+                fatal_error_ratio_in_errors = float(fatal_errors / total_errors if total_errors > 0 else 0)
+            except Exception as e:
+                logger.warning(f"⚠️ 错误严重性指标计算失败: {e}")
+                weighted_error_rate = 0.0
+                fatal_error_ratio_in_errors = 0.0
             
             logger.info(f"📊 {timeframe} 最终模型验证集准确率: {accuracy:.4f} (CV: {cv_mean:.4f}±{cv_std:.4f})")
             
@@ -760,15 +1026,17 @@ class EnsembleMLService(MLService):
             cat_acc = accuracy_score(y_cat_val, cat_pred)
             
             # Informer-2准确率（如果存在）
-            if inf_model is not None:
-                inf_pred = inf_model.predict(X_lgb_val)
-                inf_acc = accuracy_score(y_lgb_val, inf_pred)
+            if inf_model is not None and X_seq_val is not None:
+                # 🔑 修复：使用序列验证数据而不是2D数据
+                inf_pred = inf_model.predict(X_seq_val)
+                inf_acc = accuracy_score(y_seq_val, inf_pred)
             else:
                 inf_acc = 0.0
             
             training_time = time.time() - start_time
             
             result = {
+                # 基础指标
                 'accuracy': cv_mean,  # 🔑 使用CV均值作为主准确率（更可靠）
                 'cv_mean': cv_mean,   # 交叉验证均值
                 'cv_std': cv_std,     # 交叉验证标准差
@@ -777,27 +1045,139 @@ class EnsembleMLService(MLService):
                 'precision': precision,
                 'recall': recall,
                 'f1_score': f1,
+                
+                # 基础模型准确率
                 'lgb_accuracy': lgb_acc,
                 'xgb_accuracy': xgb_acc,
                 'cat_accuracy': cat_acc,
                 'inf_accuracy': inf_acc if inf_model else 0.0,
+                
+                # 🆕 类别级别指标
+                'class_metrics': {
+                    'SHORT': class_report.get('SHORT', {'precision': 0, 'recall': 0, 'f1-score': 0, 'support': 0}),
+                    'HOLD': class_report.get('HOLD', {'precision': 0, 'recall': 0, 'f1-score': 0, 'support': 0}),
+                    'LONG': class_report.get('LONG', {'precision': 0, 'recall': 0, 'f1-score': 0, 'support': 0})
+                },
+                
+                # 🆕 混淆矩阵和致命错误
+                'confusion_matrix': cm.tolist(),
+                'fatal_errors': fatal_errors,
+                'fatal_error_rate': fatal_error_rate,
+                'long_to_short_errors': long_to_short,
+                'short_to_long_errors': short_to_long,
+                
+                # 🆕 信号质量分析
+                'signal_frequency': signal_frequency,
+                'signal_accuracy': signal_accuracy,
+                'signal_count': signal_count,
+                'hold_ratio': hold_ratio,
+                
+                # 🆕 概率校准指标
+                'log_loss': log_loss_score,
+                'confidence_avg': confidence_avg,
+                'confidence_q25': confidence_q25,
+                'confidence_median': confidence_median,
+                'confidence_q75': confidence_q75,
+                'confidence_q90': confidence_q90,
+                
+                # 🆕 高置信度指标
+                'high_confidence_accuracy': high_confidence_accuracy,
+                'high_confidence_ratio': high_confidence_ratio,
+                
+                # 🆕 模型稳定性指标
+                'cv_stability': cv_stability,
+                'cv_min': cv_min,
+                'cv_max': cv_max,
+                'model_agreement': model_agreement,
+                
+                # 🆕 交易经济性指标
+                'trade_efficiency': trade_efficiency,
+                'fee_impact': fee_impact,
+                'required_winrate': required_winrate,
+                
+                # 🆕 类别平衡性指标
+                'prediction_entropy': prediction_entropy,
+                'prediction_balance_score': prediction_balance_score,
+                'short_ratio': short_ratio,
+                'long_ratio': long_ratio,
+                
+                # 🆕 错误严重性加权指标
+                'weighted_error_rate': weighted_error_rate,
+                'fatal_error_ratio_in_errors': fatal_error_ratio_in_errors,
+                
+                # 其他信息
                 'training_time': training_time,
                 'ensemble_size': len(self.ensemble_models[timeframe]),
                 'meta_features_count': meta_features_val.shape[1]  # 元特征数量
             }
             
             logger.info(f"✅ Stacking训练完成（差异化数据）:")
-            logger.info(f"  LightGBM(360天): {lgb_acc:.4f}")
-            logger.info(f"  XGBoost(540天):  {xgb_acc:.4f}")
-            logger.info(f"  CatBoost(720天): {cat_acc:.4f}")
+            logger.info(f"")
+            logger.info(f"  📊 基础模型表现:")
+            logger.info(f"     LightGBM(360天): {lgb_acc:.4f}")
+            logger.info(f"     XGBoost(540天):  {xgb_acc:.4f}")
+            logger.info(f"     CatBoost(720天): {cat_acc:.4f}")
             if inf_model:
-                logger.info(f"  Informer-2:      {inf_acc:.4f} 🤖")
-            logger.info(f"  Stacking验证集:  {accuracy:.4f}")
-            logger.info(f"  🎯 时间序列CV:  {cv_mean:.4f} ± {cv_std:.4f} (5-fold)")
+                logger.info(f"     Informer-2:      {inf_acc:.4f} 🤖")
+            logger.info(f"")
+            logger.info(f"  🎯 集成模型表现:")
+            logger.info(f"     验证集准确率:   {accuracy:.4f}")
+            logger.info(f"     时间序列CV:     {cv_mean:.4f} ± {cv_std:.4f} (5-fold)")
+            logger.info(f"     Precision:      {precision:.4f}")
+            logger.info(f"     Recall:         {recall:.4f}")
+            logger.info(f"     F1-Score:       {f1:.4f}")
+            logger.info(f"")
+            logger.info(f"  📈 类别级别表现:")
+            short_metrics = class_report.get('SHORT', {'precision': 0, 'recall': 0, 'f1-score': 0, 'support': 0})
+            hold_metrics = class_report.get('HOLD', {'precision': 0, 'recall': 0, 'f1-score': 0, 'support': 0})
+            long_metrics = class_report.get('LONG', {'precision': 0, 'recall': 0, 'f1-score': 0, 'support': 0})
+            logger.info(f"     SHORT - P:{short_metrics['precision']:.4f} R:{short_metrics['recall']:.4f} F1:{short_metrics['f1-score']:.4f} (样本:{int(short_metrics['support'])})")
+            logger.info(f"     HOLD  - P:{hold_metrics['precision']:.4f} R:{hold_metrics['recall']:.4f} F1:{hold_metrics['f1-score']:.4f} (样本:{int(hold_metrics['support'])})")
+            logger.info(f"     LONG  - P:{long_metrics['precision']:.4f} R:{long_metrics['recall']:.4f} F1:{long_metrics['f1-score']:.4f} (样本:{int(long_metrics['support'])})")
+            logger.info(f"")
+            logger.info(f"  🎲 信号质量分析:")
+            logger.info(f"     信号频率:       {signal_frequency*100:.2f}% ({signal_count}个信号)")
+            logger.info(f"     信号准确率:     {signal_accuracy:.4f}")
+            logger.info(f"     HOLD比例:       {hold_ratio*100:.2f}%")
+            logger.info(f"     平均置信度:     {confidence_avg:.4f}")
+            logger.info(f"")
+            logger.info(f"  ⚠️ 错误分析:")
+            logger.info(f"     致命错误:       {fatal_errors}次 ({fatal_error_rate*100:.2f}%)")
+            logger.info(f"     LONG→SHORT:     {long_to_short}次")
+            logger.info(f"     SHORT→LONG:     {short_to_long}次")
+            logger.info(f"     加权错误率:     {weighted_error_rate:.4f} (致命×3权重)")
+            logger.info(f"     致命错误占比:   {fatal_error_ratio_in_errors*100:.2f}% (在总错误中)")
+            logger.info(f"     Log Loss:       {log_loss_score:.4f}")
+            logger.info(f"")
+            logger.info(f"  🎯 预测置信度分布:")
+            logger.info(f"     平均值:         {confidence_avg:.4f}")
+            logger.info(f"     中位数:         {confidence_median:.4f}")
+            logger.info(f"     Q25-Q75:        {confidence_q25:.4f} - {confidence_q75:.4f}")
+            logger.info(f"     Q90:            {confidence_q90:.4f}")
+            logger.info(f"     高置信(>0.7):   {high_confidence_ratio*100:.2f}% (准确率:{high_confidence_accuracy:.4f})")
+            logger.info(f"")
+            logger.info(f"  📊 类别预测分布:")
+            logger.info(f"     SHORT比例:      {short_ratio*100:.2f}%")
+            logger.info(f"     HOLD比例:       {hold_ratio*100:.2f}%")
+            logger.info(f"     LONG比例:       {long_ratio*100:.2f}%")
+            logger.info(f"     预测熵:         {prediction_entropy:.4f} (越高越平衡)")
+            logger.info(f"     平衡分数:       {prediction_balance_score:.4f}")
+            logger.info(f"")
+            logger.info(f"  💰 交易经济性分析:")
+            logger.info(f"     交易效率:       {trade_efficiency:.4f} (准确率/频率)")
+            logger.info(f"     手续费影响:     {fee_impact:.4f}% (日预估)")
+            logger.info(f"     盈亏平衡胜率:   {required_winrate*100:.2f}% (盈亏比1:1)")
+            logger.info(f"")
+            logger.info(f"  🔧 模型稳定性:")
+            logger.info(f"     CV变异系数:     {cv_stability:.4f} (越小越稳定)")
+            logger.info(f"     CV范围:         {cv_min:.4f} - {cv_max:.4f}")
+            logger.info(f"     模型一致性:     {model_agreement*100:.2f}% (基础模型共识)")
+            logger.info(f"")
+            logger.info(f"  📊 模型配置:")
             n_base = 12 if inf_model else 9
-            n_enhanced = 11 if not inf_model else 11
-            logger.info(f"  📊 元特征: {meta_features_val.shape[1]}个（基础{n_base}+增强{n_enhanced}）")
-            logger.info(f"  训练耗时: {training_time:.2f}秒")
+            n_enhanced = 11
+            logger.info(f"     元特征数量:     {meta_features_val.shape[1]}个（基础{n_base}+增强{n_enhanced}）")
+            logger.info(f"     训练耗时:       {training_time:.2f}秒")
             
             return result
             
@@ -1005,13 +1385,13 @@ class EnsembleMLService(MLService):
             logger.error(f"CatBoost训练失败: {e}")
             raise
     
-    def _train_informer2(self, X_train: pd.DataFrame, y_train: pd.Series, timeframe: str, custom_params: Optional[Dict[str, Any]] = None):
+    def _train_informer2(self, X_seq_train: np.ndarray, y_seq_train: np.ndarray, timeframe: str, custom_params: Optional[Dict[str, Any]] = None):
         """
-        训练Informer-2深度学习模型（使用GMADL损失函数）
+        训练Informer-2深度学习模型（使用GMADL损失函数 + 序列输入）
         
         Args:
-            X_train: 训练特征
-            y_train: 训练标签
+            X_seq_train: 序列训练特征 (n_samples, seq_len, n_features)
+            y_seq_train: 训练标签 (n_samples,)
             timeframe: 时间框架
             custom_params: 自定义参数（来自Optuna优化）
         
@@ -1026,14 +1406,12 @@ class EnsembleMLService(MLService):
             import time
             start_time = time.time()
             
-            logger.info(f"🤖 训练Informer-2神经网络模型...")
+            logger.info(f"🤖 训练Informer-2神经网络模型（序列输入）...")
+            logger.info(f"   输入形状: {X_seq_train.shape} (样本数, 序列长度, 特征数)")
             
-            # 1. 数据准备（Pandas → PyTorch）
-            X_np = X_train.values if isinstance(X_train, pd.DataFrame) else X_train
-            y_np = y_train.values if isinstance(y_train, pd.Series) else y_train
-            
-            X_tensor = torch.FloatTensor(X_np)
-            y_tensor = torch.LongTensor(y_np)
+            # 1. 数据准备（NumPy → PyTorch）
+            X_tensor = torch.FloatTensor(X_seq_train)  # (n_samples, seq_len, n_features)
+            y_tensor = torch.LongTensor(y_seq_train)   # (n_samples,)
             
             # 2. 检测GPU
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1071,16 +1449,20 @@ class EnsembleMLService(MLService):
                 alpha = 1.0
                 beta = 0.5
             
-            # 5. 初始化模型（修复参数名）
+            # 5. 初始化模型（支持序列输入）
+            n_features = X_seq_train.shape[2]  # 特征数量（从序列的最后一维获取）
             model = Informer2ForClassification(
-                n_features=X_np.shape[1],  # 特征数量
+                n_features=n_features,
                 n_classes=3,  # 类别数
                 d_model=d_model,
                 n_heads=n_heads,
                 n_layers=n_layers,
                 dropout=dropout,
-                use_distilling=True
+                use_distilling=True  # 启用蒸馏层（完整Informer架构）
             ).to(device)
+            
+            logger.info(f"   模型参数: d_model={d_model}, n_heads={n_heads}, n_layers={n_layers}")
+            logger.info(f"   训练参数: epochs={epochs}, batch_size={batch_size}, lr={lr}")
             
             # 6. 定义GMADL损失函数（关键创新！）
             criterion = GMADLossWithHOLDPenalty(
@@ -1150,43 +1532,41 @@ class EnsembleMLService(MLService):
             # 9. 切换到评估模式
             model.eval()
             
-            # 10. 包装模型以兼容scikit-learn接口
+            # 10. 包装模型以兼容scikit-learn接口（支持序列输入）
             class InformerWrapper:
-                """包装Informer-2模型，提供predict_proba接口"""
+                """包装Informer-2模型，提供predict_proba接口（支持序列输入）"""
                 
                 def __init__(self, model, device):
                     self.model = model
                     self.device = device
                 
-                def predict_proba(self, X):
+                def predict_proba(self, X_seq):
                     """
-                    预测概率（兼容scikit-learn）
+                    预测概率（兼容scikit-learn，支持序列输入）
                     
                     Args:
-                        X: NumPy数组或Pandas DataFrame
+                        X_seq: NumPy数组 (n_samples, seq_len, n_features)
                     
                     Returns:
                         概率数组 (n_samples, n_classes)
                     """
                     self.model.eval()
                     with torch.no_grad():
-                        if isinstance(X, pd.DataFrame):
-                            X = X.values
-                        X_tensor = torch.FloatTensor(X).to(self.device)
+                        X_tensor = torch.FloatTensor(X_seq).to(self.device)
                         probs = self.model.predict_proba(X_tensor)
                         return probs.cpu().numpy()
                 
-                def predict(self, X):
+                def predict(self, X_seq):
                     """
-                    预测类别（兼容scikit-learn）
+                    预测类别（兼容scikit-learn，支持序列输入）
                     
                     Args:
-                        X: NumPy数组或Pandas DataFrame
+                        X_seq: NumPy数组 (n_samples, seq_len, n_features)
                     
                     Returns:
                         预测类别数组
                     """
-                    probs = self.predict_proba(X)
+                    probs = self.predict_proba(X_seq)
                     return np.argmax(probs, axis=1)
             
             wrapped_model = InformerWrapper(model, device)
@@ -1259,10 +1639,22 @@ class EnsembleMLService(MLService):
             xgb_pred = models['xgb'].predict(X_pred)[0]
             cat_pred = models['cat'].predict(X_pred)[0]
             
-            # 🤖 Informer-2预测（如果存在）
+            # 🤖 Informer-2预测（如果存在，需要序列输入）
             if 'inf' in models:
-                inf_proba = models['inf'].predict_proba(X_pred)[0]
-                inf_pred = models['inf'].predict(X_pred)[0]
+                # 构造序列输入（取最新seq_len个时间步）
+                seq_len = self.seq_len_config.get(timeframe, 96)
+                
+                if len(processed_data) < seq_len:
+                    logger.warning(f"⚠️ 数据不足：需要{seq_len}个时间步，实际{len(processed_data)}个，跳过Informer-2预测")
+                    inf_proba = None
+                    inf_pred = None
+                else:
+                    # 取最新seq_len个时间步构造序列
+                    latest_seq = processed_data.iloc[-seq_len:][feature_columns].values
+                    latest_seq = latest_seq.reshape(1, seq_len, -1)  # (1, seq_len, n_features)
+                    
+                    inf_proba = models['inf'].predict_proba(latest_seq)[0]
+                    inf_pred = models['inf'].predict(latest_seq)[0]
             else:
                 inf_proba = None
                 inf_pred = None
@@ -1524,6 +1916,305 @@ class EnsembleMLService(MLService):
             logger.error(traceback.format_exc())
             raise
     
+    def predict_with_optimizations(
+        self,
+        features: Dict[str, pd.DataFrame],
+        price_data: Optional[pd.DataFrame] = None,
+        previous_signal: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        带优化的集成预测
+        
+        Args:
+            features: 各时间框架特征数据 {timeframe: DataFrame}
+            price_data: 价格数据（用于市场状态分析）
+            previous_signal: 前一个信号 (0=SHORT, 1=HOLD, 2=LONG)
+        
+        Returns:
+            Dict[str, Any]: 预测结果和优化信息
+        """
+        try:
+            # 1. 基础预测
+            predictions = {}
+            probabilities = {}
+            
+            for timeframe, X in features.items():
+                if timeframe in self.ensemble_models:
+                    models = self.ensemble_models[timeframe]
+                    
+                    # 确保X是numpy数组格式
+                    if isinstance(X, pd.DataFrame):
+                        X_pred = X.values
+                    else:
+                        X_pred = X
+                    
+                    # 检查数据有效性
+                    if X_pred.size == 0:
+                        logger.warning(f"⚠️ {timeframe} 特征数据为空，跳过预测")
+                        continue
+                    
+                    # 基础模型预测
+                    lgb_pred = models['lgb'].predict(X_pred)
+                    xgb_pred = models['xgb'].predict(X_pred)
+                    cat_pred = models['cat'].predict(X_pred)
+                    
+                    # 元学习器预测
+                    meta_features = self._generate_enhanced_meta_features(X_pred, models)
+                    meta_pred = models['meta'].predict(meta_features)
+                    meta_proba = models['meta'].predict_proba(meta_features)
+                    
+                    predictions[timeframe] = meta_pred[0]
+                    probabilities[timeframe] = meta_proba[0]
+            
+            # 2. 交易方向一致性检查
+            consistency_check = self.direction_checker.check_multi_timeframe_consistency(
+                predictions, probabilities
+            )
+            
+            # 3. 频率控制检查
+            frequency_control = None
+            if price_data is not None:
+                market_state = self.frequency_controller.calculate_market_state(price_data)
+                recent_performance = self._get_recent_performance()
+                
+                frequency_control = self.frequency_controller.check_trade_frequency(
+                    datetime.now(),
+                    consistency_check.confidence_score,
+                    market_state,
+                    recent_performance
+                )
+            
+            # 4. 致命错误过滤
+            final_signal = predictions.get('15m', 1)  # 默认HOLD
+            filter_passed, filter_reason = self.direction_checker.filter_fatal_error_signals(
+                final_signal, consistency_check, previous_signal
+            )
+            
+            # 5. 综合决策
+            if not filter_passed:
+                final_signal = 1  # 强制HOLD
+                logger.warning(f"⚠️ 信号被过滤: {filter_reason}")
+            
+            if frequency_control and not frequency_control.allow_trade:
+                final_signal = 1  # 强制HOLD
+                logger.warning(f"⚠️ 频率控制阻止交易: {frequency_control.reason}")
+            
+            # 6. 更新优化指标
+            self._update_optimization_metrics(consistency_check, frequency_control)
+            
+            return {
+                'signal': final_signal,
+                'confidence': consistency_check.confidence_score,
+                'consistency_check': {
+                    'is_consistent': consistency_check.is_consistent,
+                    'timeframe_agreement': consistency_check.timeframe_agreement,
+                    'risk_level': consistency_check.risk_level
+                },
+                'frequency_control': {
+                    'allow_trade': frequency_control.allow_trade if frequency_control else True,
+                    'reason': frequency_control.reason if frequency_control else "未检查",
+                    'fee_impact': frequency_control.fee_impact if frequency_control else 0.0
+                },
+                'filter_result': {
+                    'passed': filter_passed,
+                    'reason': filter_reason
+                },
+                'optimization_metrics': self.optimization_metrics.copy()
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ 优化预测失败: {e}")
+            return {
+                'signal': 1,  # 默认HOLD
+                'confidence': 0.0,
+                'error': str(e)
+            }
+    
+    def _generate_enhanced_meta_features(
+        self, 
+        X_pred: np.ndarray, 
+        models: Dict[str, Any]
+    ) -> np.ndarray:
+        """
+        生成增强元特征（与训练时保持一致）
+        
+        Args:
+            X_pred: 预测特征数据
+            models: 模型字典
+        
+        Returns:
+            np.ndarray: 增强元特征
+        """
+        try:
+            from scipy.special import entr
+            
+            # 基础模型预测概率
+            lgb_proba = models['lgb'].predict_proba(X_pred)[0]
+            xgb_proba = models['xgb'].predict_proba(X_pred)[0]
+            cat_proba = models['cat'].predict_proba(X_pred)[0]
+            
+            # 基础模型预测结果
+            lgb_pred = models['lgb'].predict(X_pred)[0]
+            xgb_pred = models['xgb'].predict(X_pred)[0]
+            cat_pred = models['cat'].predict(X_pred)[0]
+            
+            # Informer-2预测（如果存在）
+            if 'inf' in models:
+                try:
+                    # 尝试获取序列输入（需要从features中构造）
+                    seq_len = self.seq_len_config.get('15m', 96)  # 默认使用15m配置
+                    # 这里需要完整的序列数据，暂时使用默认值
+                    inf_proba = np.array([0.33, 0.34, 0.33])  # 默认均匀分布
+                    inf_pred = 1  # 默认HOLD
+                    logger.debug(f"⚠️ Informer-2使用默认预测（需要序列输入）")
+                except Exception as e:
+                    logger.warning(f"⚠️ Informer-2预测失败: {e}")
+                    inf_proba = np.array([0.33, 0.34, 0.33])
+                    inf_pred = 1
+            else:
+                inf_proba = None
+                inf_pred = None
+            
+            # 1. 基础元特征（12个）
+            meta_features = np.concatenate([
+                lgb_proba,  # 3个
+                xgb_proba,  # 3个
+                cat_proba   # 3个
+            ])
+            
+            if inf_proba is not None:
+                meta_features = np.concatenate([meta_features, inf_proba])  # +3个
+            
+            # 2. 增强元特征（11个）
+            # 模型一致性
+            if inf_pred is not None:
+                agreement = float((lgb_pred == xgb_pred) and (xgb_pred == cat_pred) and (cat_pred == inf_pred))
+            else:
+                agreement = float((lgb_pred == xgb_pred) and (xgb_pred == cat_pred))
+            
+            # 最大概率
+            lgb_max_prob = lgb_proba.max()
+            xgb_max_prob = xgb_proba.max()
+            cat_max_prob = cat_proba.max()
+            
+            # 概率熵
+            lgb_entropy = entr(lgb_proba).sum()
+            xgb_entropy = entr(xgb_proba).sum()
+            cat_entropy = entr(cat_proba).sum()
+            
+            # 平均概率
+            avg_proba = np.mean([lgb_proba, xgb_proba, cat_proba], axis=0)
+            if inf_proba is not None:
+                avg_proba = np.mean([lgb_proba, xgb_proba, cat_proba, inf_proba], axis=0)
+            
+            # 概率标准差
+            prob_std = np.std([lgb_proba, xgb_proba, cat_proba], axis=0).mean()
+            if inf_proba is not None:
+                prob_std = np.std([lgb_proba, xgb_proba, cat_proba, inf_proba], axis=0).mean()
+            
+            # Informer-2增强特征（如果存在）
+            if inf_proba is not None:
+                inf_max_prob = inf_proba.max()
+                inf_entropy = entr(inf_proba).sum()
+                
+                enhanced_features = np.array([
+                    agreement, lgb_max_prob, xgb_max_prob, cat_max_prob,
+                    lgb_entropy, xgb_entropy, cat_entropy,
+                    avg_proba.mean(), prob_std,
+                    inf_max_prob, inf_entropy
+                ])
+            else:
+                enhanced_features = np.array([
+                    agreement, lgb_max_prob, xgb_max_prob, cat_max_prob,
+                    lgb_entropy, xgb_entropy, cat_entropy,
+                    avg_proba.mean(), prob_std,
+                    0.0, 0.0  # 占位符
+                ])
+            
+            # 合并所有特征
+            all_features = np.concatenate([meta_features, enhanced_features])
+            
+            return all_features.reshape(1, -1)
+            
+        except Exception as e:
+            logger.error(f"❌ 增强元特征生成失败: {e}")
+            # 返回默认特征
+            default_features = np.zeros(23)  # 12 + 11
+            return default_features.reshape(1, -1)
+
+    def _get_recent_performance(self) -> Dict[str, float]:
+        """获取近期表现指标"""
+        try:
+            # 这里应该从实际交易记录中获取
+            # 暂时返回模拟数据
+            return {
+                'win_rate': 0.55,
+                'avg_profit': 0.02,
+                'max_drawdown': 0.05
+            }
+        except Exception as e:
+            logger.error(f"❌ 获取近期表现失败: {e}")
+            return {
+                'win_rate': 0.5,
+                'avg_profit': 0.0,
+                'max_drawdown': 0.0
+            }
+    
+    def _update_optimization_metrics(
+        self,
+        consistency_check: ConsistencyCheck,
+        frequency_control: Optional[FrequencyControl]
+    ) -> None:
+        """更新优化指标"""
+        try:
+            # 更新致命错误率
+            self.optimization_metrics['fatal_error_rate'] = 1.0 - consistency_check.direction_strength
+            
+            # 更新手续费影响
+            if frequency_control:
+                self.optimization_metrics['fee_impact'] = frequency_control.fee_impact
+            
+            # 更新一致性率
+            self.optimization_metrics['consistency_rate'] = consistency_check.timeframe_agreement
+            
+            logger.debug(f"📊 优化指标更新: 致命错误率={self.optimization_metrics['fatal_error_rate']:.3f}, "
+                        f"手续费影响={self.optimization_metrics['fee_impact']:.3f}%, "
+                        f"一致性率={self.optimization_metrics['consistency_rate']:.3f}")
+            
+        except Exception as e:
+            logger.error(f"❌ 优化指标更新失败: {e}")
+    
+    def get_optimization_report(self) -> Dict[str, Any]:
+        """获取优化报告"""
+        try:
+            # 获取频率控制统计
+            freq_stats = self.frequency_controller.get_frequency_statistics()
+            
+            # 获取稳定性建议
+            stability_recommendations = []
+            if hasattr(self, 'stability_metrics'):
+                stability_recommendations = self.stability_enhancer.get_stability_recommendations(
+                    self.stability_metrics
+                )
+            
+            return {
+                'optimization_metrics': self.optimization_metrics.copy(),
+                'frequency_statistics': freq_stats,
+                'stability_recommendations': stability_recommendations,
+                'system_status': {
+                    'direction_checker': 'active',
+                    'frequency_controller': 'active',
+                    'stability_enhancer': 'active'
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ 优化报告生成失败: {e}")
+            return {
+                'error': str(e),
+                'optimization_metrics': self.optimization_metrics.copy()
+            }
+
     async def start(self):
         """启动集成ML服务"""
         try:

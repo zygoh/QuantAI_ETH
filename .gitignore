@@ -1,5 +1,6 @@
 /backend/models
 /backend/logs
 /backend/.venv
+__pycache__/
 .vscode
 .idea

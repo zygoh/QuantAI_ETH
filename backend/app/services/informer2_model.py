@@ -332,13 +332,19 @@ class InformerEncoderLayer(nn.Module):
 
 class Informer2ForClassification(nn.Module):
     """
-    Informer-2分类模型（简化版，用于交易信号预测）
+    Informer-2分类模型（完整版，用于交易信号预测）
     
     架构：
     1. 输入嵌入（特征投影）
-    2. 单层Encoder（避免序列维度问题）
-    3. 全局池化
-    4. 分类头（输出LONG/HOLD/SHORT概率）
+    2. 多层Encoder + ProbSparse自注意力
+    3. 蒸馏层（序列长度压缩）
+    4. 全局池化
+    5. 分类头（输出LONG/HOLD/SHORT概率）
+    
+    核心特性：
+    - ProbSparse Self-Attention (O(L log L)复杂度)
+    - Distilling Layers (关键信息提取)
+    - 多层Encoder (完整Informer架构)
     """
     
     def __init__(
@@ -354,18 +360,18 @@ class Informer2ForClassification(nn.Module):
         use_distilling: bool = True
     ):
         """
-        初始化Informer-2分类模型
+        初始化Informer-2分类模型（完整版）
         
         Args:
             n_features: 输入特征数量
             n_classes: 类别数（3: LONG/HOLD/SHORT）
             d_model: 模型维度
             n_heads: 注意力头数
-            n_layers: Encoder层数
+            n_layers: Encoder层数（完整多层架构）
             d_ff: Feed-Forward维度
             factor: 稀疏因子
             dropout: Dropout比率
-            use_distilling: 是否使用蒸馏层
+            use_distilling: 是否使用蒸馏层（推荐True）
         """
         super(Informer2ForClassification, self).__init__()
         
@@ -377,14 +383,24 @@ class Informer2ForClassification(nn.Module):
         # 1. 输入投影（特征→模型维度）
         self.input_projection = nn.Linear(n_features, d_model)
         
-        # 2. 单层Encoder（简化版）
-        self.encoder_layer = InformerEncoderLayer(
-            d_model=d_model,
-            n_heads=n_heads,
-            d_ff=d_ff,
-            factor=factor,
-            dropout=dropout
-        )
+        # 2. 多层Encoder + 蒸馏层（完整Informer架构）
+        self.encoder_layers = nn.ModuleList([
+            InformerEncoderLayer(
+                d_model=d_model,
+                n_heads=n_heads,
+                d_ff=d_ff,
+                factor=factor,
+                dropout=dropout
+            ) for _ in range(n_layers)
+        ])
+        
+        # 3. 蒸馏层（如果启用）
+        if use_distilling:
+            self.distilling_layers = nn.ModuleList([
+                DistillingLayer() for _ in range(n_layers - 1)
+            ])
+        else:
+            self.distilling_layers = None
         
         # 4. 分类头
         self.classifier = nn.Sequential(
@@ -402,28 +418,37 @@ class Informer2ForClassification(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        前向传播
+        前向传播（完整Informer-2架构）
+        
+        处理流程：
+        1. 输入投影：特征维度转换
+        2. 多层Encoder：ProbSparse自注意力处理
+        3. 蒸馏层：序列长度压缩，提取关键信息
+        4. 全局池化：聚合序列信息
+        5. 分类头：输出类别概率
         
         Args:
-            x: (batch, n_features) - 单个样本的特征向量
+            x: (batch, seq_len, n_features) - 序列输入
         
         Returns:
             logits: (batch, n_classes) - 分类logits
         """
-        # 1. 输入投影
-        x = self.input_projection(x)  # (batch, d_model)
+        # 1. 输入投影：(batch, seq_len, n_features) → (batch, seq_len, d_model)
+        x = self.input_projection(x)
         
-        # 2. 直接使用全局平均池化（简化版Informer-2）
-        # 避免序列维度问题，直接对特征进行聚合
-        x = x.unsqueeze(1)  # (batch, 1, d_model)
+        # 2. 多层Encoder + 蒸馏层处理
+        for i, encoder_layer in enumerate(self.encoder_layers):
+            # Encoder处理
+            x, _ = encoder_layer(x)  # (batch, seq_len, d_model)
+            
+            # 蒸馏层处理（除了最后一层）
+            if self.use_distilling and self.distilling_layers and i < len(self.encoder_layers) - 1:
+                x = self.distilling_layers[i](x)  # (batch, seq_len//4, d_model)
         
-        # 3. 简化的Encoder处理（单层）
-        x, _ = self.encoder_layer(x)  # (batch, 1, d_model)
-        
-        # 4. 全局池化（将序列维度聚合）
+        # 3. 全局池化（聚合序列信息）
         x = x.mean(dim=1)  # (batch, d_model)
         
-        # 5. 分类
+        # 4. 分类
         logits = self.classifier(x)  # (batch, n_classes)
         
         return logits
@@ -433,7 +458,7 @@ class Informer2ForClassification(nn.Module):
         预测类别概率
         
         Args:
-            x: (batch, n_features)
+            x: (batch, seq_len, n_features) - 序列输入
         
         Returns:
             probs: (batch, n_classes)

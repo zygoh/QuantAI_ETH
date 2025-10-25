@@ -1,966 +1,388 @@
 ---
-description: QuantAI-ETH Quantitative Trading System - General Rules (English)
+description: QuantAI-ETH Development Standards & Code Quality Rules
 globs:
   - "**/*"
 alwaysApply: true
 ---
 
-# QuantAI-ETH - Project Rules
+# QuantAI-ETH - Development Standards & Code Quality Rules
 
-**Full Name**: QuantAI-ETH (Quantitative AI for Ethereum Trading)  
-**Version**: v8.0  
-**Last Updated**: 2025-10-21
+**Project**: QuantAI-ETH (Quantitative AI for Ethereum Trading)  
+**Version**: v9.0  
+**Last Updated**: 2025-01-22
 
 ---
 
-## 🎯 Professional Positioning & Design Goals
+## 🎯 Professional Development Role
 
-**Role**: Professional Quantitative Development Engineer
+**Role**: Professional Quantitative Model Development Engineer
 
-**Core Design Objectives**:
-- High win-rate medium-frequency trading system (≥60% win rate, ≥1.8:1 risk-reward ratio)
-- Model accuracy target: ≥50% (current: improving)
-- Robust risk control (max drawdown <10%)
-- Signal quality over quantity
+**Core Responsibilities**:
+- Maintain highest code quality standards
+- Ensure system reliability and performance
+- Implement robust error handling
+- Follow consistent coding practices
+- Zero tolerance for low-level errors
 
-**Design Philosophy**:
-- Accuracy > Signal frequency
-- Risk control > Aggressive profit
+**Professional Standards**:
 - Code quality > Development speed
+- Accuracy > Signal frequency
 - Long-term stability > Short-term gains
+- Professional engineering practices
 
 ---
 
-## 📋 Project Overview
+## 📋 Code Quality Standards
 
-**QuantAI-ETH** is a production-grade cryptocurrency quantitative trading system using multi-timeframe Stacking ensemble learning for ETH/USDT contract medium-frequency trading.
+### Zero Tolerance for Low-Level Errors
 
-**Core Features**:
-- Multi-timeframe model training (15m/2h/4h independent Stacking models)
-- Stacking ensemble: LightGBM + XGBoost + CatBoost + Meta-learner
-- Real-time signal generation with multi-model weighted synthesis
-- Signal caching mechanism (independent cache per timeframe)
-- Warmup signal protection (first 5 signals are record-only)
-- Automated trade execution and risk management
-- WebSocket real-time data stream processing
-
-**Tech Stack**: Python 3.12+ | FastAPI | LightGBM + XGBoost + CatBoost | PostgreSQL+TimescaleDB | Redis | React
-
----
-
-## 🎯 Core Architecture Principles
-
-### 1. Stacking Ensemble Model Architecture
-
-**Each timeframe uses independent Stacking ensemble**:
-- Each timeframe contains 4 models: LightGBM, XGBoost, CatBoost, Meta-learner
-- Each has its own scaler and feature list
-- Models are independent and differentiated
-
-**Stacking Training Process**:
-1. Train 3 base models with different data durations for diversity
-2. Generate meta-features from validation predictions
-3. Train meta-learner with HOLD penalty (heavier than base models)
-4. Save all models
-
-**Prohibited**:
-- Sharing models across timeframes
-- Using single model instead of ensemble
-
----
-
-### 2. Signal Generation Architecture
-
-**Correct Signal Flow**:
-- Each timeframe predicts independently and caches results
-- 15m K-line completion triggers signal synthesis
-- Immediate prediction after training to fill all caches
-- 4h data is critical (updated every 4 hours)
-
-**Key Points**:
-- 15m acts as main trigger (70% weight)
-- 2h provides medium-term assistance (25% weight)
-- 4h confirms long-term trend (15% weight, with dynamic adjustment)
-
----
-
-### 3. Warmup Signal Protection
-
-**Safety Mechanism**:
-- First 5 signals are record-only (no trading)
-- Purpose: Observe model stability, ensure fund safety
-- State persisted in Redis, survives restarts
-- Regular training does NOT reset warmup state
-
----
-
-### 4. HOLD Bias Solution
-
-**Problem**: Stacking models tend to over-predict HOLD (70-100%)
-
-**Three-Layer Defense**:
-1. **Layer 1**: Base model HOLD penalty (0.7 weight)
-2. **Layer 2**: Meta-learner HOLD penalty (0.5-0.7 weight, stronger)
-3. **Layer 3**: Dynamic weight reduction for long-term HOLD signals during synthesis
-
-**Key Point**: Meta-learner HOLD penalty must be heavier than base models
-
----
-
-### 5. Data Source Separation
-
-- **Model Training**: Binance API (real-time latest data)
-- **Signal Generation**: WebSocket buffer (primary) → Binance API (fallback)
-- **Database**: Only for frontend display, historical queries, performance analysis
-
----
-
-### 6. No Future Function Principle
-
-**Critical Rules**:
-- Only look at next candle for labels
-- Use time-series split (NOT random split)
-- Never use future data in features
-- Ensure proper temporal ordering
-
----
-
-### 7. Timezone Consistency
-
-**All system timestamps use Asia/Shanghai timezone**
-
----
-
-### 8. WebSocket Subscription Format
-
-**Trading pairs MUST be lowercase** in stream names
-
----
-
-## 🏗️ Key Configuration Parameters
-
-### Label Thresholds (Optimized for Medium-Frequency)
-
-**Current Production Configuration**:
-- 15m: ±0.1% (highly sensitive, HOLD <30%)
-- 2h: ±0.35% (balanced, HOLD <40%)
-- 4h: ±0.5% (stable, HOLD <45%)
-
-**Expected Label Distribution**:
-- 15m: SHORT 32-38%, HOLD 24-32%, LONG 32-38%
-- 2h: SHORT 28-32%, HOLD 36-40%, LONG 28-32%
-- 4h: SHORT 26-30%, HOLD 42-46%, LONG 26-30%
-
----
-
-### Timeframe Weights
-
-**Short-term Strategy Weight Distribution**:
-- 15m: 0.70 (dominant, quick entry detection)
-- 2h: 0.25 (auxiliary, trend filtering)
-- 4h: 0.15 (auxiliary, avoid counter-trend trading)
-
----
-
-## 🎯 Code Quality Standards
-
-### Zero Tolerance for Redundancy
-
-**File Level**:
-- Prohibit creating files with duplicate functionality
-- Prohibit redundant methods (same function exists elsewhere)
-- Delete verification files after completion
-- Similar modules must be merged or inherit from base class
-- Extract functions for code used >2 times
-
-**Common Methods Management**:
-- Place common methods in `backend/app/utils/` or `frontend/src/utils/`
-- Extract same logic as utility functions
-- Avoid copy-pasting same code across files
-
----
-
-### Decoupling Principles
-
-**Single Responsibility**:
-- Each function does one thing only
-- Separate concerns clearly
-
-**Dependency Injection**:
-- Pass dependencies through constructor
-- Avoid direct import of global instances
-
----
-
-## 💻 Code Standards
-
-### Python Code Standards
-
-**Required**:
-- Type hints (must have)
-- Docstrings (must have)
-- Error handling (must have)
-- Logging with emojis for readability
-- Async for I/O operations
-- UTC+8 timezone for all timestamps
-
-**Prohibited**:
-- Future functions in features
-- Random data split (use time-series split)
-- Shared models across timeframes
-- Naive datetime (without timezone)
-- Hardcoded configuration
-- Creating redundant files/methods
-- Modifications without verification
-
----
-
-### TypeScript/React Code Standards
-
-**Required**:
-- Type definitions (interfaces)
-- Function components (preferred)
-- Custom hooks for logic reuse
-
-**Prohibited**:
-- Hardcoded API URLs
-- Direct state mutation
+**Prohibited Errors**:
+- Duplicate variable/function definitions
+- Undefined variable usage
+- Logic errors (inverted conditions)
+- Hardcoded values without constants
 - Missing error handling
-- Missing dependency arrays in useEffect
-- Duplicate logic across components
+- Type errors
+- Timezone inconsistencies
+- Variable naming inconsistencies
+
+**Required Practices**:
+- Complete type hints for all functions
+- Comprehensive error handling (try-except)
+- Clear and accurate comments
+- Consistent variable naming
+- Proper logging with emojis
+- Input validation and assertions
 
 ---
 
-## 🚫 Prohibited Actions
-
-### Code Level
-- Future functions
-- Random train-test split
-- Shared models across timeframes
-- Naive datetime
-- Hardcoded configuration
-- Creating redundant files
-- Not checking code after modifications (ensure no syntax errors)
-- Stopping optimization when accuracy <50% (meaningless below 50%)
-
-### Operation Level
-- Using database data in training/prediction (use API)
-- Missing error handling for critical operations
-- Circular dependencies
-- Uppercase in WebSocket subscriptions (must be lowercase)
-
----
-
-## ✅ Best Practices
-
-### 1. Centralized Configuration
-
-**Differentiated Config**:
-- Prediction days: 15m (15d), 2h (20d), 4h (35d)
-- Training days: 15m (180d), 2h (360d), 4h (540d)
-- Model complexity: 15m (complex), 2h (medium), 4h (simple)
-
-**Magic Numbers**:
-- Define as constants
-- Example: BUFFER_DAYS, WARMUP_SIGNALS, MIN_SIGNAL_INTERVAL
-
----
-
-### 2. Composition Over Inheritance
-
-Use composition for flexibility, inheritance only for clear is-a relationships.
-
----
-
-### 3. Logging Best Practices
-
-**Critical Flow Logs** (must have):
-- Model training start/completion
-- Data fetch success/failure
-- Signal generation full chain tracking
-- Warmup signal clear marking
-- Label distribution (critical metric in production)
-
-**Warning Conditions**:
-- HOLD ratio >60%
-- Accuracy <target threshold
-- Data integrity issues
-
----
-
-## 🏛️ Service Module Responsibility Matrix
-
-| Service Module | Core Responsibility | Should NOT Do |
-|---|---|---|
-| **SignalGenerator** | Signal generation, caching, synthesis, warmup protection | Calculate position size (delegate to position_manager) |
-| **TradingEngine** | Execute trades, virtual/live switching, order management | Generate signals, calculate positions |
-| **PositionManager** | Position calculation (ONLY), query positions, set leverage | Manage local position state |
-| **RiskService** | Calculate risk metrics, generate reports | Block trades (display only) |
-| **MLService** | Model training, prediction, feature engineering | Access database (use API) |
-| **DataService** | WebSocket data stream, buffer management | Model training |
-| **Scheduler** | Schedule periodic tasks (training, updates, checks) | Reset warmup state |
-| **TradingController** | System start/stop, signal routing, session management | Direct trade execution |
-
----
-
-## 🎯 Virtual Trading vs Live Trading
-
-### Trading Modes
-
-**Configuration**:
-- Single field: `TRADING_MODE = "SIGNAL_ONLY"` or `"AUTO"`
-
-**Mode Comparison**:
-
-| Feature | SIGNAL_ONLY (Default) | AUTO |
-|---|---|---|
-| Balance Source | Virtual (100 USDT) | Binance API |
-| Order Type | Virtual (database) | Real (Binance) |
-| Fees | Simulated (0.02% open + 0.05% close) | Real deduction |
-| Risk | Zero risk, strategy testing | Real money risk |
-| Switching | API dynamic switch, no restart | API dynamic switch |
-
----
-
-### Position Calculation Logic
-
-**Unified calculation**:
-- Virtual mode: Use virtual balance (100 USDT)
-- Live mode: Query Binance account balance
-- Same calculation logic for both modes
-- Returns USDT value directly (not converted to quantity)
-
----
-
-### Virtual Order Fees
-
-**Fee Structure**:
-- Open fee: 0.02% (Maker)
-- Close fee: 0.05% (Taker)
-- Net PnL: Price PnL - Open fee - Close fee
-
----
-
-## 🗄️ Caching Strategy & Redis Key Schema
-
-### General Cache Methods
-
-**Base Methods**:
-- `cache_manager.get(key)` - Smart deserialization
-- `cache_manager.set(key, value, expire=None)` - Smart serialization, supports permanent cache
-
----
-
-### Redis Key Naming Convention
-
-| Key Pattern | Purpose | Expiry | Example |
-|-----|---|---|---|
-| `system:*` | System config | Permanent | `system:trading_mode` |
-| `warmup:*` | Warmup state | Permanent | `warmup:signal_counter:ETHUSDT` |
-| `signal:*` | Trading signals | Permanent | `signal:last:ETHUSDT` |
-| `market_data:*` | Market data | 60s | `market_data:ETHUSDT:15m` |
-| `prediction:*` | Model predictions | 300s | `prediction:ETHUSDT` |
-| `account_info` | Account info | 30s | `account_info` |
-| `position_info` | Position info | 30s | `position_info` |
-
----
-
-### Cache Design Principles
-
-**Critical State**: Permanent cache (expire=None)
-**Temporary Data**: Set expiration
-**None Values**: Auto-skip, no error
-
----
-
-## 🔄 Data Flow & State Synchronization
-
-### Warmup State Persistence
-
-**Load on Startup**:
-- Load counter from Redis
-- Continue from previous state
-
-**Save After Each Signal**:
-- Increment counter immediately
-- Persist to Redis
-
-**Never Reset During Training**:
-- Regular training should NOT trigger initial predictions
-- Warmup state persists across training cycles
-
----
-
-### Trading Mode Synchronization
-
-**Sync to Redis on Startup**:
-- Ensure consistency across modules
-
-**Sync on Mode Switch**:
-- Immediate sync to Redis
-- Other modules dynamically read from Redis
-
----
-
-## 🐛 Common Error Patterns & Fixes
-
-### Error 1: datetime Serialization
-
-**Problem**: datetime not JSON serializable  
-**Solution**: Convert to ISO string before saving
-
----
-
-### Error 2: Missing CacheManager Methods
-
-**Problem**: Missing generic get/set methods  
-**Solution**: Implement universal get/set with auto serialization
-
----
-
-### Error 3: None Value Caching
-
-**Problem**: Redis doesn't accept None  
-**Solution**: Check and skip if value is None
-
----
-
-### Error 4: Virtual Mode Balance Query
-
-**Problem**: Querying live balance in SIGNAL_ONLY mode  
-**Solution**: Select balance source based on mode
-
----
-
-### Error 5: WebSocket Error No Reconnect
-
-**Problem**: Only reconnect on close, not on error  
-**Solution**: Trigger reconnect on error as well
-
----
-
-### Error 6: Code Duplication
-
-**Problem**: Same logic in multiple files  
-**Solution**: Centralize in one location, use dependency injection
-
----
-
-## 📊 Configuration Management Best Practices
-
-### Single Source of Truth Principle
-
-- Use one field to control behavior
-- Avoid redundant fields
-- Derivable values should not be stored separately
-
----
-
-### Configuration Read Order
-
-1. `config.py` (defaults)
-2. `.env` file (overrides)
-3. Redis runtime state (dynamic switching)
-4. API calls (immediate effect)
-
----
-
-### Differentiated Configuration
-
-**Critical**: Different timeframes need different configurations based on characteristics:
-- Label thresholds differ by timeframe
-- Training days differ by data needs
-- Model complexity differs by sample size
-
-**Prohibited**: Using same configuration for all timeframes
-
----
-
-## 🔧 Constant Naming Convention
-
-**Module-level constants**: UPPERCASE  
-**Examples**: VIRTUAL_ACCOUNT_BALANCE, WARMUP_SIGNALS, MIN_SIGNAL_INTERVAL
-
-**Prohibited**: Magic numbers without constants
-
----
-
-## 🔄 Async Programming Best Practices
-
-### Correct Async Usage
-
-**I/O Operations**: Must be async  
-**CPU-Intensive**: Can be sync (e.g., model training)
-
-**Prohibited**: Sync I/O blocking event loop
-
----
-
-### Cross-Thread Calls
-
-**From WebSocket callback (thread) to main event loop**:
-- Use `asyncio.run_coroutine_threadsafe()`
-- Pass main event loop reference
-- Save future to prevent GC
-
----
-
-## 🚀 System Optimization Standards
-
-### 1. Performance Optimization Principles
-
-**Key Metrics**:
-- Model accuracy: Target ≥50% (basic), ≥55% (good), ≥60% (excellent)
-- Actual signal accuracy: ≥50% minimum requirement
-- Prediction latency: <1 second target
-- System stability: 99.9% target
-
-**Performance Baselines** (3-class classification):
-- Random guess: 33.3%
-- Basic usable: 50% ← Minimum requirement
-- Good: 55%
-- Excellent: 60%+
-
----
-
-### 2. Optimization Priority
-
-**P0 - Immediate** ⭐⭐⭐:
-- Label threshold configuration fix
-- Confidence threshold adjustment
-- Sample weighting training
-- Time-series cross-validation
-- Enhanced meta-features
-
-**P1 - Short-term** ⭐⭐ (1-2 weeks):
-- Market microstructure features
-- Advanced technical indicators
-- Signal enhancement filtering
-- Drawdown protection mechanism
-
-**P2 - Medium-term** ⭐ (1-2 months):
-- Multi-timeframe feature fusion
-- Dynamic label thresholds
-- Hyperparameter auto-optimization
-- Feature caching mechanism
-
-**P3 - Long-term Exploration**:
-- Multi-target labels
-- Reinforcement learning
-- A/B testing framework
-- Incremental feature calculation
-
----
-
-### 3. Feature Engineering Standards
+## 🔧 Variable Naming Consistency
+
+### Model Key Naming Standards
+
+**Unified Short Keys** (must be consistent across all operations):
+- `'lgb'` - LightGBM model
+- `'xgb'` - XGBoost model  
+- `'cat'` - CatBoost model
+- `'meta'` - Meta-learner model
+- `'inf'` - Informer-2 model
+
+**Usage Consistency**:
+- Save operations: Use short keys
+- Load operations: Use short keys
+- Prediction operations: Use short keys
+- Model storage: Use short keys
 
 **Prohibited**:
-- Adding future functions (using future data)
-- Overfitting (features > samples/10)
-- Duplicate features (correlation >0.95)
-- Ignoring outlier handling
-
-**Best Practices**:
-- Feature standardization/normalization
-- Remove high missing-rate features (>20%)
-- Feature importance analysis (keep top features)
-- Cross-validation to prevent overfitting
-- Incremental calculation for efficiency
+- Mixing long and short key names
+- Inconsistent naming across modules
+- Hardcoded model names
 
 ---
 
-### 4. Model Training Standards
+## 📝 Method Consistency Standards
 
-**Differentiated Configuration** (must follow):
-- Label thresholds: 15m (±0.1%), 2h (±0.35%), 4h (±0.5%)
-- Training days: 15m (180d), 2h (270d), 4h (360d)
-- Model complexity: 15m (high), 2h (medium), 4h (low)
+### Function Signature Consistency
 
-**Sample Weighting Strategy**:
-1. Class weights (solve imbalance)
-2. Time decay weights (emphasize recent data)
-3. HOLD penalty (reduce HOLD bias)
-4. Combined weights application
+**Required Elements**:
+- Type hints for all parameters
+- Return type annotations
+- Docstrings with Args/Returns
+- Consistent parameter ordering
+- Error handling in all public methods
 
----
+**Naming Conventions**:
+- Methods: `snake_case`
+- Classes: `PascalCase`
+- Constants: `UPPERCASE`
+- Private methods: `_leading_underscore`
 
-### 5. Risk Management Standards
-
-**Dynamic Position Sizing** (when enabled):
-- Base ratio: 10% × confidence
-- Volatility adjustment: 0.5-1.5x
-- Exposure adjustment: 0.5-1.0x
-- Loss protection: 0.5-1.0x
-- Final limit: 2%-15%
-
-**Full Position Mode** (default):
-- Position value = Available balance × Leverage
-- Suitable for medium-frequency with high confidence
-
-**Drawdown Protection** (enforced):
-- >15%: Suspend trading
-- >10%: Reduce position to 50%
-- >5%: Reduce position to 75%
-- <3%: Resume normal trading
+**Prohibited**:
+- Methods without type hints
+- Missing docstrings
+- Inconsistent parameter names
+- Methods without error handling
 
 ---
 
-### 6. System Performance Standards
+## 💬 Comment Consistency Standards
 
-**Response Time Requirements**:
+### Documentation Requirements
+
+**Function Comments**:
+```python
+def method_name(param1: Type, param2: Type) -> ReturnType:
+    """
+    Brief description of method purpose.
+    
+    Args:
+        param1: Description of parameter
+        param2: Description of parameter
+    
+    Returns:
+        Description of return value
+    
+    Raises:
+        ExceptionType: When this exception occurs
+    """
+```
+
+**Class Comments**:
+```python
+class ClassName:
+    """
+    Brief description of class purpose.
+    
+    Attributes:
+        attr1: Description of attribute
+        attr2: Description of attribute
+    """
+```
+
+**Inline Comments**:
+- Explain complex logic
+- Mark TODO items with `# TODO: description`
+- Mark FIXME items with `# FIXME: description`
+- Use clear, concise language
+
+**Prohibited**:
+- Comments that don't add value
+- Outdated comments
+- Comments that contradict code
+- Missing docstrings for public methods
+
+---
+
+## 🏗️ Architecture Consistency
+
+### Module Responsibility Standards
+
+**Single Responsibility Principle**:
+- Each module has one clear purpose
+- Clear separation of concerns
+- Minimal coupling between modules
+- High cohesion within modules
+
+**Service Module Standards**:
+- Consistent interface patterns
+- Standardized error handling
+- Uniform logging practices
+- Consistent configuration management
+
+**Prohibited**:
+- Modules with multiple responsibilities
+- Circular dependencies
+- Tight coupling between modules
+- Inconsistent error handling patterns
+
+---
+
+## 🔍 Error Handling Standards
+
+### Comprehensive Error Management
+
+**Required Error Handling**:
+- All I/O operations must have try-except
+- Database operations must handle connection errors
+- API calls must handle network errors
+- File operations must handle permission errors
+
+**Error Logging Standards**:
+```python
+try:
+    # Operation
+    result = risky_operation()
+except SpecificException as e:
+    logger.error(f"Operation failed: {e}")
+    logger.error(traceback.format_exc())
+    raise
+except Exception as e:
+    logger.error(f"Unexpected error: {e}")
+    logger.error(traceback.format_exc())
+    raise
+```
+
+**Prohibited**:
+- Bare except clauses
+- Silent error handling
+- Generic error messages
+- Missing error context
+
+---
+
+## 📊 Data Validation Standards
+
+### Input Validation Requirements
+
+**Mandatory Validations**:
+- Array shape validation with assertions
+- Data type checking
+- Range validation
+- Null/None checks
+- Time series ordering validation
+
+**Validation Patterns**:
+```python
+# Shape validation
+assert array.shape == expected_shape, f"Shape error: {array.shape} != {expected_shape}"
+
+# Type validation
+if not isinstance(data, expected_type):
+    raise TypeError(f"Expected {expected_type}, got {type(data)}")
+
+# Range validation
+if not (min_val <= value <= max_val):
+    raise ValueError(f"Value {value} out of range [{min_val}, {max_val}]")
+```
+
+**Prohibited**:
+- Operations without validation
+- Silent data corruption
+- Missing shape checks
+- Unvalidated user input
+
+---
+
+## 🚀 Performance Standards
+
+### Code Performance Requirements
+
+**Response Time Targets**:
 - Feature calculation: <500ms
 - Model prediction: <200ms
 - Signal generation: <1000ms
-- Order execution: <2000ms
+- Database queries: <100ms
 
-**Optimization Strategies**:
-- Feature caching (last 100)
-- Incremental calculation (only new candles)
-- GPU acceleration (if available)
-- Async concurrency (I/O operations)
+**Optimization Practices**:
+- Use async for I/O operations
+- Implement caching for repeated calculations
+- Avoid unnecessary loops
+- Use vectorized operations when possible
 
----
-
-### 7. Monitoring Metrics
-
-**Must Monitor**:
-- Model accuracy (after each training)
-- Actual signal accuracy (real-time)
-- Win rate (7d/30d)
-- Risk-reward ratio (7d/30d)
-- Max drawdown (real-time)
-- Sharpe ratio (30d)
-- Signal count (daily average)
-- System latency (p99)
-
-**Alert Thresholds**:
-- Win rate <45%: Send alert
-- Drawdown >10%: Emergency alert
-- Accuracy <40%: Model needs retraining
-- Latency p99 >3s: Performance alert
+**Prohibited**:
+- Blocking I/O in main thread
+- Inefficient algorithms
+- Memory leaks
+- Unnecessary database queries
 
 ---
 
-## 🎓 Professional Engineer Code Standards
+## 🧪 Testing Standards
 
-**Zero Tolerance Errors**:
-- Duplicate definitions
-- Undefined variable usage
-- Logic errors (inverted conditions)
-- Hardcoded values
-- Missing error handling
-- Future functions
-- Timezone errors
-- Type errors
+### Code Testing Requirements
+
+**Test Coverage Requirements**:
+- Unit tests for all public methods
+- Integration tests for critical paths
+- Error condition testing
+- Performance regression testing
+
+**Test Quality Standards**:
+- Clear test names describing what is tested
+- Proper setup and teardown
+- Mock external dependencies
+- Assert meaningful conditions
+
+**Prohibited**:
+- Tests without assertions
+- Tests that depend on external state
+- Flaky tests
+- Missing error condition tests
 
 ---
 
-### Code Quality Checklist
+## 📚 Code Review Checklist
 
-**Before Each Commit**:
-- [ ] No duplicate definitions (features, variables, functions)
-- [ ] No undefined variable usage
+### Pre-Commit Validation
+
+**Code Quality Checklist**:
+- [ ] No duplicate definitions
 - [ ] All variables defined before use
 - [ ] Complete type hints
 - [ ] Comprehensive error handling
 - [ ] Sufficient logging
 - [ ] Clear and accurate comments
 - [ ] No hardcoded constants
-- [ ] No magic numbers
+- [ ] Consistent naming conventions
 - [ ] Pass syntax check
 - [ ] Pass unit tests
 - [ ] Code format compliant
 
----
-
-### Feature Engineering Professional Standards
-
-**Strict Rules**:
-1. Feature name uniqueness check (mandatory)
-2. Check existence before adding feature
-3. Use comments to mark feature source (avoid duplication)
-4. Group features by category
-
-**Feature Naming**:
-- Clear and semantic
-- Include parameters if applicable
-- Express intent clearly
-
-**Feature Validation** (must validate):
-1. Check duplicate features
-2. Check NaN ratio (<20%)
-3. Check numerical range (no infinity)
-4. Check feature count vs sample ratio (>50:1)
+**Architecture Review**:
+- [ ] Single responsibility maintained
+- [ ] No circular dependencies
+- [ ] Consistent interface patterns
+- [ ] Proper separation of concerns
+- [ ] Error handling implemented
+- [ ] Performance requirements met
 
 ---
 
-### Machine Learning Professional Standards
+## 🔧 Development Tools Standards
 
-**Training Flow** (strict order):
-1. Data acquisition (API, auto-batch if >1500 records)
-2. Feature engineering
-3. Label creation (must pass timeframe parameter)
-4. Feature preparation (must pass timeframe parameter)
-5. Scaling (must pass timeframe parameter)
-6. Time-series split (NOT random)
-7. Model training
-8. Save to dictionary
+### Required Development Practices
 
-**Data Acquisition & Sorting** (triple guarantee):
-1. Reverse batch order (new→old to old→new)
-2. Convert and deduplicate
-3. Explicit sorting (100% ensure old→new)
-4. Set index
+**Code Formatting**:
+- Use consistent indentation (4 spaces)
+- Follow PEP 8 for Python
+- Use consistent quote style
+- Proper line length (max 120 characters)
 
----
+**Version Control**:
+- Clear commit messages
+- Atomic commits
+- Proper branch naming
+- Code review before merge
 
-### Data Validation Standards
-
-**Mandatory Checks**:
-1. Basic check (not empty)
-2. Required columns check
-3. Data type check
-4. Data range check (high≥low, high≥close, etc.)
-5. Time ordering check (monotonic increasing)
-6. Duplicate data check (by timestamp)
+**Documentation**:
+- Keep README updated
+- Document API changes
+- Maintain changelog
+- Update configuration documentation
 
 ---
 
-### Label Creation Standards
+## 🎓 Professional Engineer Standards
 
-**Strict Requirements**:
-- Only look at next candle
-- Use differentiated threshold configuration
-- Three-class labels: SHORT (0), HOLD (1), LONG (2)
-- Validate label distribution (20-50% per class)
+### Code Quality Metrics
 
----
+**Quality Targets**:
+- Zero syntax errors
+- Zero runtime errors in production
+- 100% type hint coverage
+- 90%+ test coverage
+- <1% code duplication
 
-## 📚 Testing Requirements
+**Performance Metrics**:
+- Response time within targets
+- Memory usage optimization
+- CPU usage efficiency
+- Database query optimization
 
-### Model Training Tests
-- Data fetch success
-- Data sorting correct (old→new)
-- Label distribution balanced (30-35% each class)
-- Accuracy meets target
-- Model files saved
-
-### Signal Generation Tests
-- Initial prediction on startup
-- Independent prediction per timeframe
-- Only 15m triggers synthesis
-- Weighted synthesis correct
-- Confidence filtering works
-- Signal deduplication works
-
-### Warmup Signal Tests
-- First 5 signals record-only
-- 6th signal trades normally
-- Clear log marking of warmup/official status
-
-### WebSocket Tests
-- Subscription format correct (lowercase)
-- Real-time data reception
-- Completed candles processed correctly
-- Buffer updates normally
-
-### Data Integrity Tests
-- Batch fetch data sorted correctly
-- Deduplication works
-- PostgreSQL write is idempotent
-
----
-
-## 🚀 Phase 1 Optimization Implementation Standards
-
-### Intelligent Feature Selection (mandatory)
-
-**Two-Stage Selection**:
-- Stage 1: Filter low-importance features (fast)
-- Stage 2: Embedded selection (precise)
-
-**Dynamic Budget Calculation**:
-- Adaptive to sample count
-- Prevent overfitting
-- Differentiated by timeframe
-
-**Sample/Feature Ratio**:
-- >100:1 ideal
-- >50:1 acceptable
-- <50:1 overfitting risk
-
----
-
-### Sample Weighting Training (must enable)
-
-**Purpose**: Solve class imbalance, emphasize recent data
-
-**Weighting Strategy**:
-1. Class weights (balance classes)
-2. Time decay weights (recent data more important)
-3. HOLD penalty (reduce HOLD bias)
-4. Combined application
-
----
-
-### Market Microstructure Features (enhanced)
-
-**Feature Categories** (30+ new features):
-1. Price position
-2. Candlestick patterns
-3. Candlestick strength
-4. Trend continuation
-5. Price dynamics
-6. Volatility range
-
-**Prohibited**:
-- Using future data
-- Adding high missing-rate features (>20%)
-- Duplicate existing features
-
----
-
-### Market Sentiment Features (added)
-
-**New Features** (15+):
-1. Fear index
-2. Trend fatigue
-3. RSI sentiment
-4. Price-volume relationship
-5. Composite sentiment
-
----
-
-### Dynamic Stop-Loss/Take-Profit (enforced)
-
-**Data Source**: Binance API (must fetch in real-time)
-
-**Calculation**:
-1. Fetch 50 candles to calculate ATR
-2. Stop-loss: ±1.5 × ATR
-3. Take-profit: Based on confidence (3.0-4.0 × ATR)
-4. Trailing stop: 1.0 × ATR
-
-**Fallback**: Fixed percentage stop-loss (±1.5%/±3-4%)
-
----
-
-## 🔍 Phase 1 Optimization Verification Checklist
-
-### Training Phase
-
-- [ ] Sample weighting log shows: "Sample weighting enabled"
-- [ ] Label distribution meets expectations (HOLD 28-45%)
-- [ ] Microstructure features calculated successfully (30+ features)
-- [ ] Sentiment features calculated successfully (15+ features)
-- [ ] Model accuracy ≥48%
-
-### Signal Generation Phase
-
-- [ ] Dynamic position log shows all adjustment factors
-- [ ] ATR stop-loss calculation log complete
-- [ ] Risk-reward ratio ≥1.8:1
-- [ ] Signal count increases
-
-### Performance Validation
-
-- [ ] Actual signal accuracy ≥50% (observe 20+ signals)
-- [ ] No over-trading (daily average <10 signals)
-- [ ] Virtual trading profitable (after fees)
-
----
-
-## 📚 Reference Documentation
-
-- **Optimization Roadmap**: `OPTIMIZATION_ROADMAP.md`
-- **Backend Rules**: `.cursor/rules/backend.mdc`
-- **Frontend Rules**: `.cursor/rules/frontend.mdc`
-- **Deployment**: `DEPLOYMENT.md`
-- **Project Summary**: `PROJECT_SUMMARY.md`
-- **Bug Fix Records**: `docs/CRITICAL_*.md`
-
----
-
-## 🎯 Latest Optimizations (2025-10-21)
-
-### Time-Series Cross-Validation
-
-**Implementation**: 5-fold TimeSeriesSplit  
-**Purpose**: More reliable accuracy evaluation  
-**Expected**: +1-2% accuracy improvement
-
----
-
-### Enhanced Meta-Features
-
-**Expansion**: 9 → 20 meta-features
-
-**New Features**:
-1. Model agreement (consistency)
-2. Max probability per model (confidence)
-3. Probability entropy (uncertainty)
-4. Average probability (ensemble baseline)
-5. Probability std (model disagreement)
-
-**Expected**: +3-5% accuracy improvement
-
----
-
-### Dynamic HOLD Penalty
-
-**Adaptive Strategy**:
-- HOLD >40%: penalty 0.5 (heavy)
-- HOLD >35%: penalty 0.6 (medium)
-- HOLD ≤35%: penalty 0.7 (light)
-
-**Purpose**: Auto-adjust based on data distribution
-
----
-
-### Virtual Position Real-time Monitoring
-
-**Implementation**:
-- WebSocket ticker push → Real-time check
-- Memory cache (zero DB queries)
-- Immediate close on trigger
-
-**Performance**: Database queries from 10/sec → 0/sec
-
----
-
-### Position Calculation Simplification
-
-**Changes**:
-- Virtual account: 10000U → 100U
-- Position unit: Quantity → USDT value
-- Full position: 100U × 20x = 2000 USDT
+**Maintainability Standards**:
+- Clear code structure
+- Consistent patterns
+- Comprehensive documentation
+- Easy to understand logic
 
 ---
 
 ## 🚨 Critical Rules Summary
 
-1. **No Redundancy**: One function, one implementation
-2. **High Cohesion, Low Coupling**: Modules independent, interfaces clear
-3. **Safety First**: Warmup protection, fund safety
-4. **No Future Functions**: Only use past and current data
-5. **Time-Series Split**: Never use random split
-6. **Differentiated Config**: Different settings per timeframe
-7. **Single Responsibility**: Each service does one thing
-8. **Error Handling**: All critical operations must have try-except
-9. **Strict Validation**: Verify array dimensions at each step
+1. **Variable Naming**: Consistent short keys across all operations
+2. **Method Consistency**: Uniform signatures and error handling
+3. **Comment Quality**: Clear, accurate, and up-to-date documentation
+4. **Error Handling**: Comprehensive try-except blocks
+5. **Data Validation**: Assertions and type checking
+6. **Performance**: Meet response time targets
+7. **Testing**: Complete test coverage
+8. **Code Review**: Follow checklist before commits
+9. **Architecture**: Single responsibility and loose coupling
 10. **Professional Standards**: Zero tolerance for low-level errors
 
 ---
 
-**Version**: v8.0  
-**Last Update**: 2025-10-21  
-**Update Content**:
-- Added time-series cross-validation (5-fold)
-- Enhanced meta-features (9→20)
-- Dynamic HOLD penalty
-- Virtual position real-time monitoring
-- Position calculation simplification
-- Strict array dimension validation
-- Professional code quality standards
-
-**Scope**: Full project (frontend + backend)
+**Version**: v9.0  
+**Last Update**: 2025-01-22  
+**Focus**: Development standards and code quality  
+**Scope**: All project files and modules

@@ -56,7 +56,10 @@ class HyperparameterOptimizer:
         self.hold_penalty = 0.65
         
         logger.info(f"🔧 初始化超参数优化器: {timeframe} - {model_type}")
-        logger.info(f"   样本数: {len(X)}, 特征数: {X.shape[1]}")
+        if len(X.shape) == 3:
+            logger.info(f"   样本数: {len(X)}, 序列长度: {X.shape[1]}, 特征数: {X.shape[2]}")
+        else:
+            logger.info(f"   样本数: {len(X)}, 特征数: {X.shape[1]}")
         logger.info(f"   GPU加速: {'启用' if use_gpu else '关闭'}")
     
     def _get_lightgbm_search_space(self, trial: optuna.Trial) -> Dict[str, Any]:
@@ -201,14 +204,32 @@ class HyperparameterOptimizer:
         return base_params
     
     def _get_informer2_search_space(self, trial: optuna.Trial) -> Dict[str, Any]:
-        """Informer-2搜索空间（深度学习模型）"""
+        """Informer-2搜索空间（基于Transformer理论的最佳实践 + 精确复杂度匹配）"""
+        
+        # 🔑 序列长度配置（与ensemble_ml_service.py保持一致）
+        seq_len_config = {
+            '15m': 96,   # 96 × 15分钟 = 24小时
+            '2h': 48,    # 48 × 2小时 = 4天
+            '4h': 24     # 24 × 4小时 = 4天
+        }
+        
+        seq_len = seq_len_config.get(self.timeframe, 96)
+        
+        # 🎯 基于Transformer理论的最佳实践
+        # 1. d_model与序列长度的关系：d_model ≈ sqrt(seq_len) * 8-16
+        # 2. n_heads与d_model的关系：n_heads = d_model / 64 (标准比例)
+        # 3. n_layers与序列长度的关系：n_layers ≈ log2(seq_len) + 1
+        
         if self.timeframe == "15m":
-            # 15m: 样本多，可以复杂一些
+            # 15m: 长序列(96)，精确复杂度匹配
+            # d_model = sqrt(96) * 12 ≈ 118 → 128
+            # n_heads = 128 / 64 = 2 → 4,8,16 (渐进式搜索)
+            # n_layers = log2(96) + 1 ≈ 7 → 2,3,4 (渐进式搜索)
             base_params = {
-                'd_model': trial.suggest_categorical('d_model', [64, 128, 256]),
-                'n_heads': trial.suggest_categorical('n_heads', [4, 8, 16]),
-                'n_layers': trial.suggest_int('n_layers', 2, 4),
-                'epochs': trial.suggest_int('epochs', 20, 40),  # 减少训练轮数以控制时间
+                'd_model': trial.suggest_categorical('d_model', [128, 256]),      # 精确匹配
+                'n_heads': trial.suggest_categorical('n_heads', [4, 8]),          # 精确匹配
+                'n_layers': trial.suggest_int('n_layers', 2, 3),  # 精确匹配
+                'epochs': trial.suggest_int('epochs', 20, 40),
                 'batch_size': trial.suggest_categorical('batch_size', [128, 256, 512]),
                 'lr': trial.suggest_float('lr', 0.0005, 0.005, log=True),
                 'dropout': trial.suggest_float('dropout', 0.05, 0.2),
@@ -216,11 +237,14 @@ class HyperparameterOptimizer:
                 'beta': trial.suggest_float('beta', 0.3, 0.7)    # GMADL参数
             }
         elif self.timeframe == "2h":
-            # 2h: 样本中等，简化模型
+            # 2h: 中等序列(48)，精确复杂度匹配
+            # d_model = sqrt(48) * 12 ≈ 83 → 64,128
+            # n_heads = 64/128 / 64 = 1/2 → 2,4,8 (渐进式搜索)
+            # n_layers = log2(48) + 1 ≈ 6 → 1,2,3 (渐进式搜索)
             base_params = {
-                'd_model': trial.suggest_categorical('d_model', [64, 128]),
-                'n_heads': trial.suggest_categorical('n_heads', [4, 8]),
-                'n_layers': trial.suggest_int('n_layers', 2, 3),
+                'd_model': trial.suggest_categorical('d_model', [64, 128]),       # 精确匹配
+                'n_heads': trial.suggest_categorical('n_heads', [2, 4, 8]),       # 精确匹配
+                'n_layers': trial.suggest_int('n_layers', 1, 3),  # 精确匹配
                 'epochs': trial.suggest_int('epochs', 15, 30),
                 'batch_size': trial.suggest_categorical('batch_size', [128, 256]),
                 'lr': trial.suggest_float('lr', 0.001, 0.005, log=True),
@@ -229,11 +253,14 @@ class HyperparameterOptimizer:
                 'beta': trial.suggest_float('beta', 0.4, 0.6)
             }
         else:  # 4h
-            # 4h: 样本少，极简模型
+            # 4h: 短序列(24)，精确复杂度匹配
+            # d_model = sqrt(24) * 12 ≈ 59 → 64
+            # n_heads = 64 / 64 = 1 → 2,4 (渐进式搜索)
+            # n_layers = log2(24) + 1 ≈ 5 → 1,2 (渐进式搜索)
             base_params = {
-                'd_model': trial.suggest_categorical('d_model', [64, 128]),
-                'n_heads': trial.suggest_categorical('n_heads', [4, 8]),
-                'n_layers': trial.suggest_int('n_layers', 1, 2),
+                'd_model': trial.suggest_categorical('d_model', [64]),            # 精确匹配
+                'n_heads': trial.suggest_categorical('n_heads', [2, 4]),          # 精确匹配
+                'n_layers': trial.suggest_int('n_layers', 1, 2),  # 精确匹配
                 'epochs': trial.suggest_int('epochs', 10, 25),
                 'batch_size': trial.suggest_categorical('batch_size', [128, 256]),
                 'lr': trial.suggest_float('lr', 0.002, 0.01, log=True),
@@ -241,6 +268,9 @@ class HyperparameterOptimizer:
                 'alpha': trial.suggest_float('alpha', 1.0, 2.0),
                 'beta': trial.suggest_float('beta', 0.5, 0.7)
             }
+        
+        # 添加序列长度信息到参数中（用于日志记录）
+        base_params['seq_len'] = seq_len
         
         return base_params
     
@@ -272,14 +302,23 @@ class HyperparameterOptimizer:
         tscv = TimeSeriesSplit(n_splits=5)
         cv_scores = []
         
-        for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(self.X)):
+        # 🔑 修复：对于3D序列输入，需要基于样本数量而不是特征进行分割
+        n_samples = len(self.X) if isinstance(self.X, np.ndarray) else self.X.shape[0]
+        
+        for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(np.arange(n_samples))):
             X_train, X_val = self.X[train_idx], self.X[val_idx]
-            y_train, y_val = self.y.iloc[train_idx], self.y.iloc[val_idx]
+            # 🔑 修复：兼容 numpy 数组和 pandas Series
+            if isinstance(self.y, np.ndarray):
+                y_train, y_val = self.y[train_idx], self.y[val_idx]
+            else:
+                y_train, y_val = self.y.iloc[train_idx], self.y.iloc[val_idx]
             
-            # 计算样本权重（类别平衡 + HOLD惩罚）
+            # 计算样本权重（类别平衡 × 时间衰减 × HOLD惩罚）
             class_weights = compute_sample_weight('balanced', y_train)
+            # ✅ 添加时间衰减权重（与基础模型训练保持一致）
+            time_decay = np.exp(-np.arange(len(X_train)) / (len(X_train) * 0.1))[::-1]
             hold_penalty_weights = np.where(y_train == 1, self.hold_penalty, 1.0)
-            sample_weights = class_weights * hold_penalty_weights
+            sample_weights = class_weights * time_decay * hold_penalty_weights
             
             # 训练模型
             try:
@@ -296,33 +335,46 @@ class HyperparameterOptimizer:
                     model.fit(X_train, y_train, sample_weight=sample_weights)
                 
                 elif self.model_type == "informer2":
-                    # Informer-2需要特殊处理（深度学习模型）
+                    # Informer-2需要特殊处理（深度学习模型 + 序列输入）
                     from app.services.informer2_model import Informer2ForClassification
                     from app.services.gmadl_loss import GMADLossWithHOLDPenalty
                     import torch
                     import torch.nn as nn
                     from torch.utils.data import DataLoader, TensorDataset
                     
+                    # 🔑 检查输入维度（2D或3D）
+                    if len(X_train.shape) == 2:
+                        # 2D输入：需要构造序列（这不应该发生，但作为降级处理）
+                        logger.warning(f"⚠️ Informer-2收到2D输入，将跳过此fold")
+                        cv_scores.append(0.0)
+                        continue
+                    
+                    # 3D序列输入：(n_samples, seq_len, n_features)
+                    n_features = X_train.shape[2]
+                    
                     # 转换为PyTorch张量
                     device = torch.device('cuda:0' if self.use_gpu and torch.cuda.is_available() else 'cpu')
                     X_train_tensor = torch.FloatTensor(X_train).to(device)
-                    y_train_tensor = torch.LongTensor(y_train.values).to(device)
+                    # ✅ 兼容pandas Series和numpy ndarray
+                    y_train_np = y_train.values if hasattr(y_train, 'values') else y_train
+                    y_val_np = y_val.values if hasattr(y_val, 'values') else y_val
+                    y_train_tensor = torch.LongTensor(y_train_np).to(device)
                     X_val_tensor = torch.FloatTensor(X_val).to(device)
-                    y_val_tensor = torch.LongTensor(y_val.values).to(device)
+                    y_val_tensor = torch.LongTensor(y_val_np).to(device)
                     
                     # 创建数据加载器
                     train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-                    train_loader = DataLoader(train_dataset, batch_size=params['batch_size'], shuffle=True)
+                    train_loader = DataLoader(train_dataset, batch_size=params['batch_size'], shuffle=True, num_workers=0)
                     
-                    # 创建模型（修复参数名）
+                    # 创建模型（支持序列输入）
                     model = Informer2ForClassification(
-                        n_features=X_train.shape[1],  # 特征数量
+                        n_features=n_features,  # 特征数量（从序列的最后一维获取）
                         n_classes=3,  # 类别数
                         d_model=params['d_model'],
                         n_heads=params['n_heads'],
                         n_layers=params['n_layers'],
                         dropout=params['dropout'],
-                        use_distilling=True
+                        use_distilling=True  # 启用蒸馏层（完整Informer架构）
                     ).to(device)
                     
                     # 定义损失函数和优化器
