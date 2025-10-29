@@ -71,15 +71,13 @@ class SignalGenerator:
         self.signal_counter = 0  # 信号计数器（启动时会从Redis加载）
         
         # 缓冲区设计：按天数统一（所有时间框架覆盖相同天数）
-        self.buffer_days = 60  # 统一60天覆盖范围（训练180天的1/3）
+        self.buffer_days = 30  # 统一30天覆盖范围（超短线策略，较短缓冲）
         
         # 根据时间框架计算实际需要的K线数量
         self.buffer_sizes = {
-            '15m': int(self.buffer_days * 24 * 4),    # 60天 = 5760条
-            '1h':  int(self.buffer_days * 24),        # 60天 = 1440条
-            '2h':  int(self.buffer_days * 12),        # 60天 = 720条
-            '4h':  int(self.buffer_days * 6),         # 60天 = 360条
-            '1d':  int(self.buffer_days * 1),         # 60天 = 60条
+            '3m': int(self.buffer_days * 24 * 20),   # 30天 = 14400条（3分钟）
+            '5m': int(self.buffer_days * 24 * 12),   # 30天 = 8640条（5分钟）
+            '15m': int(self.buffer_days * 24 * 4)    # 30天 = 2880条（15分钟）
         }
         
         # 注册数据回调
@@ -253,12 +251,12 @@ class SignalGenerator:
                 logger.warning(f"❌ {timeframe} 预测失败")
                 return
             
-            # 3. 🔥 只有15m信号更新时才触发合成（15m作为主时间框架）
-            if timeframe != settings.TIMEFRAMES[0]:
-                logger.debug(f"⏭️ {timeframe} 信号已缓存，等待15m触发合成")
+            # 3. 🔥 只有5m信号更新时才触发合成（5m作为主时间框架）
+            if timeframe != '5m':
+                logger.debug(f"⏭️ {timeframe} 信号已缓存，等待5m触发合成")
                 return
             
-            logger.debug(f"🔄 15m信号更新，触发合成 (当前已缓存: {list(self.cached_predictions.keys())})")
+            logger.debug(f"🔄 5m信号更新，触发合成 (当前已缓存: {list(self.cached_predictions.keys())})")
             
             # 🔥 预热计数应该在尝试合成前就+1（不管是否HOLD）
             self.signal_counter += 1
@@ -420,13 +418,13 @@ class SignalGenerator:
         try:
             from app.services.binance_client import binance_client
             
-            # 确定需要的数据量
+            # 确定需要的数据量（超短线策略：较短周期）
             prediction_days_config = {
-                '15m': 15,   # 15天=1440条
-                '2h': 20,    # 20天=240条
-                '4h': 35     # 35天=210条
+                '3m': 10,    # 10天=4800条（超短期）
+                '5m': 10,    # 10天=2880条（主时间框架）
+                '15m': 10    # 10天=960条（趋势确认）
             }
-            prediction_days = prediction_days_config.get(timeframe, 35)
+            prediction_days = prediction_days_config.get(timeframe, 10)
             
             interval_minutes = {
                 '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30,
@@ -478,12 +476,13 @@ class SignalGenerator:
                 return None
             
             # 如果不是所有时间框架都有预测，可以继续（使用已有的）
-            # 但至少需要15m
-            if '15m' not in self.cached_predictions:
-                logger.warning("❌ 缺少15m信号，无法合成")
+            # ✅ 5m是主时间框架，必须要有；其他时间框架（3m、15m）是辅助的，有则用，无则忽略
+            if '5m' not in self.cached_predictions:
+                logger.warning("❌ 缺少5m主信号，无法合成")
                 return None
             
             # 合成信号（合成过程中的日志已在_synthesize_signal中输出）
+            # 只要有5m信号就可以合成，其他时间框架（3m、15m）有则用，无则忽略（辅助作用）
             signal = await self._synthesize_signal(symbol, self.cached_predictions)
             
             # 如果没有信号（HOLD或其他原因），直接返回
@@ -549,9 +548,9 @@ class SignalGenerator:
             # ✅ 差异化预测天数：每个时间框架使用最优配置
             # 原则：确保特征完整（最长窗口200期）+ 适合时间框架特性
             prediction_days_config = {
-                '15m': 15,   # 15天=1440条 (短期敏感，快速响应)
-                '2h': 20,    # 20天=240条 (中期平衡)
-                '4h': 35     # 35天=210条 (长期稳定，确保200期特征)
+                '3m': 10,    # 10天=4800条（超短期，高频样本）
+                '5m': 10,    # 10天=2880条（主时间框架，快速响应）
+                '15m': 10    # 10天=960条（趋势确认）
             }
             
             # 时间周期对应的分钟数
@@ -626,15 +625,15 @@ class SignalGenerator:
                 logger.warning("⚠️ 没有可用的预测数据，无法合成信号")
                 return None
             
-            # 时间框架权重（短线交易策略：以15m为主导）
+            # 时间框架权重（超短线交易策略：以5m为主导）
             # 差异化训练天数后的数据量：
-            # 15m: 17,280条/180天 (训练13.8k) ✅ 充足，捕捉短期机会
-            # 2h:  4,320条/360天  (训练3.5k)  ✅ 更充足，趋势过滤 ⬆️ 增加
-            # 4h:  3,240条/540天  (训练2.6k)  ✅ 大幅增加，大趋势确认 ⬆️ 增加
+            # 3m:  57,600条/120天 (训练46k)  ✅ 超短期辅助，快速反应
+            # 5m:  34,560条/120天 (训练27.6k) ✅ 主导，捕捉短期入场点
+            # 15m: 11,520条/120天 (训练9.2k)  ✅ 中期辅助，趋势过滤
             timeframe_weights = {
-                '15m': 0.70,   # 🎯 短线主导：提高权重，快速捕捉入场点
-                '2h': 0.20,    # 中期辅助：趋势过滤
-                '4h': 0.10     # 长期辅助：避免逆势交易（权重低，避免4h信号长时间主导）
+                '3m': 0.15,    # 超短期辅助：捕捉极短期波动
+                '5m': 0.70,    # 🎯 短线主导：提高权重，快速捕捉入场点
+                '15m': 0.15    # 中期辅助：趋势确认，避免逆势交易
             }
             
             # 计算加权信号（动态权重：长周期HOLD时降权）
@@ -646,11 +645,11 @@ class SignalGenerator:
                 probabilities = prediction.get('probabilities', {})
                 signal = prediction.get('signal_type')
                 
-                # 🔑 动态权重调整：如果长周期（2h/4h）是HOLD且置信度高，大幅降低权重
-                if timeframe in ['2h', '4h'] and signal == 'HOLD':
+                # 🔑 动态权重调整：如果长周期（15m）是HOLD且置信度高，大幅降低权重
+                if timeframe in ['15m'] and signal == 'HOLD':
                     hold_confidence = prediction.get('confidence', 0)
                     if hold_confidence > 0.65:
-                        # HOLD置信度很高时，权重减半（避免压制15m）
+                        # HOLD置信度很高时，权重减半（避免压制5m）
                         weight = base_weight * 0.5
                         logger.debug(f"   {timeframe} HOLD高置信度({hold_confidence:.2f})，权重{base_weight}→{weight}")
                     else:
@@ -1010,16 +1009,16 @@ class SignalGenerator:
             
             # 3. 波动率过滤（避免在极端波动时交易）
             try:
-                # 获取最新15m K线数据来计算波动率
-                buffer_data = self.kline_buffers.get(symbol, {}).get('15m', [])
-                if len(buffer_data) >= 20:
-                    recent_closes = [k['close'] for k in buffer_data[-20:]]
+                # 获取最新5m K线数据来计算波动率（主时间框架）
+                buffer_data = self.kline_buffers.get('5m', [])
+                if len(buffer_data) >= 60:  # 5m需要更多样本（60个=5小时）
+                    recent_closes = [k['close'] for k in buffer_data[-60:]]
                     returns = [(recent_closes[i] - recent_closes[i-1]) / recent_closes[i-1] 
                               for i in range(1, len(recent_closes))]
                     current_volatility = np.std(returns)
                     
-                    # 日波动率估算（15分钟 → 日，假设96个15分钟周期）
-                    daily_volatility = current_volatility * np.sqrt(96)
+                    # 日波动率估算（5分钟 → 日，假设288个5分钟周期）
+                    daily_volatility = current_volatility * np.sqrt(288)
                     
                     if daily_volatility > 0.08:  # 日波动率>8%
                         return {'pass': False, 'reason': f'市场波动过大 (日波动率={daily_volatility*100:.2f}%)'}
@@ -1032,8 +1031,8 @@ class SignalGenerator:
             # 4. 量能确认（高置信度信号需要量能配合）
             if confidence > 0.6:  # 高置信度信号
                 try:
-                    buffer_data = self.kline_buffers.get(symbol, {}).get('15m', [])
-                    if len(buffer_data) >= 20:
+                    buffer_data = self.kline_buffers.get('5m', [])
+                    if len(buffer_data) >= 60:  # 5m需要更多样本
                         recent_volumes = [k['volume'] for k in buffer_data[-20:]]
                         current_volume = buffer_data[-1]['volume']
                         avg_volume = np.mean(recent_volumes)
@@ -1044,12 +1043,39 @@ class SignalGenerator:
                 except Exception as e:
                     logger.debug(f"量能检查失败（跳过此过滤）: {e}")
             
-            # 5. 信号频率限制（避免过度交易）
-            # 检查最近1小时内的信号数量
+            # 5. 信号频率限制（动态限制，基于主时间框架）
+            # 超短线策略需要在保持灵活性的同时避免过度交易
             try:
-                recent_signals = await self.get_recent_signals(symbol, hours=1, limit=10)
-                if len(recent_signals) >= 5:  # 1小时内超过5个信号
-                    return {'pass': False, 'reason': f'信号频率过高（1小时内已有{len(recent_signals)}个信号）'}
+                from app.core.config import settings
+                
+                # 🔑 基于时间框架的动态限制策略
+                # 计算逻辑：1小时内的K线数 × 合理触发率
+                timeframe_limits = {
+                    '3m': 8,   # 3m: 1小时20个K线 × 40% = 8个信号
+                    '5m': 6,   # 5m: 1小时12个K线 × 50% = 6个信号（主时间框架）
+                    '15m': 3   # 15m: 1小时4个K线 × 75% = 3个信号
+                }
+                
+                # 使用主时间框架（5m）的限制
+                main_timeframe = '5m'  # 当前系统主时间框架
+                max_signals_per_hour = timeframe_limits.get(main_timeframe, 6)
+                
+                # 查询最近1小时的信号
+                recent_signals = await self.get_recent_signals(
+                    symbol, 
+                    hours=1, 
+                    limit=max_signals_per_hour + 2  # 多查2个用于准确判断
+                )
+                
+                if len(recent_signals) >= max_signals_per_hour:
+                    return {
+                        'pass': False, 
+                        'reason': f'信号频率过高（1小时内已有{len(recent_signals)}个，{main_timeframe}限制{max_signals_per_hour}个）'
+                    }
+                
+                # 调试日志：显示当前信号频率状态
+                logger.debug(f"✓ 信号频率检查通过: {len(recent_signals)}/{max_signals_per_hour} ({main_timeframe})")
+                
             except Exception as e:
                 logger.debug(f"信号频率检查失败（跳过此过滤）: {e}")
             

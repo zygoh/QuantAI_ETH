@@ -260,9 +260,9 @@ class HyperparameterOptimizer:
         
         # 🔑 序列长度配置（与ensemble_ml_service.py保持一致）
         seq_len_config = {
-            '15m': 96,   # 96 × 15分钟 = 24小时
-            '2h': 48,    # 48 × 2小时 = 4天
-            '4h': 24     # 24 × 4小时 = 4天
+            '3m': 480,   # 480 × 3分钟 = 24小时（超短期模式识别）
+            '5m': 288,   # 288 × 5分钟 = 24小时（主时间框架）
+            '15m': 96    # 96 × 15分钟 = 24小时（趋势确认）
         }
         
         seq_len = seq_len_config.get(self.timeframe, 96)

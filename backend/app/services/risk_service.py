@@ -614,11 +614,11 @@ class RiskService:
         try:
             from app.services.binance_client import binance_client
             
-            # 1. 获取最近的K线数据计算ATR
+            # 1. 获取最近的K线数据计算ATR（使用5m主时间框架）
             klines = binance_client.get_klines(
                 symbol=symbol,
-                interval='15m',
-                limit=50  # 50根K线足够计算ATR
+                interval='5m',
+                limit=100  # 5m需要更多样本（100个=8.3小时）
             )
             
             if not klines or len(klines) < 20:

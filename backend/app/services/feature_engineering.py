@@ -773,9 +773,9 @@ class FeatureEngineer:
             # 设置timestamp为索引以便重采样
             df_temp = df.set_index('timestamp')
             
-            # 1. 模拟4h数据（对于15m和2h有用）
-            # 重采样到4h并向前填充
-            df_4h = df_temp.resample('4h').agg({
+            # 1. 模拟1h数据（长周期趋势参考，对3m/5m/15m都有用）
+            # 重采样到1h并向前填充
+            df_1h = df_temp.resample('1h').agg({
                 'open': 'first',
                 'high': 'max',
                 'low': 'min',
@@ -783,30 +783,30 @@ class FeatureEngineer:
                 'volume': 'sum'
             }).ffill()
             
-            # 计算4h的关键指标
-            close_4h = df_4h['close']
-            sma_20_4h = close_4h.rolling(20).mean()
-            sma_50_4h = close_4h.rolling(50).mean()
-            rsi_4h = self._calculate_rsi(close_4h, 14)
+            # 计算1h的关键指标
+            close_1h = df_1h['close']
+            sma_20_1h = close_1h.rolling(20).mean()
+            sma_50_1h = close_1h.rolling(50).mean()
+            rsi_1h = self._calculate_rsi(close_1h, 14)
             
-            # 4h趋势方向（1=上涨，0=横盘，-1=下跌）
-            trend_4h = pd.Series(0, index=df_4h.index)
-            trend_4h[sma_20_4h > sma_50_4h] = 1  # 多头
-            trend_4h[sma_20_4h < sma_50_4h] = -1  # 空头
+            # 1h趋势方向（1=上涨，0=横盘，-1=下跌）
+            trend_1h = pd.Series(0, index=df_1h.index)
+            trend_1h[sma_20_1h > sma_50_1h] = 1  # 多头
+            trend_1h[sma_20_1h < sma_50_1h] = -1  # 空头
             
-            # 4h波动率
-            returns_4h = close_4h.pct_change()
-            volatility_4h = returns_4h.rolling(20).std()
+            # 1h波动率
+            returns_1h = close_1h.pct_change()
+            volatility_1h = returns_1h.rolling(20).std()
             
-            # 将4h数据对齐到原始时间框架
-            new_features['trend_4h'] = trend_4h.reindex(df_temp.index, method='ffill')
-            new_features['rsi_4h'] = rsi_4h.reindex(df_temp.index, method='ffill')
-            new_features['volatility_4h'] = volatility_4h.reindex(df_temp.index, method='ffill')
-            new_features['sma_20_4h'] = sma_20_4h.reindex(df_temp.index, method='ffill')
-            new_features['sma_50_4h'] = sma_50_4h.reindex(df_temp.index, method='ffill')
+            # 将1h数据对齐到原始时间框架
+            new_features['trend_1h'] = trend_1h.reindex(df_temp.index, method='ffill')
+            new_features['rsi_1h'] = rsi_1h.reindex(df_temp.index, method='ffill')
+            new_features['volatility_1h'] = volatility_1h.reindex(df_temp.index, method='ffill')
+            new_features['sma_20_1h'] = sma_20_1h.reindex(df_temp.index, method='ffill')
+            new_features['sma_50_1h'] = sma_50_1h.reindex(df_temp.index, method='ffill')
             
-            # 2. 模拟2h数据（对15m有用）
-            df_2h = df_temp.resample('2h').agg({
+            # 2. 模拟15m数据（中期趋势参考，对3m/5m有用）
+            df_15m = df_temp.resample('15m').agg({
                 'open': 'first',
                 'high': 'max',
                 'low': 'min',
@@ -814,26 +814,26 @@ class FeatureEngineer:
                 'volume': 'sum'
             }).ffill()
             
-            close_2h = df_2h['close']
-            sma_20_2h = close_2h.rolling(20).mean()
-            sma_50_2h = close_2h.rolling(50).mean()
-            rsi_2h = self._calculate_rsi(close_2h, 14)
+            close_15m = df_15m['close']
+            sma_20_15m = close_15m.rolling(20).mean()
+            sma_50_15m = close_15m.rolling(50).mean()
+            rsi_15m = self._calculate_rsi(close_15m, 14)
             
-            # 2h趋势方向
-            trend_2h = pd.Series(0, index=df_2h.index)
-            trend_2h[sma_20_2h > sma_50_2h] = 1
-            trend_2h[sma_20_2h < sma_50_2h] = -1
+            # 15m趋势方向
+            trend_15m = pd.Series(0, index=df_15m.index)
+            trend_15m[sma_20_15m > sma_50_15m] = 1
+            trend_15m[sma_20_15m < sma_50_15m] = -1
             
-            # 2h波动率
-            returns_2h = close_2h.pct_change()
-            volatility_2h = returns_2h.rolling(20).std()
+            # 15m波动率
+            returns_15m = close_15m.pct_change()
+            volatility_15m = returns_15m.rolling(20).std()
             
-            # 将2h数据对齐到原始时间框架
-            new_features['trend_2h'] = trend_2h.reindex(df_temp.index, method='ffill')
-            new_features['rsi_2h'] = rsi_2h.reindex(df_temp.index, method='ffill')
-            new_features['volatility_2h'] = volatility_2h.reindex(df_temp.index, method='ffill')
-            new_features['sma_20_2h'] = sma_20_2h.reindex(df_temp.index, method='ffill')
-            new_features['sma_50_2h'] = sma_50_2h.reindex(df_temp.index, method='ffill')
+            # 将15m数据对齐到原始时间框架
+            new_features['trend_15m'] = trend_15m.reindex(df_temp.index, method='ffill')
+            new_features['rsi_15m'] = rsi_15m.reindex(df_temp.index, method='ffill')
+            new_features['volatility_15m'] = volatility_15m.reindex(df_temp.index, method='ffill')
+            new_features['sma_20_15m'] = sma_20_15m.reindex(df_temp.index, method='ffill')
+            new_features['sma_50_15m'] = sma_50_15m.reindex(df_temp.index, method='ffill')
             
             # 3. 趋势一致性特征（短中长周期是否一致）
             if 'sma_20' in df_temp.columns and 'sma_50' in df_temp.columns:
@@ -843,23 +843,23 @@ class FeatureEngineer:
                 trend_current[df_temp['sma_20'] < df_temp['sma_50']] = -1
                 
                 # 多时间框架趋势一致性
-                new_features['trend_alignment_2h'] = (trend_current == new_features['trend_2h']).astype(int)
-                new_features['trend_alignment_4h'] = (trend_current == new_features['trend_4h']).astype(int)
+                new_features['trend_alignment_15m'] = (trend_current == new_features['trend_15m']).astype(int)
+                new_features['trend_alignment_1h'] = (trend_current == new_features['trend_1h']).astype(int)
                 new_features['trend_alignment_all'] = (
-                    (new_features['trend_alignment_2h'] + new_features['trend_alignment_4h']) / 2
+                    (new_features['trend_alignment_15m'] + new_features['trend_alignment_1h']) / 2
                 )
             
             # 4. 相对强弱（当前时间框架 vs 更长周期）
             if 'rsi_14' in df_temp.columns:
-                new_features['rsi_diff_2h'] = df_temp['rsi_14'] - new_features['rsi_2h']
-                new_features['rsi_diff_4h'] = df_temp['rsi_14'] - new_features['rsi_4h']
+                new_features['rsi_diff_15m'] = df_temp['rsi_14'] - new_features['rsi_15m']
+                new_features['rsi_diff_1h'] = df_temp['rsi_14'] - new_features['rsi_1h']
             
             # 5. 价格相对位置（相对于更长周期均线）
             if 'close' in df_temp.columns:
-                new_features['price_to_sma20_2h'] = (df_temp['close'] - new_features['sma_20_2h']) / new_features['sma_20_2h']
-                new_features['price_to_sma50_2h'] = (df_temp['close'] - new_features['sma_50_2h']) / new_features['sma_50_2h']
-                new_features['price_to_sma20_4h'] = (df_temp['close'] - new_features['sma_20_4h']) / new_features['sma_20_4h']
-                new_features['price_to_sma50_4h'] = (df_temp['close'] - new_features['sma_50_4h']) / new_features['sma_50_4h']
+                new_features['price_to_sma20_15m'] = (df_temp['close'] - new_features['sma_20_15m']) / new_features['sma_20_15m']
+                new_features['price_to_sma50_15m'] = (df_temp['close'] - new_features['sma_50_15m']) / new_features['sma_50_15m']
+                new_features['price_to_sma20_1h'] = (df_temp['close'] - new_features['sma_20_1h']) / new_features['sma_20_1h']
+                new_features['price_to_sma50_1h'] = (df_temp['close'] - new_features['sma_50_1h']) / new_features['sma_50_1h']
             
             # 将新特征添加到df_temp（确保索引一致）
             for col_name, col_data in new_features.items():

@@ -145,9 +145,9 @@ class EnsembleMLService(MLService):
         
         # 🔑 序列长度配置（用于Informer-2序列输入）
         self.seq_len_config = {
-            '15m': 96,   # 96 × 15分钟 = 24小时
-            '2h': 48,    # 48 × 2小时 = 4天
-            '4h': 24     # 24 × 4小时 = 4天
+            '3m': 480,   # 480 × 3分钟 = 24小时（超短期模式识别）
+            '5m': 288,   # 288 × 5分钟 = 24小时（主时间框架）
+            '15m': 96    # 96 × 15分钟 = 24小时（趋势确认）
         }
         
         # 🛡️ 系统优化组件
@@ -231,20 +231,20 @@ class EnsembleMLService(MLService):
             
             symbol = settings.SYMBOL
             
-            # 🔑 基础训练天数配置（2h/4h增加数据量防过拟合）
+            # 🔑 基础训练天数配置（超短线策略：确保足够样本）
             base_days_config = {
-                '15m': 360,  # 保持360天
-                '2h': 540,   # 270→540（翻倍）
-                '4h': 720    # 360→720（翻倍）
+                '3m': 120,   # 3m: 120天=57,600条（高频样本，捕捉极短期模式）
+                '5m': 120,   # 5m: 120天=34,560条（主时间框架，充足样本）
+                '15m': 120   # 15m: 120天=11,520条（中期过滤，足够识别趋势）
             }
-            base_days = base_days_config.get(timeframe, 360)
+            base_days = base_days_config.get(timeframe, 120)
             
             # 应用倍数
             training_days = int(base_days * days_multiplier)
             
             # 计算需要的K线数量
             interval_minutes = {
-                '15m': 15, '2h': 120, '4h': 240
+                '3m': 3, '5m': 5, '15m': 15
             }
             minutes = interval_minutes.get(timeframe, 60)
             required_klines = int((training_days * 24 * 60) / minutes)
@@ -710,13 +710,13 @@ class EnsembleMLService(MLService):
                 inf_model = self._train_informer2(X_seq_train, y_seq_train, timeframe, custom_params=inf_params_optimized)
             
             # 🔧 然后训练传统模型
-            logger.info(f"🚂 训练LightGBM（360天数据）...")
+            logger.info(f"🚂 训练LightGBM（{timeframe} 标准数据）...")
             lgb_model = self._train_lightgbm(X_lgb_train, y_lgb_train, timeframe, custom_params=lgb_params_optimized)
             
-            logger.info(f"🚂 训练XGBoost（540天数据）...")
+            logger.info(f"🚂 训练XGBoost（{timeframe} +50%数据）...")
             xgb_model = self._train_xgboost(X_xgb_train, y_xgb_train, timeframe, custom_params=xgb_params_optimized)
             
-            logger.info(f"🚂 训练CatBoost（720天数据）...")
+            logger.info(f"🚂 训练CatBoost（{timeframe} +100%数据）...")
             cat_model = self._train_catboost(X_cat_train, y_cat_train, timeframe, custom_params=cat_params_optimized)
             
             # 2️⃣ 生成验证集的预测概率（元特征）

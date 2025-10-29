@@ -23,6 +23,7 @@ class ScheduledTask:
     func: Callable
     interval_hours: int = None  # 间隔小时（如果使用间隔模式）
     scheduled_time: Optional[dt_time] = None  # 固定时间（如果使用固定时间模式）
+    weekly_day: Optional[int] = None  # 每周的星期几（0=周一，4=周五，如果使用每周模式）
     last_run: Optional[datetime] = None
     next_run: Optional[datetime] = None
     is_running: bool = False
@@ -49,11 +50,12 @@ class TaskScheduler:
     def _init_scheduled_tasks(self):
         """初始化调度任务"""
         try:
-            # 模型训练任务（每天00:01执行）
+            # 模型训练任务（每周五晚上00:00执行）
             self.tasks['model_training'] = ScheduledTask(
                 name='模型训练',
                 func=self._run_model_training,
-                scheduled_time=dt_time(0, 1)  # 每天00:01
+                scheduled_time=dt_time(0, 0),  # 晚上00:00（即周五深夜12点）
+                weekly_day=4  # 周五（0=周一，1=周二，...，4=周五）
             )
             
             # 数据更新任务
@@ -159,7 +161,7 @@ class TaskScheduler:
             
             if not has_model:
                 logger.warning("⚠️ 未找到已保存的Stacking集成模型文件，开始首次训练...")
-                logger.info("🎓 首次部署：立即执行模型训练（后续将在每天00:01自动训练）")
+                logger.info("🎓 首次部署：立即执行模型训练（后续将在每周五晚上00:00自动训练）")
                 
                 # 立即执行模型训练
                 task = self.tasks.get('model_training')
@@ -179,31 +181,58 @@ class TaskScheduler:
             
             for task_name, task in self.tasks.items():
                 if task.scheduled_time is not None:
-                    # 固定时间模式（如每天00:01）
-                    if task.last_run is None:
-                        # 首次运行：计算下一个00:01时刻
-                        next_scheduled = current_time.replace(
-                            hour=task.scheduled_time.hour,
-                            minute=task.scheduled_time.minute,
-                            second=0,
-                            microsecond=0
-                        )
-                        
-                        # 如果今天的时间已过，设为明天
-                        if next_scheduled <= current_time:
-                            next_scheduled += timedelta(days=1)
-                        
-                        task.next_run = next_scheduled
-                        logger.info(f"任务 [{task.name}] 计划于 {next_scheduled.strftime('%Y-%m-%d %H:%M:%S')} 执行")
+                    # 检查是否是每周模式
+                    if task.weekly_day is not None:
+                        # 每周固定某一天的固定时间（如每周五00:00）
+                        if task.last_run is None:
+                            # 首次运行：计算下一个周五的00:00
+                            next_scheduled = current_time.replace(
+                                hour=task.scheduled_time.hour,
+                                minute=task.scheduled_time.minute,
+                                second=0,
+                                microsecond=0
+                            )
+                            
+                            # 计算距离下一个目标星期几还有多少天
+                            days_ahead = task.weekly_day - current_time.weekday()
+                            if days_ahead <= 0 or (days_ahead == 0 and next_scheduled <= current_time):
+                                # 如果已经过了本周的目标日，或者是今天但时间已过，则设为下周
+                                days_ahead += 7
+                            
+                            next_scheduled += timedelta(days=days_ahead)
+                            task.next_run = next_scheduled
+                            weekday_name = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'][task.weekly_day]
+                            logger.info(f"任务 [{task.name}] 计划于 {next_scheduled.strftime('%Y-%m-%d %H:%M:%S')} ({weekday_name}) 执行")
+                        else:
+                            # 已运行过：计算下周同一天的同一时间
+                            next_scheduled = task.last_run + timedelta(days=7)
+                            task.next_run = next_scheduled
                     else:
-                        # 已运行过：计算下一天的同一时间
-                        next_scheduled = task.last_run.replace(
-                            hour=task.scheduled_time.hour,
-                            minute=task.scheduled_time.minute,
-                            second=0,
-                            microsecond=0
-                        ) + timedelta(days=1)
-                        task.next_run = next_scheduled
+                        # 每天固定时间模式（如每天00:00）
+                        if task.last_run is None:
+                            # 首次运行：计算下一个指定时刻
+                            next_scheduled = current_time.replace(
+                                hour=task.scheduled_time.hour,
+                                minute=task.scheduled_time.minute,
+                                second=0,
+                                microsecond=0
+                            )
+                            
+                            # 如果今天的时间已过，设为明天
+                            if next_scheduled <= current_time:
+                                next_scheduled += timedelta(days=1)
+                            
+                            task.next_run = next_scheduled
+                            logger.info(f"任务 [{task.name}] 计划于 {next_scheduled.strftime('%Y-%m-%d %H:%M:%S')} 执行")
+                        else:
+                            # 已运行过：计算下一天的同一时间
+                            next_scheduled = task.last_run.replace(
+                                hour=task.scheduled_time.hour,
+                                minute=task.scheduled_time.minute,
+                                second=0,
+                                microsecond=0
+                            ) + timedelta(days=1)
+                            task.next_run = next_scheduled
                 
                 elif task.interval_hours is not None:
                     # 间隔时间模式

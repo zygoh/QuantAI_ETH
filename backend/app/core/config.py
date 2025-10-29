@@ -29,8 +29,8 @@ class Settings(BaseSettings):
     # 交易模式配置
     TRADING_MODE: str = "SIGNAL_ONLY"  # 默认交易模式：SIGNAL_ONLY（信号模式/虚拟交易）或 AUTO（自动交易/实盘）
     
-    # 时间框架配置
-    TIMEFRAMES: list = ["15m", "2h", "4h"]
+    # 时间框架配置（以5m为主，3m和15m为辅助）
+    TIMEFRAMES: list = ["3m", "5m", "15m"]
     
     # PostgreSQL + TimescaleDB 配置
     PG_HOST: str = "localhost"
