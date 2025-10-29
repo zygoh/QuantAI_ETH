@@ -231,7 +231,7 @@ class SignalGenerator:
     async def _on_new_data(self, kline_data: KlineData):
         """处理新的K线数据 - 更新缓冲区并预测该时间框架"""
         try:
-            logger.info(f"📊 信号生成器收到新K线: {kline_data.symbol} {kline_data.interval}")
+            logger.debug(f"📊 信号生成器收到新K线: {kline_data.symbol} {kline_data.interval}")
             
             if not self.is_running:
                 logger.warning("⚠️ 信号生成器未运行，跳过处理")
@@ -248,17 +248,17 @@ class SignalGenerator:
             if prediction:
                 # 缓存该时间框架的预测结果
                 self.cached_predictions[timeframe] = prediction
-                logger.info(f"✅ {timeframe} 预测完成并缓存: {prediction.get('signal_type')} (置信度={prediction.get('confidence'):.4f})")
+                logger.debug(f"✅ {timeframe} 预测完成并缓存: {prediction.get('signal_type')} (置信度={prediction.get('confidence'):.4f})")
             else:
                 logger.warning(f"❌ {timeframe} 预测失败")
                 return
             
             # 3. 🔥 只有15m信号更新时才触发合成（15m作为主时间框架）
             if timeframe != settings.TIMEFRAMES[0]:
-                logger.info(f"⏭️ {timeframe} 信号已缓存，等待15m触发合成")
+                logger.debug(f"⏭️ {timeframe} 信号已缓存，等待15m触发合成")
                 return
             
-            logger.info(f"🔄 15m信号更新，触发合成 (当前已缓存: {list(self.cached_predictions.keys())})")
+            logger.debug(f"🔄 15m信号更新，触发合成 (当前已缓存: {list(self.cached_predictions.keys())})")
             
             # 🔥 预热计数应该在尝试合成前就+1（不管是否HOLD）
             self.signal_counter += 1
@@ -351,12 +351,8 @@ class SignalGenerator:
                 import asyncio
                 asyncio.create_task(postgresql_manager.write_kline_data([kline_dict]))
                 
-                # ✅ 日志输出时转换为北京时间（仅用于展示）
-                shanghai_tz = pytz.timezone('Asia/Shanghai')
-                open_time_beijing = datetime.fromtimestamp(kline_data.open_time / 1000, tz=shanghai_tz)
-                
-                logger.info(f"💾 WebSocket数据已提交写入: {timeframe}")
-                logger.info(f"   北京时间: {open_time_beijing.strftime('%Y-%m-%d %H:%M:%S')} | trades={kline_data.trades}")
+                # ✅ 简化日志输出（改为DEBUG级别，减少日志量）
+                logger.debug(f"💾 WebSocket数据已提交写入: {timeframe} | trades={kline_data.trades}")
             except Exception as db_error:
                 logger.error(f"❌ 写入数据库失败: {db_error}")
                 logger.error(f"   K线详情: symbol={kline_dict.get('symbol')} interval={kline_dict.get('interval')} timestamp={kline_dict.get('timestamp')}")
@@ -481,16 +477,13 @@ class SignalGenerator:
                 logger.debug("❌ 信号缓存为空")
                 return None
             
-            # 记录当前缓存状态
-            logger.info(f"🔄 信号合成: 已缓存 {len(self.cached_predictions)}/{len(settings.TIMEFRAMES)} 个时间框架")
-            
             # 如果不是所有时间框架都有预测，可以继续（使用已有的）
             # 但至少需要15m
             if '15m' not in self.cached_predictions:
                 logger.warning("❌ 缺少15m信号，无法合成")
                 return None
             
-            # 合成信号
+            # 合成信号（合成过程中的日志已在_synthesize_signal中输出）
             signal = await self._synthesize_signal(symbol, self.cached_predictions)
             
             # 如果没有信号（HOLD或其他原因），直接返回
@@ -503,9 +496,8 @@ class SignalGenerator:
                 logger.info(f"❌ 置信度不足: {signal.confidence:.4f} < {self.confidence_threshold}")
                 return None
             
-            # 检查信号去重
+            # 检查信号去重（去重检查中的日志已在_should_send_signal中输出）
             if not await self._should_send_signal(symbol, signal.signal_type):
-                logger.info(f"✗ 信号重复，跳过: {signal.signal_type}")
                 return None
             
             return signal
@@ -821,7 +813,7 @@ class SignalGenerator:
             
             # 如果信号类型相同，拒绝（去重）
             if last_signal_type == signal_type:
-                logger.info(f"✗ 信号重复: 上次={last_signal_type}, 本次={signal_type}")
+                logger.warning(f"✗ 信号重复: 上次={last_signal_type}, 本次={signal_type}")
                 return False
             
             # 信号类型不同，允许发送（方向改变）

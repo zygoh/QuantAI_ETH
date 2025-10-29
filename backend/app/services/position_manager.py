@@ -194,9 +194,7 @@ class PositionManager:
                 # 限制最大仓位价值（安全保护）
                 position_value = min(position_value, self.max_position_value)
                 
-                logger.info(f"💰 全仓仓位计算: {symbol}")
-                logger.info(f"  余额: {available_balance:.2f} USDT | 杠杆: {self.leverage}x")
-                logger.info(f"  仓位价值: {position_value:.2f} USDT" + 
+                logger.debug(f"💰 全仓仓位计算: {symbol} | 余额: {available_balance:.2f} USDT | 杠杆: {self.leverage}x | 仓位价值: {position_value:.2f} USDT" + 
                            (f" (已限制，原始: {original_value:.2f})" if original_value > self.max_position_value else ""))
                 
             else:

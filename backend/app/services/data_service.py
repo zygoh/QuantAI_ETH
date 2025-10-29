@@ -241,11 +241,11 @@ class DataService:
             
             # 只处理已完成的K线
             if not is_closed:
-                logger.debug(f"📥 收到未完成K线: {k}")  # DEBUG级别，减少日志
+                logger.debug(f"📥 收到未完成K线: {symbol} {interval}")  # DEBUG级别，减少日志
                 return
             
-            # 已完成的K线才用INFO级别
-            logger.info(f"📥 收到已完成K线: {k} ")
+            # 已完成的K线，只输出关键信息（避免日志过大）
+            logger.debug(f"📥 收到已完成K线: {symbol} {interval} t={k.get('t')} c={k.get('c')}")  # 改为DEBUG，减少日志量
             # 创建K线数据对象（保留Binance原始时间戳，不转换）
             kline = KlineData(
                 symbol=symbol,
