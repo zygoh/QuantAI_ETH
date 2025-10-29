@@ -2,14 +2,23 @@
 集成机器学习服务 - Stacking三模型融合
 """
 import logging
+import gc
+import time
+import traceback
 from typing import Dict, Any, Optional, Tuple
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
+import xgboost as xgb
+from catboost import CatBoostClassifier
 from datetime import datetime
 import pickle
 from pathlib import Path
-
+from scipy.special import entr
+from scipy.stats import entropy as scipy_entropy
+from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report, log_loss
 from app.services.ml_service import MLService
 from app.core.config import settings
 from app.core.cache import cache_manager
@@ -17,8 +26,12 @@ from app.services.hyperparameter_optimizer import HyperparameterOptimizer
 from app.services.direction_consistency_checker import TradingDirectionConsistencyChecker, ConsistencyCheck
 from app.services.adaptive_frequency_controller import AdaptiveFrequencyController, FrequencyControl
 from app.services.model_stability_enhancer import ModelStabilityEnhancer
+from app.utils.helpers import format_signal_type
 
 logger = logging.getLogger(__name__)
+
+# 延迟导入避免循环依赖（在需要时导入）
+# from app.services.binance_client import binance_client  # 在方法内导入
 
 # 深度学习模型（PyTorch）
 try:
@@ -32,6 +45,55 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
     logger.warning("⚠️ PyTorch未安装，Informer-2模型将不可用")
+
+
+class InformerWrapper:
+    """
+    包装Informer-2模型，提供predict_proba接口（支持序列输入）
+    
+    将类移到模块级别以支持pickle序列化
+    """
+    
+    def __init__(self, model, device):
+        """
+        初始化包装器
+        
+        Args:
+            model: Informer2ForClassification模型实例
+            device: PyTorch设备（'cuda'或'cpu'）
+        """
+        self.model = model
+        self.device = device
+    
+    def predict_proba(self, X_seq):
+        """
+        预测概率（兼容scikit-learn，支持序列输入）
+        
+        Args:
+            X_seq: NumPy数组 (n_samples, seq_len, n_features)
+        
+        Returns:
+            概率数组 (n_samples, n_classes)
+        """
+        self.model.eval()
+        with torch.no_grad():
+            X_tensor = torch.FloatTensor(X_seq).to(self.device)
+            probs = self.model.predict_proba(X_tensor)
+            return probs.cpu().numpy()
+    
+    def predict(self, X_seq):
+        """
+        预测类别（兼容scikit-learn，支持序列输入）
+        
+        Args:
+            X_seq: NumPy数组 (n_samples, seq_len, n_features)
+        
+        Returns:
+            预测类别数组
+        """
+        probs = self.predict_proba(X_seq)
+        return np.argmax(probs, axis=1)
+
 
 class EnsembleMLService(MLService):
     """
@@ -106,6 +168,52 @@ class EnsembleMLService(MLService):
         logger.info(f"   Informer-2神经网络: {'启用' if self.enable_informer2 else '关闭'}")
         logger.info(f"   序列长度配置: {self.seq_len_config}")
         logger.info(f"   GPU加速: {'启用' if self.use_gpu else '关闭'} (设备: {self.gpu_device if self.use_gpu else 'CPU'})")
+    
+    def clear_gpu_memory(self):
+        """
+        清理GPU内存
+        
+        功能：
+        - 清空PyTorch缓存
+        - 同步GPU操作
+        - 强制垃圾回收
+        - 记录清理状态
+        """
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
+            
+            # 记录GPU内存状态
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory
+            gpu_used = torch.cuda.memory_allocated(0)
+            gpu_free = gpu_memory - gpu_used
+            logger.info(f"🧹 GPU内存已清理 (使用: {gpu_used/1024**3:.1f}GB, 可用: {gpu_free/1024**3:.1f}GB)")
+        else:
+            logger.info("🧹 CPU模式，无需清理GPU内存")
+    
+    def monitor_gpu_memory(self):
+        """
+        监控GPU内存使用情况
+        
+        Returns:
+            Dict: GPU内存状态信息
+        """
+        if torch.cuda.is_available():
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory
+            gpu_used = torch.cuda.memory_allocated(0)
+            gpu_free = gpu_memory - gpu_used
+            gpu_reserved = torch.cuda.memory_reserved(0)
+            
+            return {
+                'total': gpu_memory,
+                'used': gpu_used,
+                'free': gpu_free,
+                'reserved': gpu_reserved,
+                'usage_percent': (gpu_used / gpu_memory) * 100
+            }
+        else:
+            return {'error': 'GPU不可用'}
     
     async def _prepare_diverse_training_data(self, timeframe: str, days_multiplier: float = 1.0) -> pd.DataFrame:
         """
@@ -185,6 +293,7 @@ class EnsembleMLService(MLService):
             
         except Exception as e:
             logger.error(f"准备差异化训练数据失败: {e}")
+            logger.error(traceback.format_exc())
             raise
     
     def _prepare_features_labels_reuse(self, df: pd.DataFrame, timeframe: str) -> Tuple[pd.DataFrame, pd.Series]:
@@ -274,7 +383,6 @@ class EnsembleMLService(MLService):
             
         except Exception as e:
             logger.error(f"构造序列输入失败: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             return np.array([]), np.array([])
     
@@ -337,7 +445,6 @@ class EnsembleMLService(MLService):
             
         except Exception as e:
             logger.error(f"❌ 集成模型训练失败: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             raise
     
@@ -472,7 +579,6 @@ class EnsembleMLService(MLService):
             
         except Exception as e:
             logger.error(f"❌ {timeframe} 集成模型训练失败: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             raise
     
@@ -501,7 +607,6 @@ class EnsembleMLService(MLService):
         Returns:
             训练结果字典
         """
-        import time
         start_time = time.time()
         
         try:
@@ -671,7 +776,6 @@ class EnsembleMLService(MLService):
             logger.debug(f"✓ max_prob: {lgb_max_prob.shape}")
             
             # 3. 概率熵（不确定性，熵越高越不确定）
-            from scipy.special import entr
             lgb_entropy = entr(lgb_pred_proba).sum(axis=1).reshape(-1, 1)
             xgb_entropy = entr(xgb_pred_proba).sum(axis=1).reshape(-1, 1)
             cat_entropy = entr(cat_pred_proba).sum(axis=1).reshape(-1, 1)
@@ -706,7 +810,7 @@ class EnsembleMLService(MLService):
             
             # 逐步拼接并验证
             if inf_model is not None:
-                # 包含Informer-2（23个特征）
+                # 包含Informer-2（25个特征）
                 meta_list = [
                     lgb_pred_proba,      # (N, 3)
                     xgb_pred_proba,      # (N, 3)
@@ -724,7 +828,7 @@ class EnsembleMLService(MLService):
                     avg_proba,           # (N, 3)
                     prob_std_max         # (N, 1)
                 ]
-                expected_features = 23  # 3+3+3+3+1+1+1+1+1+1+1+1+1+3+1
+                expected_features = 25  # 3+3+3+3+1+1+1+1+1+1+1+1+1+3+1 = 25
             else:
                 # 仅传统模型（20个特征）
                 meta_list = [
@@ -760,7 +864,7 @@ class EnsembleMLService(MLService):
             meta_labels_val = y_lgb_val
             
             if inf_model is not None:
-                logger.info(f"✅ 增强元特征生成完成: {meta_features_val.shape} (基础12+增强11=23个，含Informer-2)")
+                logger.info(f"✅ 增强元特征生成完成: {meta_features_val.shape} (基础12+增强13=25个，含Informer-2)")
             else:
                 logger.info(f"✅ 增强元特征生成完成: {meta_features_val.shape} (基础9+增强11=20个)")
             
@@ -768,7 +872,6 @@ class EnsembleMLService(MLService):
             logger.info(f"🧠 训练元学习器（LightGBM - 更强大的决策能力）...")
             
             # 🔑 检查HOLD比例，动态调整惩罚系数
-            from sklearn.utils.class_weight import compute_sample_weight
             hold_ratio = (meta_labels_val == 1).sum() / len(meta_labels_val)
             
             # 🔑 根据HOLD比例动态调整惩罚（平衡策略）
@@ -823,9 +926,6 @@ class EnsembleMLService(MLService):
             
             # 5️⃣ 评估集成模型 - 使用时间序列交叉验证
             logger.info(f"📊 {timeframe} 时间序列交叉验证评估...")
-            
-            from sklearn.model_selection import TimeSeriesSplit
-            from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report, log_loss
             
             # 🆕 时间序列5折交叉验证（更可靠的评估）
             tscv = TimeSeriesSplit(n_splits=5)
@@ -986,7 +1086,6 @@ class EnsembleMLService(MLService):
             
             # 🆕 类别平衡性指标
             try:
-                from scipy.stats import entropy as scipy_entropy
                 pred_distribution = np.bincount(ensemble_pred, minlength=3) / len(ensemble_pred)
                 prediction_entropy = float(scipy_entropy(pred_distribution))  # 熵越高越平衡
                 prediction_balance_score = float(1 - np.std(pred_distribution))  # 平衡分数
@@ -1183,7 +1282,6 @@ class EnsembleMLService(MLService):
             
         except Exception as e:
             logger.error(f"差异化Stacking训练失败: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             raise
     
@@ -1198,8 +1296,8 @@ class EnsembleMLService(MLService):
             custom_params: 自定义参数（Optuna优化后的参数，优先级最高）
         """
         try:
-            import lightgbm as lgb
-            from sklearn.utils.class_weight import compute_sample_weight
+            # 🎮 统一GPU内存管理：训练前清理
+            self.clear_gpu_memory()
             
             # 样本加权（类别平衡 × 时间衰减 × HOLD惩罚）
             class_weights = compute_sample_weight('balanced', y_train)
@@ -1236,19 +1334,24 @@ class EnsembleMLService(MLService):
             model = lgb.LGBMClassifier(**params)
             model.fit(X_train, y_train, sample_weight=sample_weights)
             
+            # 🎮 统一GPU内存管理：训练后清理
+            self.clear_gpu_memory()
+            
             return model
             
         except Exception as e:
             logger.error(f"LightGBM训练失败: {e}")
+            # 🎮 统一GPU内存管理：异常时清理
+            self.clear_gpu_memory()
             raise
     
     def _train_xgboost(self, X_train: pd.DataFrame, y_train: pd.Series, timeframe: str, custom_params: Optional[Dict[str, Any]] = None):
-        """训练XGBoost模型（防过拟合）"""
+        """训练XGBoost模型（防过拟合 + GPU内存管理）"""
         try:
-            import xgboost as xgb
+            # 🎮 统一GPU内存管理：训练前清理
+            self.clear_gpu_memory()
             
             # 样本加权（与LightGBM一致 + HOLD惩罚）
-            from sklearn.utils.class_weight import compute_sample_weight
             class_weights = compute_sample_weight('balanced', y_train)
             time_decay = np.exp(-np.arange(len(X_train)) / (len(X_train) * 0.1))[::-1]
             
@@ -1310,19 +1413,24 @@ class EnsembleMLService(MLService):
             model = xgb.XGBClassifier(**params)
             model.fit(X_train, y_train, sample_weight=sample_weights, verbose=False)
             
+            # 🎮 统一GPU内存管理：训练后清理
+            self.clear_gpu_memory()
+            
             return model
             
         except Exception as e:
             logger.error(f"XGBoost训练失败: {e}")
+            # 🎮 统一GPU内存管理：异常时清理
+            self.clear_gpu_memory()
             raise
     
     def _train_catboost(self, X_train: pd.DataFrame, y_train: pd.Series, timeframe: str, custom_params: Optional[Dict[str, Any]] = None):
-        """训练CatBoost模型（防过拟合）"""
+        """训练CatBoost模型（防过拟合 + GPU内存管理）"""
         try:
-            from catboost import CatBoostClassifier
+            # 🎮 统一GPU内存管理：训练前清理
+            self.clear_gpu_memory()
             
             # 样本加权（与LightGBM一致 + HOLD惩罚）
-            from sklearn.utils.class_weight import compute_sample_weight
             class_weights = compute_sample_weight('balanced', y_train)
             time_decay = np.exp(-np.arange(len(X_train)) / (len(X_train) * 0.1))[::-1]
             
@@ -1379,10 +1487,15 @@ class EnsembleMLService(MLService):
             model = CatBoostClassifier(**params)
             model.fit(X_train, y_train, sample_weight=sample_weights, verbose=False)
             
+            # 🎮 统一GPU内存管理：训练后清理
+            self.clear_gpu_memory()
+            
             return model
             
         except Exception as e:
             logger.error(f"CatBoost训练失败: {e}")
+            # 🎮 统一GPU内存管理：异常时清理
+            self.clear_gpu_memory()
             raise
     
     def _train_informer2(self, X_seq_train: np.ndarray, y_seq_train: np.ndarray, timeframe: str, custom_params: Optional[Dict[str, Any]] = None):
@@ -1406,6 +1519,9 @@ class EnsembleMLService(MLService):
             import time
             start_time = time.time()
             
+            # 🎮 GPU内存管理：训练前清理
+            self.clear_gpu_memory()
+            
             logger.info(f"🤖 训练Informer-2神经网络模型（序列输入）...")
             logger.info(f"   输入形状: {X_seq_train.shape} (样本数, 序列长度, 特征数)")
             
@@ -1416,6 +1532,11 @@ class EnsembleMLService(MLService):
             # 2. 检测GPU
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             logger.info(f"   设备: {device} {'🚀 (GPU加速)' if device.type == 'cuda' else '💻 (CPU)'}")
+            
+            # 🎮 GPU内存监控
+            if torch.cuda.is_available():
+                gpu_status = self.monitor_gpu_memory()
+                logger.info(f"   GPU内存状态: 使用{gpu_status['usage_percent']:.1f}% ({gpu_status['used']/1024**3:.1f}GB/{gpu_status['total']/1024**3:.1f}GB)")
             
             # 3. 创建数据加载器
             dataset = TensorDataset(X_tensor, y_tensor)
@@ -1533,43 +1654,11 @@ class EnsembleMLService(MLService):
             model.eval()
             
             # 10. 包装模型以兼容scikit-learn接口（支持序列输入）
-            class InformerWrapper:
-                """包装Informer-2模型，提供predict_proba接口（支持序列输入）"""
-                
-                def __init__(self, model, device):
-                    self.model = model
-                    self.device = device
-                
-                def predict_proba(self, X_seq):
-                    """
-                    预测概率（兼容scikit-learn，支持序列输入）
-                    
-                    Args:
-                        X_seq: NumPy数组 (n_samples, seq_len, n_features)
-                    
-                    Returns:
-                        概率数组 (n_samples, n_classes)
-                    """
-                    self.model.eval()
-                    with torch.no_grad():
-                        X_tensor = torch.FloatTensor(X_seq).to(self.device)
-                        probs = self.model.predict_proba(X_tensor)
-                        return probs.cpu().numpy()
-                
-                def predict(self, X_seq):
-                    """
-                    预测类别（兼容scikit-learn，支持序列输入）
-                    
-                    Args:
-                        X_seq: NumPy数组 (n_samples, seq_len, n_features)
-                    
-                    Returns:
-                        预测类别数组
-                    """
-                    probs = self.predict_proba(X_seq)
-                    return np.argmax(probs, axis=1)
-            
+            # ✅ 使用模块级别的InformerWrapper类（支持pickle序列化）
             wrapped_model = InformerWrapper(model, device)
+            
+            # 🎮 GPU内存管理：训练后清理
+            self.clear_gpu_memory()
             
             training_time = time.time() - start_time
             logger.info(f"✅ Informer-2训练完成: 最佳Loss={best_loss:.4f}, "
@@ -1579,6 +1668,8 @@ class EnsembleMLService(MLService):
             
         except Exception as e:
             logger.error(f"Informer-2训练失败: {e}")
+            # 🎮 GPU内存管理：异常时清理
+            self.clear_gpu_memory()
             logger.warning("⚠️ 将跳过Informer-2，仅使用传统模型")
             return None
     
@@ -1662,8 +1753,6 @@ class EnsembleMLService(MLService):
             # Stacking预测（使用元学习器）
             if 'meta' in models:
                 # 🆕 生成增强元特征（与训练时一致）
-                from scipy.special import entr
-                
                 # 1. 模型一致性
                 if inf_proba is not None:
                     agreement = float((lgb_pred == xgb_pred) and (xgb_pred == cat_pred) and (cat_pred == inf_pred))
@@ -1754,7 +1843,6 @@ class EnsembleMLService(MLService):
             signal_type = signal_map[final_pred]
             
             # 简洁记录预测结果
-            from app.utils.helpers import format_signal_type
             logger.info(f"🎯 {timeframe} Stacking预测: {format_signal_type(signal_type)} "
                        f"(置信度={confidence:.4f}, 概率: 📉{final_probabilities[0]:.2f} ⏸️{final_probabilities[1]:.2f} 📈{final_probabilities[2]:.2f})")
             
@@ -1773,7 +1861,6 @@ class EnsembleMLService(MLService):
             
         except Exception as e:
             logger.error(f"集成预测失败: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             return {}
     
@@ -1829,7 +1916,6 @@ class EnsembleMLService(MLService):
             
         except Exception as e:
             logger.error(f"保存集成模型失败: {e}")
-            import traceback
             logger.error(traceback.format_exc())
     
     def _load_ensemble_models(self, timeframe: str) -> bool:
@@ -1885,7 +1971,6 @@ class EnsembleMLService(MLService):
             
         except Exception as e:
             logger.error(f"加载集成模型失败: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             return False
     
@@ -1912,7 +1997,6 @@ class EnsembleMLService(MLService):
             
         except Exception as e:
             logger.error(f"❌ 集成模型训练失败: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             raise
     
@@ -2046,8 +2130,6 @@ class EnsembleMLService(MLService):
             np.ndarray: 增强元特征
         """
         try:
-            from scipy.special import entr
-            
             # 基础模型预测概率
             lgb_proba = models['lgb'].predict_proba(X_pred)[0]
             xgb_proba = models['xgb'].predict_proba(X_pred)[0]

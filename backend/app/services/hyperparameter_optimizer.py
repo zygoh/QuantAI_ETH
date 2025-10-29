@@ -3,6 +3,7 @@
 """
 
 import logging
+import gc
 from typing import Dict, Any, Optional
 import numpy as np
 import pandas as pd
@@ -14,6 +15,11 @@ import catboost as cb
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import accuracy_score
 from sklearn.utils.class_weight import compute_sample_weight
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from app.services.informer2_model import Informer2ForClassification
+from app.services.gmadl_loss import GMADLossWithHOLDPenalty
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,52 @@ class HyperparameterOptimizer:
         else:
             logger.info(f"   样本数: {len(X)}, 特征数: {X.shape[1]}")
         logger.info(f"   GPU加速: {'启用' if use_gpu else '关闭'}")
+    
+    def clear_gpu_memory(self):
+        """
+        统一GPU内存清理方法
+        
+        功能：
+        - 清空PyTorch缓存
+        - 同步GPU操作
+        - 强制垃圾回收
+        - 记录清理状态
+        """
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
+            
+            # 记录GPU内存状态
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory
+            gpu_used = torch.cuda.memory_allocated(0)
+            gpu_free = gpu_memory - gpu_used
+            logger.debug(f"🧹 GPU内存已清理 (使用: {gpu_used/1024**3:.1f}GB, 可用: {gpu_free/1024**3:.1f}GB)")
+        else:
+            logger.debug("🧹 CPU模式，无需清理GPU内存")
+    
+    def monitor_gpu_memory(self):
+        """
+        监控GPU内存使用情况
+        
+        Returns:
+            Dict: GPU内存状态信息
+        """
+        if torch.cuda.is_available():
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory
+            gpu_used = torch.cuda.memory_allocated(0)
+            gpu_free = gpu_memory - gpu_used
+            gpu_reserved = torch.cuda.memory_reserved(0)
+            
+            return {
+                'total': gpu_memory,
+                'used': gpu_used,
+                'free': gpu_free,
+                'reserved': gpu_reserved,
+                'usage_percent': (gpu_used / gpu_memory) * 100
+            }
+        else:
+            return {'error': 'GPU不可用'}
     
     def _get_lightgbm_search_space(self, trial: optuna.Trial) -> Dict[str, Any]:
         """
@@ -322,25 +374,76 @@ class HyperparameterOptimizer:
             
             # 训练模型
             try:
+                # 🎮 统一GPU内存管理：训练前清理
+                self.clear_gpu_memory()
+                
                 if self.model_type == "lightgbm":
-                    model = lgb.LGBMClassifier(**params)
-                    model.fit(X_train, y_train, sample_weight=sample_weights)
+                    try:
+                        model = lgb.LGBMClassifier(**params)
+                        model.fit(X_train, y_train, sample_weight=sample_weights)
+                        
+                        # 🎮 统一GPU内存管理：训练后清理
+                        self.clear_gpu_memory()
+                            
+                    except Exception as e:
+                        logger.error(f"❌ LightGBM训练失败: {e}")
+                        # 降级到CPU
+                        params['device'] = 'cpu'
+                        model = lgb.LGBMClassifier(**params)
+                        model.fit(X_train, y_train, sample_weight=sample_weights)
+                        self.clear_gpu_memory()
                 
                 elif self.model_type == "xgboost":
-                    model = xgb.XGBClassifier(**params)
-                    model.fit(X_train, y_train, sample_weight=sample_weights)
+                    try:
+                        model = xgb.XGBClassifier(**params)
+                        model.fit(X_train, y_train, sample_weight=sample_weights, verbose=False)
+                        
+                        # 🎮 统一GPU内存管理：训练后清理
+                        self.clear_gpu_memory()
+                            
+                    except Exception as e:
+                        logger.error(f"❌ XGBoost训练失败: {e}")
+                        # 降级到CPU
+                        params['tree_method'] = 'hist'
+                        params['device'] = 'cpu'
+                        model = xgb.XGBClassifier(**params)
+                        model.fit(X_train, y_train, sample_weight=sample_weights, verbose=False)
+                        self.clear_gpu_memory()
                 
                 elif self.model_type == "catboost":
-                    model = cb.CatBoostClassifier(**params)
-                    model.fit(X_train, y_train, sample_weight=sample_weights)
+                    # 检查GPU内存可用性
+                    if torch.cuda.is_available():
+                        gpu_status = self.monitor_gpu_memory()
+                        if gpu_status.get('free', 0) > 500 * 1024**2:  # 500MB
+                            params['task_type'] = 'GPU'
+                            params['devices'] = '0'
+                            logger.debug(f"🚀 CatBoost使用GPU训练 (可用内存: {gpu_status['free']/1024**3:.1f}GB)")
+                        else:
+                            params['task_type'] = 'CPU'
+                            logger.warning(f"⚠️ GPU内存不足({gpu_status['free']/1024**3:.1f}GB)，切换到CPU")
+                    else:
+                        params['task_type'] = 'CPU'
+                        logger.debug("🔄 GPU不可用，CatBoost使用CPU训练")
+                    
+                    try:
+                        model = cb.CatBoostClassifier(**params)
+                        model.fit(X_train, y_train, sample_weight=sample_weights, verbose=False)
+                        
+                        # 🎮 统一GPU内存管理：训练后清理
+                        self.clear_gpu_memory()
+                            
+                    except Exception as e:
+                        logger.error(f"❌ CatBoost GPU训练失败: {e}")
+                        # 降级到CPU
+                        params['task_type'] = 'CPU'
+                        model = cb.CatBoostClassifier(**params)
+                        model.fit(X_train, y_train, sample_weight=sample_weights, verbose=False)
+                        self.clear_gpu_memory()
                 
                 elif self.model_type == "informer2":
                     # Informer-2需要特殊处理（深度学习模型 + 序列输入）
-                    from app.services.informer2_model import Informer2ForClassification
-                    from app.services.gmadl_loss import GMADLossWithHOLDPenalty
-                    import torch
-                    import torch.nn as nn
-                    from torch.utils.data import DataLoader, TensorDataset
+                    # 🎮 统一GPU内存管理：训练前清理
+                    self.clear_gpu_memory()
                     
                     # 🔑 检查输入维度（2D或3D）
                     if len(X_train.shape) == 2:
@@ -400,6 +503,13 @@ class HyperparameterOptimizer:
                     with torch.no_grad():
                         val_outputs = model(X_val_tensor)
                         y_pred = torch.argmax(val_outputs, dim=1).cpu().numpy()
+                    
+                    # 🎮 统一GPU内存管理：训练后清理
+                    self.clear_gpu_memory()
+                    
+                    # 删除模型和张量释放内存
+                    del model, X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor
+                    self.clear_gpu_memory()
                 
                 # 预测并评估
                 if self.model_type != "informer2":

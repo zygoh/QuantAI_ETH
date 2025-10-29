@@ -28,13 +28,13 @@ class BinanceClient:
         
         # 配置代理地址
         # REST API: https://n8n.do2ge.com/tail/http/relay/fapi/v1/... -> https://fapi.binance.com/fapi/v1/...
-        base_url = "https://n8n.do2ge.com/tail/http/relay"
+        self.base_url = "https://n8n.do2ge.com/tail/http/relay"
         
         # REST API客户端
         self.client = UMFutures(
             key=self.api_key,
             secret=self.secret_key,
-            base_url=base_url,
+            base_url=self.base_url,
             timeout=30  # 增加超时时间
         )
         
@@ -47,7 +47,7 @@ class BinanceClient:
         
         logger.info(f"Binance客户端初始化完成")
         logger.info(f"  - 模式: {'测试网' if self.testnet else '生产环境'}")
-        logger.info(f"  - REST URL: {base_url}")
+        logger.info(f"  - REST URL: {self.base_url}")
         logger.info(f"  - API Key 长度: {len(self.api_key)} 字符")
         logger.info(f"  - API Key (前8位): {self.api_key[:8]}...")
         logger.info(f"  - Secret Key 长度: {len(self.secret_key)} 字符")
@@ -497,6 +497,9 @@ class BinanceWebSocketClient:
     
     async def _reconnect(self):
         """自动重连"""
+        # ✅ 立即输出日志，确认重连任务已开始执行
+        logger.warning(f"🔄 重连任务开始执行 (当前重连次数: {self.reconnect_count})...")
+        
         try:
             # 检查是否超过最大重连次数
             self.reconnect_count += 1
@@ -506,26 +509,32 @@ class BinanceWebSocketClient:
                 self.is_running = False
                 return
             
-            logger.info(f"尝试重新建立WebSocket连接 (第 {self.reconnect_count}/{self.max_reconnect_attempts} 次)...")
+            logger.info(f"🔌 尝试重新建立WebSocket连接 (第 {self.reconnect_count}/{self.max_reconnect_attempts} 次)...")
+            logger.info(f"⏱️ 等待 {self.current_reconnect_delay} 秒后开始重连...")
             await asyncio.sleep(self.current_reconnect_delay)
             
             # 停止旧连接
             if self.ws_client:
                 try:
+                    logger.info("🛑 停止旧WebSocket连接...")
                     self.ws_client.stop()
                     await asyncio.sleep(0.5)  # 等待连接完全关闭
+                    logger.info("✅ 旧连接已停止")
                 except Exception as stop_error:
-                    logger.warning(f"停止旧连接时出错: {stop_error}")
+                    logger.warning(f"⚠️ 停止旧连接时出错: {stop_error}")
             
             # 重新启动
+            logger.info("🚀 启动新WebSocket连接...")
             self.start_websocket()
             
-            # 🔥 等待连接建立，增加重试机制
+            # 🔥 等待连接建立，增加重试机制和详细日志
             max_wait_time = 10  # 最多等待10秒
             wait_time = 0
             while not self.is_connected and wait_time < max_wait_time:
                 await asyncio.sleep(0.5)
                 wait_time += 0.5
+                if wait_time % 2 == 0:  # 每2秒输出一次等待状态
+                    logger.debug(f"⏳ 等待连接建立中... ({wait_time:.1f}s/{max_wait_time}s)")
             
             if self.is_connected:
                 logger.info("✅ WebSocket连接已建立，开始恢复订阅...")
@@ -537,32 +546,38 @@ class BinanceWebSocketClient:
                 self.current_reconnect_delay = self.reconnect_delay
                 self.reconnect_count = 0
                 self.is_reconnecting = False  # 🔓 释放重连锁
-                logger.info("✅ WebSocket重连成功")
+                logger.warning("✅ ✅ ✅ WebSocket重连成功！连接已恢复正常 ✅ ✅ ✅")
             else:
-                logger.error("❌ WebSocket连接建立超时，重连失败")
+                logger.error(f"❌ WebSocket连接建立超时（等待了{max_wait_time}秒），重连失败")
+                logger.error(f"   当前状态: is_connected={self.is_connected}, is_running={self.is_running}")
                 raise Exception("连接建立超时")
             
         except Exception as e:
-            logger.error(f"❌ WebSocket重连失败 (第 {self.reconnect_count} 次): {e}")
+            logger.error(f"❌ WebSocket重连失败 (第 {self.reconnect_count}/{self.max_reconnect_attempts} 次): {e}")
+            logger.error(f"   错误类型: {type(e).__name__}")
             
             # 指数退避，增加重连延迟
             self.current_reconnect_delay = min(
                 self.current_reconnect_delay * 2,
                 self.max_reconnect_delay
             )
-            logger.warning(f"⏱️ 下次重连延迟: {self.current_reconnect_delay}秒")
+            logger.warning(f"⏱️ 下次重连延迟: {self.current_reconnect_delay}秒 (指数退避策略)")
             
             # 🔄 重连失败后，再次尝试重连
             self.is_reconnecting = False  # 释放锁，允许下次重连
             
             # 再次调度重连任务（如果还在运行且未超过最大次数）
             if self.is_running and self.loop and self.reconnect_count < self.max_reconnect_attempts:
-                logger.info("📅 调度下次重连...")
+                logger.info(f"📅 调度下次重连... (还剩 {self.max_reconnect_attempts - self.reconnect_count} 次机会)")
                 future = asyncio.run_coroutine_threadsafe(self._reconnect(), self.loop)
                 self.reconnect_task = future
+                logger.info("✅ 下次重连任务已提交")
             elif self.reconnect_count >= self.max_reconnect_attempts:
-                logger.error("❌ 已达到最大重连次数，停止重连尝试")
+                logger.error("❌ ❌ ❌ 已达到最大重连次数，停止重连尝试 ❌ ❌ ❌")
+                logger.error("   系统将继续运行，但WebSocket数据流已中断")
                 self.is_running = False
+            else:
+                logger.error(f"❌ 无法调度重连: is_running={self.is_running}, loop={self.loop is not None}")
     
     def _restore_subscriptions(self):
         """恢复所有订阅"""

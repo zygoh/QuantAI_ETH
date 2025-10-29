@@ -6,6 +6,8 @@ import logging
 import pickle
 import os
 import gc
+import time
+import traceback
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timedelta
 import pandas as pd
@@ -13,6 +15,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split, TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.feature_selection import SelectFromModel
 import lightgbm as lgb
 import joblib
 
@@ -21,6 +24,10 @@ from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
 from app.services.feature_engineering import feature_engineer
 from app.services.data_service import DataService
+from app.utils.helpers import format_signal_type
+
+# 延迟导入避免循环依赖
+# from app.services.binance_client import binance_client  # 在方法内导入
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +181,6 @@ class MLService:
                     logger.info(f"✅ {timeframe} 模型训练完成 - 准确率: {metrics['accuracy']:.4f}")
                 except Exception as e:
                     logger.error(f"❌ {timeframe} 模型训练失败: {e}")
-                    import traceback
                     logger.error(f"详细错误: {traceback.format_exc()}")
                     all_metrics[timeframe] = {'success': False, 'error': str(e), 'accuracy': 0.0, 'training_time': 0.0}
             
@@ -227,7 +233,6 @@ class MLService:
             
         except Exception as e:
             logger.error(f"模型训练失败: {e}")
-            import traceback
             logger.error(f"详细错误: {traceback.format_exc()}")
             return {}
     
@@ -238,7 +243,6 @@ class MLService:
             tuple: (metrics, training_data_with_timeframe) 
         """
         try:
-            import time
             start_time = time.time()
             
             # 获取该时间框架的训练数据
@@ -349,7 +353,6 @@ class MLService:
             signal_type = signal_map[prediction]
             
             # 简洁记录预测结果（使用图标+中文）
-            from app.utils.helpers import format_signal_type
             logger.info(f"🎯 {timeframe} 预测: {format_signal_type(signal_type)} (置信度={confidence:.4f}, 概率: 📉{probabilities[0]:.2f} ⏸️{probabilities[1]:.2f} 📈{probabilities[2]:.2f})")
             
             result = {
@@ -522,7 +525,6 @@ class MLService:
             
         except Exception as e:
             logger.error(f"训练数据写入数据库失败: {e}")
-            import traceback
             logger.error(f"详细错误: {traceback.format_exc()}")
             raise
     
@@ -693,8 +695,6 @@ class MLService:
             选中的特征列表
         """
         try:
-            from sklearn.feature_selection import SelectFromModel
-            
             n_samples = len(X)
             n_feats = len(X.columns)
             ratio = n_samples / n_feats if n_feats > 0 else 0
@@ -735,7 +735,6 @@ class MLService:
             logger.info(f"✅ 过滤了{filtered_count}个低重要性特征(<{imp_threshold:.6f}), 剩余{len(stage1_cols)}个")
             
             # 🆕 Kim建议4: 释放内存
-            import gc
             del lgb_filter
             gc.collect()
             
@@ -789,7 +788,6 @@ class MLService:
             
         except Exception as e:
             logger.error(f"智能特征选择失败: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             
             # 降级方案：使用简单的top_n选择

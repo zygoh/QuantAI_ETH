@@ -8,8 +8,8 @@ alwaysApply: true
 # QuantAI-ETH - Development Standards & Code Quality Rules
 
 **Project**: QuantAI-ETH (Quantitative AI for Ethereum Trading)  
-**Version**: v9.0  
-**Last Updated**: 2025-01-22
+**Version**: v10.0  
+**Last Updated**: 2025-10-27
 
 ---
 
@@ -53,6 +53,107 @@ alwaysApply: true
 - Consistent variable naming
 - Proper logging with emojis
 - Input validation and assertions
+- All imports at file top (no local imports)
+
+---
+
+## 📦 Module Import Standards
+
+### Unified Import Management
+
+**Critical Rule**: **All module imports MUST be declared at the top of the file. Local imports are STRICTLY PROHIBITED.**
+
+**Required Import Structure**:
+```python
+"""
+Module docstring
+"""
+# Standard library imports
+import os
+import sys
+import logging
+from typing import Dict, List, Any
+
+# Third-party imports
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+# Local application imports
+from app.core.config import settings
+from app.services.data_service import DataService
+```
+
+**Import Ordering**:
+1. Standard library imports
+2. Third-party library imports (sorted alphabetically)
+3. Local application imports (sorted by module hierarchy)
+4. Blank line between each group
+
+**Benefits**:
+- Clear dependency visualization
+- Avoid Python scoping issues (UnboundLocalError)
+- Better performance (imports cached at module load)
+- Improved code readability
+- Easier dependency management
+- No circular import issues
+
+**Prohibited Practices**:
+```python
+# ❌ WRONG: Local import inside function
+def some_function():
+    import pandas as pd  # PROHIBITED
+    from app.utils import helper  # PROHIBITED
+    
+# ❌ WRONG: Local import in try-except
+try:
+    import optional_module  # PROHIBITED (unless truly optional)
+except ImportError:
+    optional_module = None
+    
+# ❌ WRONG: Conditional import inside function
+def process_data():
+    if condition:
+        from sklearn import model  # PROHIBITED
+```
+
+**Correct Practices**:
+```python
+# ✅ CORRECT: All imports at top
+import pandas as pd
+from app.utils import helper
+from sklearn import model
+
+def some_function():
+    # Use imported modules directly
+    df = pd.DataFrame()
+    helper.process()
+    
+def process_data():
+    # All dependencies already available
+    model.fit()
+```
+
+**Exception Cases** (Rare):
+- **Circular Dependency**: Only when unavoidable, document clearly with comment
+  ```python
+  # Delayed import to avoid circular dependency
+  # from app.services.binance_client import binance_client
+  ```
+- **Optional Features**: Use try-except at module level, not in functions
+  ```python
+  # Optional GPU support
+  try:
+      import torch
+      TORCH_AVAILABLE = True
+  except ImportError:
+      TORCH_AVAILABLE = False
+  ```
+
+**Enforcement**:
+- All code reviews MUST check for local imports
+- Zero tolerance policy - any local import must be refactored
+- CI/CD should include linting rules to detect local imports
 
 ---
 
@@ -296,6 +397,7 @@ if not (min_val <= value <= max_val):
 ### Pre-Commit Validation
 
 **Code Quality Checklist**:
+- [ ] All imports at file top (no local imports)
 - [ ] No duplicate definitions
 - [ ] All variables defined before use
 - [ ] Complete type hints
@@ -327,6 +429,112 @@ if not (min_val <= value <= max_val):
 - Follow PEP 8 for Python
 - Use consistent quote style
 - Proper line length (max 120 characters)
+
+### Python Indentation Standards
+
+**Critical Rule**: **All Python code MUST use 4 spaces for indentation. Inconsistent indentation is a ZERO-TOLERANCE error.**
+
+**Required Indentation Rules**:
+
+1. **Base Indentation**: 4 spaces per level
+   ```python
+   # ✅ CORRECT
+   def function():
+       if condition:
+           statement()
+   
+   # ❌ WRONG: Inconsistent spaces
+   def function():
+       if condition:
+             statement()  # 6 spaces instead of 8
+   ```
+
+2. **Function/Method Body**: Indent 4 spaces from function definition
+   ```python
+   # ✅ CORRECT
+   def method(self, param: str) -> str:
+       """Docstring"""
+       result = process(param)
+       return result
+   
+   # ❌ WRONG: Missing or extra indentation
+   def method(self, param: str) -> str:
+   """Docstring"""  # Missing indent
+   result = process(param)
+   return result
+   ```
+
+3. **Try-Except Blocks**: All blocks at same level
+   ```python
+   # ✅ CORRECT
+   try:
+       operation()
+   except Exception as e:
+       logger.error(f"Error: {e}")
+       logger.error(traceback.format_exc())
+   
+   # ❌ WRONG: Extra indentation in except block
+   try:
+       operation()
+   except Exception as e:
+       logger.error(f"Error: {e}")
+           logger.error(traceback.format_exc())  # Extra indent
+   ```
+
+4. **Nested Structures**: Each level adds exactly 4 spaces
+   ```python
+   # ✅ CORRECT: 0, 4, 8, 12 spaces
+   class MyClass:
+       def method(self):
+           if condition:
+               for item in items:
+                   process(item)
+   
+   # ❌ WRONG: Inconsistent spacing
+   class MyClass:
+       def method(self):
+           if condition:
+              for item in items:  # 2 spaces instead of 4
+                   process(item)
+   ```
+
+5. **Multi-line Statements**: Align continuation lines
+   ```python
+   # ✅ CORRECT: Aligned continuation
+   result = some_function(
+       param1=value1,
+       param2=value2,
+       param3=value3
+   )
+   
+   # ✅ CORRECT: Hanging indent (4 spaces)
+   result = some_function(
+       param1, param2, param3,
+       param4, param5
+   )
+   ```
+
+**Common Indentation Errors to Avoid**:
+
+| Error Type | Example | Fix |
+|------------|---------|-----|
+| **Mixed spaces/tabs** | `\t    code` | Use only spaces |
+| **Inconsistent levels** | `    code` then `      code` | Always 4-space increments |
+| **Over-indentation** | 8 spaces where 4 needed | Check block level |
+| **Under-indentation** | 2 spaces where 4 needed | Add missing spaces |
+| **Misaligned except** | except at wrong level | Align with try |
+
+**Tools for Indentation Checking**:
+- **autopep8**: Auto-fix indentation issues
+- **pylint**: Detect indentation errors
+- **flake8**: Check PEP 8 compliance including indentation
+- **black**: Auto-format with consistent style
+
+**Enforcement**:
+- Pre-commit hooks MUST check indentation
+- CI/CD MUST reject code with indentation errors
+- Code reviews MUST verify indentation consistency
+- Zero tolerance: Fix immediately, never commit broken indentation
 
 **Version Control**:
 - Clear commit messages
@@ -369,20 +577,21 @@ if not (min_val <= value <= max_val):
 
 ## 🚨 Critical Rules Summary
 
-1. **Variable Naming**: Consistent short keys across all operations
-2. **Method Consistency**: Uniform signatures and error handling
-3. **Comment Quality**: Clear, accurate, and up-to-date documentation
-4. **Error Handling**: Comprehensive try-except blocks
-5. **Data Validation**: Assertions and type checking
-6. **Performance**: Meet response time targets
-7. **Testing**: Complete test coverage
-8. **Code Review**: Follow checklist before commits
-9. **Architecture**: Single responsibility and loose coupling
-10. **Professional Standards**: Zero tolerance for low-level errors
+1. **Import Standards**: All imports at file top, no local imports (STRICT)
+2. **Variable Naming**: Consistent short keys across all operations
+3. **Method Consistency**: Uniform signatures and error handling
+4. **Comment Quality**: Clear, accurate, and up-to-date documentation
+5. **Error Handling**: Comprehensive try-except blocks
+6. **Data Validation**: Assertions and type checking
+7. **Performance**: Meet response time targets
+8. **Testing**: Complete test coverage
+9. **Code Review**: Follow checklist before commits
+10. **Architecture**: Single responsibility and loose coupling
+11. **Professional Standards**: Zero tolerance for low-level errors
 
 ---
 
-**Version**: v9.0  
-**Last Update**: 2025-01-22  
-**Focus**: Development standards and code quality  
+**Version**: v10.1  
+**Last Update**: 2025-10-27  
+**Focus**: Development standards, code quality, and indentation rules  
 **Scope**: All project files and modules

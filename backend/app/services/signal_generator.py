@@ -821,7 +821,7 @@ class SignalGenerator:
             
             # 如果信号类型相同，拒绝（去重）
             if last_signal_type == signal_type:
-                logger.warning(f"✗ 信号重复: 上次={last_signal_type}, 本次={signal_type}")
+                logger.info(f"✗ 信号重复: 上次={last_signal_type}, 本次={signal_type}")
                 return False
             
             # 信号类型不同，允许发送（方向改变）
