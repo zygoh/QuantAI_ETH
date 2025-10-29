@@ -64,6 +64,13 @@ class DataService:
         try:
             logger.info("启动数据获取服务...")
             
+            # ✅ 显式输出Binance客户端初始化状态（确保日志可见）
+            logger.info(f"✅ Binance客户端初始化完成")
+            logger.info(f"   - 模式: {'测试网' if binance_client.testnet else '生产环境'}")
+            logger.info(f"   - REST URL: {binance_client.base_url}")
+            logger.info(f"   - API Key 长度: {len(binance_client.api_key) if binance_client.api_key else 0} 字符")
+            logger.info(f"   - API Key (前8位): {binance_client.api_key[:8] if binance_client.api_key and len(binance_client.api_key) >= 8 else 'N/A'}...")
+            
             # 🔥 保存当前事件循环（用于WebSocket回调）
             self.loop = asyncio.get_running_loop()
             
