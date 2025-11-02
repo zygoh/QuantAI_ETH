@@ -53,11 +53,16 @@ console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(logging.Formatter(log_format))
 
 # 配置根日志器
-logging.basicConfig(
-    level=getattr(logging, settings.LOG_LEVEL),  # 从配置读取日志级别
-    format=log_format,
-    handlers=[file_handler, console_handler]
-)
+root_logger = logging.getLogger()
+root_logger.setLevel(getattr(logging, settings.LOG_LEVEL))
+
+# 清除已有的 handlers（避免重复添加）
+if root_logger.hasHandlers():
+    root_logger.handlers.clear()
+
+# 添加 handlers
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
 
 logger = logging.getLogger(__name__)
 logger.info(f"日志文件: {log_file}")

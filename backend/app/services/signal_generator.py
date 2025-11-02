@@ -2,7 +2,7 @@
 交易信号生成器
 
 职责：
-1. 🎯 多时间框架信号生成（15m/2h/4h）
+1. 🎯 多时间框架信号生成（3m/5m/15m）
 2. 🔄 信号缓存与合成
 3. 🔒 预热信号保护（前5个信号仅记录）
 4. 📊 WebSocket实时数据处理
@@ -13,6 +13,7 @@
 """
 import asyncio
 import logging
+import time
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 from dataclasses import dataclass
@@ -54,7 +55,16 @@ class SignalGenerator:
         
         # 信号生成参数
         self.confidence_threshold = settings.CONFIDENCE_THRESHOLD
-        self.min_signal_interval = 900  # 短线策略：3分钟最小信号间隔（更频繁）
+        self.min_signal_interval = 180  # 短线策略：3分钟最小信号间隔（180秒，与3m K线周期一致）
+        self.min_prediction_interval = 30  # 预测频率防抖：同一时间框架至少间隔30秒
+        
+        # 🔑 预测频率控制（新增）
+        self.last_prediction_time: Dict[str, float] = {}  # {timeframe: timestamp}
+        
+        # 🔑 特征缓存（新增）
+        self.feature_cache: Dict[str, pd.DataFrame] = {}  # {cache_key: features}
+        self.feature_cache_time: Dict[str, float] = {}  # {cache_key: timestamp}
+        self.feature_cache_ttl = 300  # 特征缓存5分钟
         
         # 止损止盈参数（中频交易策略：更紧的止损，保持止盈）
         self.stop_loss_pct = 0.015  # 1.5%止损（中频快速止损，减少风险）
@@ -238,17 +248,32 @@ class SignalGenerator:
             # 1. 将WebSocket数据添加到缓冲区
             await self._update_kline_buffer(kline_data)
             
-            # 2. 🔥 对该时间框架进行预测并缓存（每个时间框架独立预测）
+            # 2. 🔑 检查预测间隔（新增频率控制）
             timeframe = kline_data.interval
+            current_time = time.time()
+            last_time = self.last_prediction_time.get(timeframe, 0)
+            time_diff = current_time - last_time
             
+            if time_diff < self.min_prediction_interval:
+                logger.debug(f"⏸️ {timeframe} 预测间隔不足: {time_diff:.1f}s < {self.min_prediction_interval}s，跳过预测")
+                return
+            
+            logger.info(f"🎯 {timeframe} 触发预测: 距离上次预测 {time_diff:.1f}s")
+            
+            # 3. 对该时间框架进行预测并缓存（每个时间框架独立预测）
             prediction = await self._predict_single_timeframe(kline_data.symbol, timeframe)
             
             if prediction:
                 # 缓存该时间框架的预测结果
                 self.cached_predictions[timeframe] = prediction
+                
+                # 🔑 更新最后预测时间（新增）
+                self.last_prediction_time[timeframe] = current_time
+                
                 logger.debug(f"✅ {timeframe} 预测完成并缓存: {prediction.get('signal_type')} (置信度={prediction.get('confidence'):.4f})")
             else:
-                logger.warning(f"❌ {timeframe} 预测失败")
+                # 预测失败或模型训练中（详细信息已在ml_service层记录）
+                logger.debug(f"⏸️ {timeframe} 预测暂不可用")
                 return
             
             # 3. 🔥 只有5m信号更新时才触发合成（5m作为主时间框架）
@@ -428,7 +453,7 @@ class SignalGenerator:
             
             interval_minutes = {
                 '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30,
-                '1h': 60, '2h': 120, '4h': 240, '6h': 360, '8h': 480,
+                '1h': 60, '6h': 360, '8h': 480,
                 '12h': 720, '1d': 1440
             }
             minutes = interval_minutes.get(timeframe, 60)
@@ -556,7 +581,7 @@ class SignalGenerator:
             # 时间周期对应的分钟数
             interval_minutes = {
                 '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30,
-                '1h': 60, '2h': 120, '4h': 240, '6h': 360, '8h': 480,
+                '1h': 60, '6h': 360, '8h': 480,
                 '12h': 720, '1d': 1440
             }
             
@@ -606,7 +631,8 @@ class SignalGenerator:
                     predictions[timeframe] = prediction
                     logger.debug(f"✅ {timeframe}预测完成: {prediction.get('signal_type')} (置信度={prediction.get('confidence'):.4f})")
                 else:
-                    logger.warning(f"❌ {timeframe}预测失败或返回空")
+                    # 预测失败或模型训练中（详细信息已在ml_service层记录）
+                    logger.debug(f"⏸️ {timeframe}预测暂不可用")
             
             return predictions
             

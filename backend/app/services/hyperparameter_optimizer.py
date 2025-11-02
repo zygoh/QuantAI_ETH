@@ -17,9 +17,10 @@ from sklearn.metrics import accuracy_score
 from sklearn.utils.class_weight import compute_sample_weight
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 from app.services.informer2_model import Informer2ForClassification
-from app.services.gmadl_loss import GMADLossWithHOLDPenalty
+from app.services.gmadl_loss import create_trade_loss
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ class HyperparameterOptimizer:
         Args:
             X: 特征数据（已缩放）
             y: 标签数据
-            timeframe: 时间框架（15m/2h/4h）
+        timeframe: 时间框架（3m/5m/15m）
             model_type: 模型类型（lightgbm/xgboost/catboost）
             use_gpu: 是否使用GPU加速
         """
@@ -140,38 +141,19 @@ class HyperparameterOptimizer:
                 'verbose': -1,
                 'force_col_wise': True
             }
-        
-        elif self.timeframe == "2h":
-            # 2h: 样本中等，简化模型
+        else:
+            # 3m/5m 简化搜索（与15m区分）
             base_params = {
-                'n_estimators': trial.suggest_int('n_estimators', 100, 300),
-                'max_depth': trial.suggest_int('max_depth', 3, 6),
-                'num_leaves': trial.suggest_int('num_leaves', 11, 31),
-                'learning_rate': trial.suggest_float('learning_rate', 0.03, 0.15, log=True),
-                'min_child_samples': trial.suggest_int('min_child_samples', 40, 80),
+                'n_estimators': trial.suggest_int('n_estimators', 120, 320),
+                'max_depth': trial.suggest_int('max_depth', 4, 8),
+                'num_leaves': trial.suggest_int('num_leaves', 31, 63),
+                'learning_rate': trial.suggest_float('learning_rate', 0.03, 0.12, log=True),
+                'min_child_samples': trial.suggest_int('min_child_samples', 30, 70),
                 'subsample': trial.suggest_float('subsample', 0.6, 0.85),
                 'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.85),
-                'reg_alpha': trial.suggest_float('reg_alpha', 0.5, 1.2),
-                'reg_lambda': trial.suggest_float('reg_lambda', 0.5, 1.2),
+                'reg_alpha': trial.suggest_float('reg_alpha', 0.3, 1.0),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0.3, 1.0),
                 'min_split_gain': trial.suggest_float('min_split_gain', 0.0, 0.2),
-                'random_state': 42,
-                'verbose': -1,
-                'force_col_wise': True
-            }
-        
-        else:  # 4h
-            # 4h: 样本少，极简模型
-            base_params = {
-                'n_estimators': trial.suggest_int('n_estimators', 50, 200),
-                'max_depth': trial.suggest_int('max_depth', 2, 5),
-                'num_leaves': trial.suggest_int('num_leaves', 7, 21),
-                'learning_rate': trial.suggest_float('learning_rate', 0.05, 0.2, log=True),
-                'min_child_samples': trial.suggest_int('min_child_samples', 50, 100),
-                'subsample': trial.suggest_float('subsample', 0.6, 0.8),
-                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.8),
-                'reg_alpha': trial.suggest_float('reg_alpha', 0.8, 1.5),
-                'reg_lambda': trial.suggest_float('reg_lambda', 0.8, 1.5),
-                'min_split_gain': trial.suggest_float('min_split_gain', 0.0, 0.3),
                 'random_state': 42,
                 'verbose': -1,
                 'force_col_wise': True
@@ -201,7 +183,7 @@ class HyperparameterOptimizer:
                 'verbosity': 0
             }
         else:
-            # 2h/4h简化
+            # 3m/5m 简化
             base_params = {
                 'n_estimators': trial.suggest_int('n_estimators', 100, 250),
                 'max_depth': trial.suggest_int('max_depth', 2, 5),
@@ -217,8 +199,8 @@ class HyperparameterOptimizer:
         
         # 🎮 GPU加速（如果启用）
         if self.use_gpu:
-            base_params['tree_method'] = 'gpu_hist'
-            base_params['gpu_id'] = 0
+            base_params['tree_method'] = 'hist'  # 新版本使用 hist
+            base_params['device'] = 'cuda'  # 使用 device 参数指定 GPU
         else:
             base_params['tree_method'] = 'hist'
         
@@ -237,7 +219,7 @@ class HyperparameterOptimizer:
                 'verbose': False
             }
         else:
-            # 2h/4h简化
+            # 3m/5m 简化
             base_params = {
                 'iterations': trial.suggest_int('iterations', 100, 250),
                 'depth': trial.suggest_int('depth', 2, 5),
@@ -259,10 +241,11 @@ class HyperparameterOptimizer:
         """Informer-2搜索空间（基于Transformer理论的最佳实践 + 精确复杂度匹配）"""
         
         # 🔑 序列长度配置（与ensemble_ml_service.py保持一致）
+        # 🎯 优化：减少序列长度以降低内存占用（减少80-90%）
         seq_len_config = {
-            '3m': 480,   # 480 × 3分钟 = 24小时（超短期模式识别）
-            '5m': 288,   # 288 × 5分钟 = 24小时（主时间框架）
-            '15m': 96    # 96 × 15分钟 = 24小时（趋势确认）
+            '3m': 96,   # 96 × 3分钟 = 4.8小时（足够短期模式识别）
+            '5m': 96,   # 96 × 5分钟 = 8小时（主时间框架）
+            '15m': 64   # 64 × 15分钟 = 16小时（趋势确认）
         }
         
         seq_len = seq_len_config.get(self.timeframe, 96)
@@ -273,10 +256,10 @@ class HyperparameterOptimizer:
         # 3. n_layers与序列长度的关系：n_layers ≈ log2(seq_len) + 1
         
         if self.timeframe == "15m":
-            # 15m: 长序列(96)，精确复杂度匹配
-            # d_model = sqrt(96) * 12 ≈ 118 → 128
-            # n_heads = 128 / 64 = 2 → 4,8,16 (渐进式搜索)
-            # n_layers = log2(96) + 1 ≈ 7 → 2,3,4 (渐进式搜索)
+            # 15m: 短序列(64)，精确复杂度匹配
+            # d_model = sqrt(64) * 12 ≈ 96 → 128
+            # n_heads = 128 / 64 = 2 → 4,8 (渐进式搜索)
+            # n_layers = log2(64) + 1 ≈ 7 → 2,3 (渐进式搜索)
             base_params = {
                 'd_model': trial.suggest_categorical('d_model', [128, 256]),      # 精确匹配
                 'n_heads': trial.suggest_categorical('n_heads', [4, 8]),          # 精确匹配
@@ -288,37 +271,18 @@ class HyperparameterOptimizer:
                 'alpha': trial.suggest_float('alpha', 0.5, 2.0),  # GMADL参数
                 'beta': trial.suggest_float('beta', 0.3, 0.7)    # GMADL参数
             }
-        elif self.timeframe == "2h":
-            # 2h: 中等序列(48)，精确复杂度匹配
-            # d_model = sqrt(48) * 12 ≈ 83 → 64,128
-            # n_heads = 64/128 / 64 = 1/2 → 2,4,8 (渐进式搜索)
-            # n_layers = log2(48) + 1 ≈ 6 → 1,2,3 (渐进式搜索)
+        else:
+            # 3m/5m：中序列(96)
             base_params = {
-                'd_model': trial.suggest_categorical('d_model', [64, 128]),       # 精确匹配
-                'n_heads': trial.suggest_categorical('n_heads', [2, 4, 8]),       # 精确匹配
-                'n_layers': trial.suggest_int('n_layers', 1, 3),  # 精确匹配
-                'epochs': trial.suggest_int('epochs', 15, 30),
-                'batch_size': trial.suggest_categorical('batch_size', [128, 256]),
-                'lr': trial.suggest_float('lr', 0.001, 0.005, log=True),
+                'd_model': trial.suggest_categorical('d_model', [64, 128]),
+                'n_heads': trial.suggest_categorical('n_heads', [2, 4, 8]),
+                'n_layers': trial.suggest_int('n_layers', 1, 2),
+                'epochs': trial.suggest_int('epochs', 10, 30),
+                'batch_size': trial.suggest_categorical('batch_size', [64, 128, 256]),
+                'lr': trial.suggest_float('lr', 0.0008, 0.006, log=True),
                 'dropout': trial.suggest_float('dropout', 0.1, 0.3),
-                'alpha': trial.suggest_float('alpha', 0.8, 1.5),
+                'alpha': trial.suggest_float('alpha', 0.8, 1.8),
                 'beta': trial.suggest_float('beta', 0.4, 0.6)
-            }
-        else:  # 4h
-            # 4h: 短序列(24)，精确复杂度匹配
-            # d_model = sqrt(24) * 12 ≈ 59 → 64
-            # n_heads = 64 / 64 = 1 → 2,4 (渐进式搜索)
-            # n_layers = log2(24) + 1 ≈ 5 → 1,2 (渐进式搜索)
-            base_params = {
-                'd_model': trial.suggest_categorical('d_model', [64]),            # 精确匹配
-                'n_heads': trial.suggest_categorical('n_heads', [2, 4]),          # 精确匹配
-                'n_layers': trial.suggest_int('n_layers', 1, 2),  # 精确匹配
-                'epochs': trial.suggest_int('epochs', 10, 25),
-                'batch_size': trial.suggest_categorical('batch_size', [128, 256]),
-                'lr': trial.suggest_float('lr', 0.002, 0.01, log=True),
-                'dropout': trial.suggest_float('dropout', 0.15, 0.35),
-                'alpha': trial.suggest_float('alpha', 1.0, 2.0),
-                'beta': trial.suggest_float('beta', 0.5, 0.7)
             }
         
         # 添加序列长度信息到参数中（用于日志记录）
@@ -353,23 +317,57 @@ class HyperparameterOptimizer:
         # 时间序列5折交叉验证
         tscv = TimeSeriesSplit(n_splits=5)
         cv_scores = []
+        fold_fail_count = 0
         
         # 🔑 修复：对于3D序列输入，需要基于样本数量而不是特征进行分割
         n_samples = len(self.X) if isinstance(self.X, np.ndarray) else self.X.shape[0]
         
         for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(np.arange(n_samples))):
-            X_train, X_val = self.X[train_idx], self.X[val_idx]
-            # 🔑 修复：兼容 numpy 数组和 pandas Series
-            if isinstance(self.y, np.ndarray):
-                y_train, y_val = self.y[train_idx], self.y[val_idx]
-            else:
-                y_train, y_val = self.y.iloc[train_idx], self.y.iloc[val_idx]
+            # 🔥 关键修复：确保索引转换为numpy数组（兼容内存映射）
+            train_idx = np.asarray(train_idx)
+            val_idx = np.asarray(val_idx)
             
-            # 计算样本权重（类别平衡 × 时间衰减 × HOLD惩罚）
-            class_weights = compute_sample_weight('balanced', y_train)
+            # 🔥 关键修复：对于内存映射数组，需要复制数据到内存
+            if hasattr(self.X, 'filename') and self.X.filename:
+                # 内存映射数组：复制到内存
+                X_train = np.array(self.X[train_idx], dtype=np.float32)
+                X_val = np.array(self.X[val_idx], dtype=np.float32)
+            else:
+                # 普通数组：直接切片
+                X_train, X_val = self.X[train_idx], self.X[val_idx]
+            
+            # 🔑 修复：统一转换为numpy数组（兼容pandas Series和numpy数组）
+            if isinstance(self.y, pd.Series):
+                y_train = self.y.iloc[train_idx].values
+                y_val = self.y.iloc[val_idx].values
+            elif isinstance(self.y, np.ndarray):
+                if hasattr(self.y, 'filename') and self.y.filename:
+                    # 内存映射数组：复制到内存
+                    y_train = np.array(self.y[train_idx], dtype=np.int64)
+                    y_val = np.array(self.y[val_idx], dtype=np.int64)
+                else:
+                    y_train, y_val = self.y[train_idx], self.y[val_idx]
+            else:
+                # 其他类型：尝试转换
+                y_train = np.asarray(self.y)[train_idx]
+                y_val = np.asarray(self.y)[val_idx]
+            
+            # 计算样本权重（有效样本数 × 时间衰减 × HOLD惩罚）
+            try:
+                from app.services.ml_service import MLService
+                temp_svc = MLService()
+                class_weights = temp_svc._compute_effective_sample_weights(y_train, self.timeframe)
+            except Exception:
+                class_weights = compute_sample_weight('balanced', y_train)
             # ✅ 添加时间衰减权重（与基础模型训练保持一致）
             time_decay = np.exp(-np.arange(len(X_train)) / (len(X_train) * 0.1))[::-1]
-            hold_penalty_weights = np.where(y_train == 1, self.hold_penalty, 1.0)
+            # HOLD惩罚自适应
+            hold_ratio_tmp = float((y_train == 1).sum()) / max(len(y_train), 1)
+            if self.timeframe == '3m':
+                hold_weight_tmp = float(max(0.35, min(0.70, 0.80 - 0.6 * hold_ratio_tmp)))
+            else:
+                hold_weight_tmp = float(max(0.50, min(0.75, 0.85 - 0.5 * hold_ratio_tmp)))
+            hold_penalty_weights = np.where(y_train == 1, hold_weight_tmp, 1.0)
             sample_weights = class_weights * time_decay * hold_penalty_weights
             
             # 训练模型
@@ -450,26 +448,76 @@ class HyperparameterOptimizer:
                         # 2D输入：需要构造序列（这不应该发生，但作为降级处理）
                         logger.warning(f"⚠️ Informer-2收到2D输入，将跳过此fold")
                         cv_scores.append(0.0)
+                        fold_fail_count += 1
                         continue
                     
                     # 3D序列输入：(n_samples, seq_len, n_features)
                     n_features = X_train.shape[2]
                     
-                    # 转换为PyTorch张量
+                    # 转换为PyTorch张量（内存优化）
                     device = torch.device('cuda:0' if self.use_gpu and torch.cuda.is_available() else 'cpu')
-                    X_train_tensor = torch.FloatTensor(X_train).to(device)
-                    # ✅ 兼容pandas Series和numpy ndarray
-                    y_train_np = y_train.values if hasattr(y_train, 'values') else y_train
-                    y_val_np = y_val.values if hasattr(y_val, 'values') else y_val
-                    y_train_tensor = torch.LongTensor(y_train_np).to(device)
-                    X_val_tensor = torch.FloatTensor(X_val).to(device)
-                    y_val_tensor = torch.LongTensor(y_val_np).to(device)
                     
-                    # 创建数据加载器
-                    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-                    train_loader = DataLoader(train_dataset, batch_size=params['batch_size'], shuffle=True, num_workers=0)
+                    # 🔥 内存优化：确保输入数据为float32（减少内存占用）
+                    if X_train.dtype != np.float32:
+                        logger.debug(f"   转换X_train为float32（原类型: {X_train.dtype}）")
+                        X_train = X_train.astype(np.float32)
+                    if X_val.dtype != np.float32:
+                        logger.debug(f"   转换X_val为float32（原类型: {X_val.dtype}）")
+                        X_val = X_val.astype(np.float32)
                     
-                    # 创建模型（支持序列输入）
+                    # 🔥 关键修复：统一转换为numpy数组（确保是连续内存）
+                    if not isinstance(y_train, np.ndarray):
+                        y_train_np = np.asarray(y_train, dtype=np.int64)
+                    else:
+                        y_train_np = y_train.astype(np.int64) if y_train.dtype != np.int64 else y_train
+                    
+                    if not isinstance(y_val, np.ndarray):
+                        y_val_np = np.asarray(y_val, dtype=np.int64)
+                    else:
+                        y_val_np = y_val.astype(np.int64) if y_val.dtype != np.int64 else y_val
+                    
+                    # 🔥 关键修复：创建张量用于内存监控（但不用于训练）
+                    # DataLoader会自动处理数据转换
+                    train_memory_mb = (X_train.nbytes + y_train_np.nbytes) / (1024 ** 2)
+                    logger.debug(f"   训练集内存: {train_memory_mb:.1f} MB")
+                    
+                    # 🚀 梯度累积配置（解决GPU OOM问题）
+                    effective_batch_size = params['batch_size']
+                    actual_batch_size = max(8, params['batch_size'] // 8)
+                    accumulation_steps = effective_batch_size // actual_batch_size
+                    
+                    # 🔥 关键修复：确保数据是连续的numpy数组（避免内存映射问题）
+                    if not X_train.flags['C_CONTIGUOUS']:
+                        logger.debug(f"   转换X_train为连续数组")
+                        X_train = np.ascontiguousarray(X_train)
+                    if not y_train_np.flags['C_CONTIGUOUS']:
+                        logger.debug(f"   转换y_train为连续数组")
+                        y_train_np = np.ascontiguousarray(y_train_np)
+                    
+                    # 创建数据加载器（使用更小的物理批次）
+                    class NumpyTimeSeriesDataset(Dataset):
+                        def __init__(self, X_np, y_np):
+                            # 确保数据是连续的numpy数组
+                            self.X_np = np.ascontiguousarray(X_np) if not X_np.flags['C_CONTIGUOUS'] else X_np
+                            self.y_np = np.ascontiguousarray(y_np) if not y_np.flags['C_CONTIGUOUS'] else y_np
+                        def __len__(self):
+                            return len(self.y_np)
+                        def __getitem__(self, idx):
+                            return (
+                                torch.from_numpy(self.X_np[idx].copy()).to(dtype=torch.float32),
+                                torch.tensor(self.y_np[idx], dtype=torch.long)
+                            )
+
+                    train_dataset = NumpyTimeSeriesDataset(X_train, y_train_np)
+                    train_loader = DataLoader(
+                        train_dataset,
+                        batch_size=actual_batch_size,
+                        shuffle=True,
+                        num_workers=0,
+                        pin_memory=True if device.type == 'cuda' else False
+                    )
+                    
+                    # 创建模型（支持序列输入 + 梯度检查点）
                     model = Informer2ForClassification(
                         n_features=n_features,  # 特征数量（从序列的最后一维获取）
                         n_classes=3,  # 类别数
@@ -477,30 +525,120 @@ class HyperparameterOptimizer:
                         n_heads=params['n_heads'],
                         n_layers=params['n_layers'],
                         dropout=params['dropout'],
-                        use_distilling=True  # 启用蒸馏层（完整Informer架构）
+                        use_distilling=True,  # 启用蒸馏层（完整Informer架构）
+                        use_gradient_checkpointing=True  # 🔥 启用梯度检查点（节省50-70%内存）
                     ).to(device)
                     
-                    # 定义损失函数和优化器
-                    criterion = GMADLossWithHOLDPenalty(
-                        hold_penalty=self.hold_penalty,
-                        alpha=params['alpha'],
-                        beta=params['beta']
+                    # 定义损失函数（与训练流程保持一致）
+                    hold_ratio_opt = float((y_train_np == 1).sum()) / max(len(y_train_np), 1)
+                    if self.timeframe == '3m':
+                        hold_penalty_nn = float(max(0.35, min(0.70, 0.80 - 0.6 * hold_ratio_opt)))
+                    else:
+                        hold_penalty_nn = float(max(0.50, min(0.75, 0.85 - 0.5 * hold_ratio_opt)))
+
+                    criterion = create_trade_loss(
+                        use_gmadl=settings.USE_GMADL_LOSS,
+                        hold_penalty=hold_penalty_nn,
+                        alpha=params.get('alpha', settings.GMADL_ALPHA),
+                        beta=params.get('beta', settings.GMADL_BETA)
                     )
-                    optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'])
+
+                    if settings.USE_GMADL_LOSS:
+                        logger.debug(
+                            f"   损失函数: GMADL + HOLD惩罚 (alpha={params.get('alpha', settings.GMADL_ALPHA):.2f}, beta={params.get('beta', settings.GMADL_BETA):.2f})"
+                        )
+                    else:
+                        logger.debug("   损失函数: 交叉熵 + HOLD惩罚 (稳定模式)")
                     
-                    # 训练模型
+                    # 🔥 尝试使用8-bit Adam优化器（节省75%优化器内存）
+                    optimizer_created = False
+                    if self.use_gpu and device.type == 'cuda':
+                        try:
+                            import bitsandbytes as bnb
+                            optimizer = bnb.optim.Adam8bit(
+                                model.parameters(),
+                                lr=params['lr'],
+                                betas=(0.9, 0.999)
+                            )
+                            optimizer_created = True
+                        except (ImportError, Exception):
+                            pass
+                    
+                    if not optimizer_created:
+                        optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'])
+                    
+                    # 🚀 混合精度训练（使用新的torch.amp API + 激进优化）
+                    use_amp = device.type == 'cuda' and torch.cuda.is_available()
+                    if settings.USE_GMADL_LOSS and use_amp:
+                        logger.debug("   ⚠️ GMADL开启 → Optuna试验禁用AMP改用FP32训练")
+                        use_amp = False
+                    if use_amp:
+                        # 🔥 激进混合精度优化
+                        scaler = torch.amp.GradScaler('cuda', init_scale=2.**16)
+                        torch.backends.cuda.matmul.allow_tf32 = True
+                        torch.backends.cudnn.allow_tf32 = True
+                    else:
+                        scaler = None
+                    
+                    # 训练模型（带梯度累积和混合精度）
                     model.train()
                     for epoch in range(params['epochs']):
-                        for batch_X, batch_y in train_loader:
-                            optimizer.zero_grad()
-                            outputs = model(batch_X)
-                            loss = criterion(outputs, batch_y)
-                            loss.backward()
-                            optimizer.step()
+                        optimizer.zero_grad()
+                        
+                        for i, (batch_X, batch_y) in enumerate(train_loader):
+                            # 🎯 混合精度前向传播
+                            # 将批次移动到目标设备
+                            batch_X = batch_X.to(device, non_blocking=True)
+                            batch_y = batch_y.to(device, non_blocking=True)
+                            if use_amp:
+                                with torch.amp.autocast('cuda'):
+                                    outputs = model(batch_X)
+                                    # 统一dtype与loss输入：logits用float32，targets用long
+                                    loss = criterion(outputs.float(), batch_y.long()) / accumulation_steps
+                            else:
+                                outputs = model(batch_X)
+                                loss = criterion(outputs.float(), batch_y.long()) / accumulation_steps
+                            
+                            # 🎯 混合精度反向传播
+                            if use_amp:
+                                scaler.scale(loss).backward()
+                            else:
+                                loss.backward()
+                            
+                            # 🎯 梯度累积
+                            if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
+                                if use_amp:
+                                    scaler.unscale_(optimizer)
+                                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                                    scaler.step(optimizer)
+                                    scaler.update()
+                                else:
+                                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                                    optimizer.step()
+                                
+                                optimizer.zero_grad()
+                                
+                                # 定期清理GPU缓存
+                                if (i + 1) % (accumulation_steps * 10) == 0 and device.type == 'cuda':
+                                    torch.cuda.empty_cache()
+                        
+                        # 每个epoch结束后清理GPU缓存
+                        if device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                    
+                    # 🔥 关键修复：确保验证数据也是连续数组
+                    if not X_val.flags['C_CONTIGUOUS']:
+                        logger.debug(f"   转换X_val为连续数组")
+                        X_val = np.ascontiguousarray(X_val)
+                    if not y_val_np.flags['C_CONTIGUOUS']:
+                        logger.debug(f"   转换y_val为连续数组")
+                        y_val_np = np.ascontiguousarray(y_val_np)
                     
                     # 评估模式
                     model.eval()
                     with torch.no_grad():
+                        # 🔥 关键修复：使用copy()避免内存映射问题
+                        X_val_tensor = torch.from_numpy(X_val.copy()).to(device, dtype=torch.float32)
                         val_outputs = model(X_val_tensor)
                         y_pred = torch.argmax(val_outputs, dim=1).cpu().numpy()
                     
@@ -508,7 +646,7 @@ class HyperparameterOptimizer:
                     self.clear_gpu_memory()
                     
                     # 删除模型和张量释放内存
-                    del model, X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor
+                    del model, X_val_tensor
                     self.clear_gpu_memory()
                 
                 # 预测并评估
@@ -518,12 +656,15 @@ class HyperparameterOptimizer:
                 cv_scores.append(acc)
                 
             except Exception as e:
-                logger.warning(f"Trial {trial.number} Fold {fold_idx+1} 失败: {e}")
+                fold_fail_count += 1
+                logger.debug(f"Trial {trial.number} Fold {fold_idx+1} 失败: {e}")
                 # 失败的trial返回很差的分数
                 cv_scores.append(0.0)
         
         # 计算平均CV准确率
         mean_cv_acc = np.mean(cv_scores)
+        if fold_fail_count > 0:
+            logger.info(f"   Trial {trial.number} 汇总：失败fold={fold_fail_count}/5，CV={mean_cv_acc:.4f}")
         
         # 每10次试验报告一次进度
         if trial.number % 10 == 0:

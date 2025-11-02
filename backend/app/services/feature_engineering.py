@@ -71,7 +71,33 @@ class FeatureEngineer:
             df = self._add_order_flow_features(df)
             df = self._add_swing_features(df)
             
-            # 处理NaN值：训练用dropna，预测用fillna
+            # 🔥 第一步：处理无穷大值（inf）- 必须在NaN处理前完成
+            inf_count = 0
+            for col in df.columns:
+                if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]):
+                    inf_mask = np.isinf(df[col])
+                    if inf_mask.any():
+                        inf_count += inf_mask.sum()
+                        # 将inf替换为NaN（后续统一处理）
+                        df.loc[inf_mask, col] = np.nan
+            
+            if inf_count > 0:
+                logger.warning(f"⚠️ 检测到{inf_count}个无穷大值（inf），已替换为NaN")
+            
+            # 🔥 第二步：处理过大值（可能导致缩放时溢出）
+            large_value_threshold = 1e15  # 防止后续缩放时溢出
+            large_count = 0
+            for col in df.columns:
+                if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]):
+                    large_mask = np.abs(df[col]) > large_value_threshold
+                    if large_mask.any():
+                        large_count += large_mask.sum()
+                        df.loc[large_mask, col] = np.nan
+            
+            if large_count > 0:
+                logger.warning(f"⚠️ 检测到{large_count}个过大值（>1e15），已替换为NaN")
+            
+            # 🔥 第三步：处理NaN值（训练用dropna，预测用fillna）
             rows_before = len(df)
             
             # 先尝试删除NaN
@@ -90,7 +116,11 @@ class FeatureEngineer:
             else:
                 # 训练场景，正常删除NaN
                 df = df_clean
-                logger.info(f"✅ 特征工程完成: {len(df)}行，特征数: {len(df.columns)}")
+                rows_dropped = rows_before - len(df)
+                if rows_dropped > 0:
+                    logger.info(f"✅ 特征工程完成: {len(df)}行（因NaN/Inf丢弃{rows_dropped}行），特征数: {len(df.columns)}")
+                else:
+                    logger.info(f"✅ 特征工程完成: {len(df)}行，特征数: {len(df.columns)}")
 
             
             return df
@@ -806,7 +836,7 @@ class FeatureEngineer:
             new_features['sma_50_1h'] = sma_50_1h.reindex(df_temp.index, method='ffill')
             
             # 2. 模拟15m数据（中期趋势参考，对3m/5m有用）
-            df_15m = df_temp.resample('15m').agg({
+            df_15m = df_temp.resample('15min').agg({
                 'open': 'first',
                 'high': 'max',
                 'low': 'min',

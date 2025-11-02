@@ -32,6 +32,7 @@ class KlineData:
     trades: int = 0
     taker_buy_base_volume: float = 0.0  # ✅ 主动买入成交量
     taker_buy_quote_volume: float = 0.0  # ✅ 主动买入成交额
+    is_closed: bool = False  # 🔑 K线是否完成（修复预测频率问题）
 
 class DataService:
     """数据获取服务"""
@@ -239,13 +240,16 @@ class DataService:
             interval = k.get('i', 'UNKNOWN')
             is_closed = k.get('x', False)
             
+            # 🔑 增强日志验证（新增）
+            logger.debug(f"📥 收到K线: {symbol} {interval} is_closed={is_closed} t={k.get('t')} c={k.get('c')}")
+            
             # 只处理已完成的K线
             if not is_closed:
-                logger.debug(f"📥 收到未完成K线: {symbol} {interval}")  # DEBUG级别，减少日志
+                logger.debug(f"⏸️ 跳过未完成K线: {symbol} {interval}")
                 return
             
-            # 已完成的K线，只输出关键信息（避免日志过大）
-            logger.debug(f"📥 收到已完成K线: {symbol} {interval} t={k.get('t')} c={k.get('c')}")  # 改为DEBUG，减少日志量
+            # 已完成的K线
+            logger.info(f"✅ 处理已完成K线: {symbol} {interval} close={k.get('c')}")
             # 创建K线数据对象（保留Binance原始时间戳，不转换）
             kline = KlineData(
                 symbol=symbol,

@@ -28,7 +28,7 @@ psycopg2-binary
 # ========================================
 # 传统机器学习模型（支持GPU加速）
 lightgbm  # GPU: device='gpu'
-xgboost   # GPU: tree_method='gpu_hist'
+xgboost   # GPU: tree_method='hist', device='cuda'
 catboost  # GPU: task_type='GPU'
 
 # 深度学习模型（Informer-2 + GMADL）
@@ -40,6 +40,7 @@ numpy
 pandas
 scipy
 optuna  # 超参数优化（支持所有4个模型）
+bitsandbytes #8-bit优化器
 
 # 深度学习框架（神经网络 - CUDA版本）
 # 注意：使用CUDA 12.1版本，与RTX 4060 Ti兼容

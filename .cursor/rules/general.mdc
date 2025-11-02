@@ -8,9 +8,21 @@ alwaysApply: true
 # QuantAI-ETH - Development Standards & Code Quality Rules
 
 **Project**: QuantAI-ETH (Quantitative AI for Ethereum Trading)  
-**Version**: v10.0  
-**Last Updated**: 2025-10-27
+**Version**: v10.1  
+**Last Updated**: 2025-10-30
 
+---
+
+## 💻 System Environment
+
+**Operating System**: Windows 11  
+**Processor**: AMD Ryzen 7 9700X 8core
+**Memory**: 32GB DDR5
+**Graphics Card**: NVIDIA RTX 4060TI 8GB((for GPU accelerated training)
+**Shell**: Windows PowerShell  
+**Python Environment**: Virtual environment
+
+**Critical Rule**: **All command-line examples and scripts MUST use Windows PowerShell syntax, NOT bash/Linux commands.**
 ---
 
 ## 🎯 Professional Development Role
@@ -592,6 +604,6 @@ if not (min_val <= value <= max_val):
 ---
 
 **Version**: v10.1  
-**Last Update**: 2025-10-27  
-**Focus**: Development standards, code quality, and indentation rules  
+**Last Update**: 2025-10-30  
+**Focus**: Development standards, code quality, Windows PowerShell, and indentation rules  
 **Scope**: All project files and modules

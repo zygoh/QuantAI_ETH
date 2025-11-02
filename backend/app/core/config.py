@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # 机器学习配置
     # 注意：模型训练由scheduler统一管理（每天00:01执行）
     TRAINING_SPLIT: float = 0.8  # 训练集/验证集分割比例
+    USE_GMADL_LOSS: bool = False  # 生产默认使用稳定的交叉熵损失
+    GMADL_ALPHA: float = 1.0
+    GMADL_BETA: float = 0.5
     
     # GPU配置
     USE_GPU: bool = True

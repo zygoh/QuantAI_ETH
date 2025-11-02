@@ -3,6 +3,7 @@ Binance API客户端
 """
 import asyncio
 import logging
+import traceback
 from typing import Optional, List, Dict, Any, Callable
 from datetime import datetime, timedelta
 import json
@@ -10,6 +11,7 @@ import time
 import hmac
 import hashlib
 import requests
+import os
 from binance.um_futures import UMFutures
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
 import websocket
@@ -70,8 +72,7 @@ class BinanceClient:
                 logger.error(f"✗ 账户信息获取失败: {account_error}")
                 logger.error("可能的原因：")
                 logger.error("  1. API Key 未启用期货交易权限")
-                logger.error("  2. API Key 设置了 IP 白名单，但代理 IP 不在列表中")
-                logger.error("  3. API Key 或 Secret Key 不正确")
+                logger.error("  2. API Key 或 Secret Key 不正确")
                 return False
             
         except Exception as e:
@@ -362,7 +363,9 @@ class BinanceWebSocketClient:
                 on_message=self._on_message,
                 on_error=self._on_error,
                 on_close=self._on_close,
-                on_open=self._on_open
+                on_open=self._on_open,
+                on_ping=self._on_ping,
+                on_pong=self._on_pong
             )
             
             self.is_running = True
@@ -443,6 +446,17 @@ class BinanceWebSocketClient:
                 self.is_reconnecting = False  # 释放锁
         elif self.is_reconnecting:
             logger.debug("重连任务已在进行中，跳过重复重连")
+    
+    def _on_ping(self, ws, message):
+        """处理WebSocket Ping消息（服务端每3分钟发送）"""
+        logger.debug("📥 收到服务端Ping帧（保持连接活跃）")
+        # Binance库会自动回复PONG，无需手动处理
+    
+    def _on_pong(self, ws):
+        """处理WebSocket Pong消息"""
+        logger.debug("📥 收到服务端Pong帧")
+        # 更新最后消息时间（用于健康检查）
+        self.last_message_time = datetime.now()
     
     def _on_message(self, ws, message):
         """处理WebSocket消息"""
@@ -583,6 +597,7 @@ class BinanceWebSocketClient:
         """恢复所有订阅"""
         try:
             logger.info(f"📋 开始恢复 {len(self.subscriptions)} 个订阅...")
+            logger.debug(f"   当前状态: ws_client={self.ws_client is not None}, is_connected={self.is_connected}")
             success_count = 0
             failed_subs = []
             
@@ -597,8 +612,13 @@ class BinanceWebSocketClient:
                     elif sub_info['type'] == 'ticker':
                         self._do_subscribe_ticker(sub_info['symbol'])
                         success_count += 1
+                    else:
+                        logger.warning(f"  ⚠️ 未知订阅类型: {sub_info.get('type')}")
                 except Exception as sub_error:
                     logger.error(f"  └─ ❌ 恢复订阅失败: {sub_info}")
+                    logger.error(f"     错误类型: {type(sub_error).__name__}")
+                    logger.error(f"     错误详情: {sub_error}")
+                    logger.error(traceback.format_exc())
                     failed_subs.append(sub_info)
             
             if success_count == len(self.subscriptions):
@@ -610,6 +630,7 @@ class BinanceWebSocketClient:
                     
         except Exception as e:
             logger.error(f"恢复订阅失败: {e}")
+            logger.error(traceback.format_exc())
     
     async def _health_check(self):
         """健康检查（检测消息超时）"""

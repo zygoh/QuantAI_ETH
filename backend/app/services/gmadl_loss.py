@@ -1,20 +1,11 @@
-"""
-GMADL损失函数 - Generalized Mean Absolute Deviation Loss
-论文: "GMADL: Generalized Mean Absolute Deviation Loss for Time Series Forecasting" (2024)
+"""GMADL损失函数及其交易场景增强版。"""
 
-核心思想:
-- 对异常值更鲁棒（比RMSE）
-- 对分位数更灵活（比Quantile Loss）
-- 自适应权重机制
-
-实证效果（30min比特币数据）:
-- RMSE Informer: 年化94.09%, 夏普2.26
-- Quantile Informer: 年化98.74%, 夏普2.68
-- GMADL Informer: 年化183.71%, 夏普4.42 ⭐⭐⭐
-"""
+import logging
+from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 
@@ -56,12 +47,17 @@ class GMADLoss(nn.Module):
         Returns:
             损失值
         """
+        # 0. 确保float32精度（避免AMP下的dtype不匹配）
+        logits = logits.float()
+        
         # 1. 计算softmax概率
         probs = torch.softmax(logits, dim=1)
         
         # 2. 获取正确类别的概率
         batch_size = targets.size(0)
-        target_probs = probs[torch.arange(batch_size), targets]
+        # 确保targets为Long类型
+        targets = targets.long()
+        target_probs = probs[torch.arange(batch_size, device=logits.device, dtype=torch.long), targets]
         
         # 3. 计算预测误差（1 - 正确概率）
         errors = 1.0 - target_probs
@@ -121,12 +117,16 @@ class GMADLossWithClassWeight(nn.Module):
         Returns:
             损失值
         """
+        # 0. 确保float32精度（避免AMP下的dtype不匹配）
+        logits = logits.float()
+        
         # 1. 计算softmax概率
         probs = torch.softmax(logits, dim=1)
         
         # 2. 获取正确类别的概率
         batch_size = targets.size(0)
-        target_probs = probs[torch.arange(batch_size), targets]
+        targets = targets.long()
+        target_probs = probs[torch.arange(batch_size, device=logits.device, dtype=torch.long), targets]
         
         # 3. 计算预测误差
         errors = 1.0 - target_probs
@@ -139,7 +139,9 @@ class GMADLossWithClassWeight(nn.Module):
         loss = numerator / (denominator + 1e-8)
         
         # 5. 应用类别权重
-        weights = self.class_weights[targets]
+        # 确保使用float32精度（logits已在上面转换为float32）
+        class_weights = self.class_weights.to(device=logits.device, dtype=torch.float32)
+        weights = class_weights[targets]
         weighted_loss = loss * weights
         
         # 6. 聚合损失
@@ -182,10 +184,12 @@ class GMADLossWithHOLDPenalty(nn.Module):
         self.alpha = alpha
         self.beta = beta
         self.reduction = reduction
+        self._fallback_enabled = False
+        self._logger = logging.getLogger(__name__)
     
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
-        计算GMADL + HOLD惩罚损失
+        计算GMADL + HOLD惩罚损失（增强数值稳定性）
         
         Args:
             logits: 模型输出 (batch_size, num_classes)
@@ -194,39 +198,111 @@ class GMADLossWithHOLDPenalty(nn.Module):
         Returns:
             损失值
         """
-        # 1. 计算softmax概率
+        # 0. 确保float32精度（避免AMP下的dtype不匹配）
+        logits = logits.float()
+        targets = targets.long()
+
+        if self._fallback_enabled:
+            return self._cross_entropy_with_hold(logits, targets)
+
+        # 1. 计算softmax概率（添加数值稳定性）
         probs = torch.softmax(logits, dim=1)
-        
-        # 2. 获取正确类别的概率
+        probs = torch.clamp(probs, min=1e-7, max=1.0 - 1e-7)
+
+        # 2. 获取正确类别概率并计算误差
         batch_size = targets.size(0)
-        target_probs = probs[torch.arange(batch_size), targets]
-        
-        # 3. 计算预测误差
-        errors = 1.0 - target_probs
-        
-        # 4. GMADL损失
+        target_probs = probs[torch.arange(batch_size, device=logits.device, dtype=torch.long), targets]
+        errors = torch.clamp(1.0 - target_probs, min=1e-7, max=1.0)
+
+        # 3. GMADL损失（增强数值稳定性）
         abs_errors = torch.abs(errors)
-        numerator = torch.pow(abs_errors, self.beta)
-        denominator = self.alpha + torch.pow(abs_errors, 1.0 - self.beta)
-        
-        loss = numerator / (denominator + 1e-8)
-        
-        # 5. 应用HOLD惩罚（targets==1为HOLD类别）
-        hold_weights = torch.where(
-            targets == 1,
-            torch.tensor(self.hold_penalty, device=targets.device),
-            torch.tensor(1.0, device=targets.device)
-        )
-        
+        numerator = torch.pow(abs_errors + 1e-8, self.beta)
+        denominator = self.alpha + torch.pow(abs_errors + 1e-8, 1.0 - self.beta)
+        loss = numerator / (denominator + 1e-7)
+
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            if not self._fallback_enabled:
+                self._logger.warning("⚠️ GMADL损失出现nan/inf，后续迭代将降级为交叉熵损失")
+                self._fallback_enabled = True
+            return self._cross_entropy_with_hold(logits, targets)
+
+        # 4. 应用HOLD惩罚并聚合
+        hold_tensor = torch.tensor(self.hold_penalty, device=logits.device, dtype=torch.float32)
+        one_tensor = torch.tensor(1.0, device=logits.device, dtype=torch.float32)
+        hold_weights = torch.where(targets == 1, hold_tensor, one_tensor)
         weighted_loss = loss * hold_weights
-        
-        # 6. 聚合损失
+
         if self.reduction == 'mean':
             return weighted_loss.mean()
-        elif self.reduction == 'sum':
+        if self.reduction == 'sum':
             return weighted_loss.sum()
-        else:
-            return weighted_loss
+        return weighted_loss
+
+    def _cross_entropy_with_hold(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """降级路径：交叉熵 + HOLD 惩罚。"""
+        ce_loss = F.cross_entropy(logits, targets, reduction='none')
+        hold_tensor = torch.tensor(self.hold_penalty, device=logits.device, dtype=torch.float32)
+        one_tensor = torch.tensor(1.0, device=logits.device, dtype=torch.float32)
+        hold_weights = torch.where(targets == 1, hold_tensor, one_tensor)
+        weighted_loss = ce_loss * hold_weights
+
+        if self.reduction == 'mean':
+            return weighted_loss.mean()
+        if self.reduction == 'sum':
+            return weighted_loss.sum()
+        return weighted_loss
+
+
+class CrossEntropyWithHoldPenalty(nn.Module):
+    """交叉熵 + HOLD 惩罚的稳定损失函数。"""
+
+    def __init__(
+        self,
+        hold_penalty: float = 0.65,
+        reduction: str = 'mean'
+    ):
+        super().__init__()
+        self.hold_penalty = hold_penalty
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        logits = logits.float()
+        targets = targets.long()
+
+        ce_loss = F.cross_entropy(logits, targets, reduction='none')
+        hold_tensor = torch.tensor(self.hold_penalty, device=logits.device, dtype=torch.float32)
+        one_tensor = torch.tensor(1.0, device=logits.device, dtype=torch.float32)
+        hold_weights = torch.where(targets == 1, hold_tensor, one_tensor)
+        weighted_loss = ce_loss * hold_weights
+
+        if self.reduction == 'mean':
+            return weighted_loss.mean()
+        if self.reduction == 'sum':
+            return weighted_loss.sum()
+        return weighted_loss
+
+
+def create_trade_loss(
+    use_gmadl: bool,
+    hold_penalty: float = 0.65,
+    alpha: float = 1.0,
+    beta: float = 0.5,
+    reduction: str = 'mean'
+) -> nn.Module:
+    """根据配置返回稳定的交易损失函数。"""
+
+    if use_gmadl:
+        return GMADLossWithHOLDPenalty(
+            hold_penalty=hold_penalty,
+            alpha=alpha,
+            beta=beta,
+            reduction=reduction
+        )
+
+    return CrossEntropyWithHoldPenalty(
+        hold_penalty=hold_penalty,
+        reduction=reduction
+    )
 
 
 def create_gmadl_loss(

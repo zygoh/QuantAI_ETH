@@ -36,7 +36,7 @@ class MLService:
     
     def __init__(self):
         self.is_running = False
-        # 多时间框架模型：{'15m': model, '2h': model, '4h': model}
+        # 多时间框架模型：{'3m': model, '5m': model, '15m': model}
         self.models = {}
         self.scalers = {}
         self.feature_columns_dict = {}
@@ -71,6 +71,47 @@ class MLService:
             'min_split_gain': 0.02,  # 0.01→0.02（提高分裂阈值）
             'is_unbalance': True  # 自动处理不平衡类别
         }
+
+    def _compute_effective_sample_weights(self, y: pd.Series, timeframe: str) -> np.ndarray:
+        """使用有效样本数(Effective Number of Samples)计算样本权重，缓解极端类别不平衡。
+        参考: Class-Balanced Loss Based on Effective Number of Samples (Cui et al., CVPR 2019)
+
+        Args:
+            y: 标签Series或ndarray，取值{0: SHORT, 1: HOLD, 2: LONG}
+            timeframe: 时间框架（用于可选的时间框架敏感调节）
+
+        Returns:
+            每个样本的权重向量（与y等长）
+        """
+        try:
+            y_np = y.values if hasattr(y, 'values') else y
+            classes = np.array([0, 1, 2])
+            counts = np.array([(y_np == c).sum() for c in classes], dtype=np.float64)
+            total = max(int(len(y_np)), 1)
+
+            # 避免零计数
+            counts = np.maximum(counts, 1.0)
+
+            # beta按样本规模自适应，样本越多beta越接近1
+            # 为防止过强权重，设置时间框架敏感的上限
+            base_beta = 0.999
+            if timeframe == '3m':
+                beta = min(base_beta, 1.0 - 1.0 / (total + 1))
+            else:
+                beta = min(0.995, 1.0 - 1.0 / (total + 1))
+
+            effective_num = (1.0 - np.power(beta, counts)) / (1.0 - beta)
+            class_weights = 1.0 / effective_num
+            class_weights = class_weights / class_weights.sum() * len(classes)
+
+            # 将类别权重映射为样本权重
+            weight_map = {c: class_weights[i] for i, c in enumerate(classes)}
+            sample_weights = np.array([weight_map[int(label)] for label in y_np], dtype=np.float64)
+
+            return sample_weights
+        except Exception:
+            logger.error("有效样本数权重计算失败，降级到均等权重")
+            return np.ones(len(y))
         
         # ✅ 差异化配置：防止过拟合的保守策略
         self.lgb_params_by_timeframe = {
@@ -554,11 +595,11 @@ class MLService:
             # ATR百分比（相对于价格）
             atr_pct = (atr / df['close']).rolling(window=50).mean()  # 50根K线平均
             
-            # 基础阈值配置（中频交易：灵敏策略）
+            # 基础阈值配置（多时间框架策略）
             base_threshold_config = {
-                '15m': 0.001,   # 基础±0.1% ✅ 中频交易极度灵敏
-                '2h': 0.0035,   # 基础±0.35%
-                '4h': 0.005     # 基础±0.5%
+                '3m': 0.0008,   # 基础±0.08% 🔥 高频超灵敏
+                '5m': 0.0010,   # 基础±0.10% 🔥 高频灵敏
+                '15m': 0.0015,  # 基础±0.15% ✅ 中频灵敏
             }
             
             base_threshold = base_threshold_config.get(timeframe, 0.010)
@@ -809,6 +850,47 @@ class MLService:
             缩放后的特征数组
         """
         try:
+            # 🔥 第一步：检查并处理无穷大值（Critical Fix）
+            inf_count = 0
+            nan_count = 0
+            large_count = 0
+            
+            for col in X.columns:
+                if pd.api.types.is_numeric_dtype(X[col]):
+                    # 检查inf
+                    inf_mask = np.isinf(X[col])
+                    if inf_mask.any():
+                        inf_count += inf_mask.sum()
+                        # 用该列的最大有限值替换正无穷，最小有限值替换负无穷
+                        finite_values = X.loc[~inf_mask, col]
+                        if len(finite_values) > 0:
+                            X.loc[X[col] == np.inf, col] = finite_values.max()
+                            X.loc[X[col] == -np.inf, col] = finite_values.min()
+                        else:
+                            X.loc[inf_mask, col] = 0  # 如果没有有限值，用0填充
+                    
+                    # 检查过大值（可能导致缩放时溢出）
+                    large_value_threshold = 1e15
+                    large_mask = np.abs(X[col]) > large_value_threshold
+                    if large_mask.any():
+                        large_count += large_mask.sum()
+                        # 限制在阈值范围内
+                        X.loc[large_mask & (X[col] > 0), col] = large_value_threshold
+                        X.loc[large_mask & (X[col] < 0), col] = -large_value_threshold
+                    
+                    # 检查NaN
+                    nan_mask = X[col].isna()
+                    if nan_mask.any():
+                        nan_count += nan_mask.sum()
+                        X.loc[nan_mask, col] = X[col].median()  # 用中位数填充NaN
+            
+            if inf_count > 0:
+                logger.warning(f"⚠️ 特征缩放前处理了{inf_count}个无穷大值（inf）")
+            if large_count > 0:
+                logger.warning(f"⚠️ 特征缩放前处理了{large_count}个过大值（>1e15）")
+            if nan_count > 0:
+                logger.warning(f"⚠️ 特征缩放前处理了{nan_count}个缺失值（NaN）")
+            
             # 每个时间框架独立的scaler
             if fit or timeframe not in self.scalers or self.scalers[timeframe] is None:
                 self.scalers[timeframe] = StandardScaler()
@@ -819,7 +901,7 @@ class MLService:
             return X_scaled
             
         except Exception as e:
-            logger.error(f"特征缩放失败: {e}")
+            logger.error(f"特征缩放失败: {e}", exc_info=True)
             return X.values
     
     # 注：_train_lightgbm() 方法已移至 ensemble_ml_service.py（统一三模型训练代码位置）
