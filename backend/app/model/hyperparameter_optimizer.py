@@ -27,6 +27,13 @@ from app.model.gmadl_loss import create_trade_loss
 from app.model.ml_service import MLService
 from app.core.config import settings
 
+# 可选依赖：bitsandbytes（8-bit优化器）
+try:
+    import bitsandbytes as bnb
+    BNB_AVAILABLE = True
+except ImportError:
+    BNB_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -1142,7 +1149,8 @@ class HyperparameterOptimizer:
                     optimizer_created = False
                     if self.use_gpu and device.type == 'cuda':
                         try:
-                            import bitsandbytes as bnb
+                            if not BNB_AVAILABLE:
+                                raise ImportError("bitsandbytes未安装")
                             optimizer = bnb.optim.Adam8bit(
                                 model.parameters(),
                                 lr=params['lr'],

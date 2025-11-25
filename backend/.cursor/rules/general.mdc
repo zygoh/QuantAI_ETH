@@ -1,10 +1,6 @@
 ---
-description: QuantAI-ETH Development Standards & Code Quality Rules
-globs:
-  - "**/*"
 alwaysApply: true
 ---
-
 # QuantAI-ETH - Development Standards & Code Quality Rules
 
 **Project**: QuantAI-ETH (Quantitative AI for Ethereum Trading)  
