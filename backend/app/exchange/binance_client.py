@@ -6,12 +6,15 @@ import logging
 import traceback
 from typing import Optional, List, Dict, Any, Callable
 from datetime import datetime, timedelta
+from dataclasses import dataclass
+from enum import Enum
 import json
 import time
 import hmac
 import hashlib
 import requests
 import os
+import ssl
 from binance.um_futures import UMFutures
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
 import websocket
@@ -20,6 +23,336 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass
+class ReconnectRecord:
+    """重连历史记录"""
+    timestamp: datetime
+    attempt_number: int
+    success: bool
+    error_type: Optional[str]
+    error_message: Optional[str]
+    delay_seconds: float
+    connection_duration_before_failure: Optional[float]
+
+
+class WebSocketErrorType(Enum):
+    """WebSocket错误类型"""
+    SSL_ERROR = "ssl_error"
+    NETWORK_ERROR = "network_error"
+    TIMEOUT_ERROR = "timeout_error"
+    PROTOCOL_ERROR = "protocol_error"
+    UNKNOWN_ERROR = "unknown_error"
+
+
+class ExponentialBackoffReconnector:
+    """
+    指数退避重连策略
+    
+    实现智能重连策略，避免频繁重连导致服务端封禁
+    """
+    
+    def __init__(self):
+        """初始化重连器"""
+        self.initial_delay = settings.WS_RECONNECT_INITIAL_DELAY
+        self.max_delay = settings.WS_RECONNECT_MAX_DELAY
+        self.backoff_factor = settings.WS_RECONNECT_BACKOFF_FACTOR
+        self.max_retries = settings.WS_RECONNECT_MAX_RETRIES
+        
+        self.current_delay = self.initial_delay
+        self.retry_count = 0
+        self.reconnect_history: List[ReconnectRecord] = []
+        self.connection_start_time: Optional[datetime] = None
+        
+        logger.info(f"🔧 重连器初始化: 初始延迟={self.initial_delay}s, 最大延迟={self.max_delay}s, 退避因子={self.backoff_factor}")
+    
+    def calculate_next_delay(self) -> float:
+        """
+        计算下次重连延迟（指数退避）
+        
+        Returns:
+            下次重连延迟（秒）
+        """
+        delay = min(
+            self.initial_delay * (self.backoff_factor ** self.retry_count),
+            self.max_delay
+        )
+        return delay
+    
+    def should_retry(self) -> bool:
+        """
+        检查是否应该继续重试
+        
+        Returns:
+            是否应该重试
+        """
+        return self.retry_count < self.max_retries
+    
+    def on_reconnect_attempt(self) -> float:
+        """
+        记录重连尝试，返回应该等待的延迟
+        
+        Returns:
+            等待延迟（秒）
+        """
+        self.retry_count += 1
+        self.current_delay = self.calculate_next_delay()
+        
+        logger.info(f"🔄 重连尝试 {self.retry_count}/{self.max_retries}, 延迟: {self.current_delay:.1f}秒")
+        
+        return self.current_delay
+    
+    def on_reconnect_success(self):
+        """记录重连成功"""
+        connection_duration = None
+        if self.connection_start_time:
+            connection_duration = (datetime.now() - self.connection_start_time).total_seconds()
+        
+        record = ReconnectRecord(
+            timestamp=datetime.now(),
+            attempt_number=self.retry_count,
+            success=True,
+            error_type=None,
+            error_message=None,
+            delay_seconds=self.current_delay,
+            connection_duration_before_failure=connection_duration
+        )
+        
+        self._add_history(record)
+        
+        # 重置状态
+        self.retry_count = 0
+        self.current_delay = self.initial_delay
+        self.connection_start_time = datetime.now()
+        
+        logger.info(f"✅ 重连成功！连接已恢复，重置重连计数器")
+    
+    def on_reconnect_failure(self, error: Exception):
+        """
+        记录重连失败
+        
+        Args:
+            error: 错误对象
+        """
+        connection_duration = None
+        if self.connection_start_time:
+            connection_duration = (datetime.now() - self.connection_start_time).total_seconds()
+        
+        error_type = self._classify_error(error)
+        
+        record = ReconnectRecord(
+            timestamp=datetime.now(),
+            attempt_number=self.retry_count,
+            success=False,
+            error_type=error_type.value,
+            error_message=str(error),
+            delay_seconds=self.current_delay,
+            connection_duration_before_failure=connection_duration
+        )
+        
+        self._add_history(record)
+        
+        logger.error(f"❌ 重连失败 (尝试 {self.retry_count}/{self.max_retries}): {error_type.value}")
+        logger.error(f"   错误信息: {str(error)[:200]}")
+    
+    def reset(self):
+        """重置重连状态"""
+        self.retry_count = 0
+        self.current_delay = self.initial_delay
+        self.connection_start_time = datetime.now()
+        logger.info("🔄 重连器状态已重置")
+    
+    def _add_history(self, record: ReconnectRecord):
+        """
+        添加历史记录（保留最近10次）
+        
+        Args:
+            record: 重连记录
+        """
+        self.reconnect_history.append(record)
+        
+        # 只保留最近10次记录
+        if len(self.reconnect_history) > 10:
+            self.reconnect_history = self.reconnect_history[-10:]
+    
+    def _classify_error(self, error: Exception) -> WebSocketErrorType:
+        """
+        分类错误类型
+        
+        Args:
+            error: 错误对象
+        
+        Returns:
+            错误类型
+        """
+        error_str = str(error).lower()
+        
+        if "ssl" in error_str or "decryption" in error_str or "bad record mac" in error_str:
+            return WebSocketErrorType.SSL_ERROR
+        elif "timeout" in error_str:
+            return WebSocketErrorType.TIMEOUT_ERROR
+        elif "connection" in error_str or "network" in error_str:
+            return WebSocketErrorType.NETWORK_ERROR
+        elif "protocol" in error_str:
+            return WebSocketErrorType.PROTOCOL_ERROR
+        else:
+            return WebSocketErrorType.UNKNOWN_ERROR
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """
+        获取重连统计信息
+        
+        Returns:
+            统计信息字典
+        """
+        if not self.reconnect_history:
+            return {
+                'total_attempts': 0,
+                'success_count': 0,
+                'failure_count': 0,
+                'success_rate': 0.0,
+                'avg_delay': 0.0,
+                'current_retry_count': self.retry_count,
+                'current_delay': self.current_delay
+            }
+        
+        success_count = sum(1 for r in self.reconnect_history if r.success)
+        failure_count = len(self.reconnect_history) - success_count
+        
+        # 按错误类型统计
+        error_types = {}
+        for record in self.reconnect_history:
+            if not record.success and record.error_type:
+                error_types[record.error_type] = error_types.get(record.error_type, 0) + 1
+        
+        return {
+            'total_attempts': len(self.reconnect_history),
+            'success_count': success_count,
+            'failure_count': failure_count,
+            'success_rate': success_count / len(self.reconnect_history) if self.reconnect_history else 0.0,
+            'avg_delay': sum(r.delay_seconds for r in self.reconnect_history) / len(self.reconnect_history),
+            'current_retry_count': self.retry_count,
+            'current_delay': self.current_delay,
+            'error_types': error_types,
+            'recent_history': [
+                {
+                    'timestamp': r.timestamp.isoformat(),
+                    'attempt': r.attempt_number,
+                    'success': r.success,
+                    'error_type': r.error_type,
+                    'delay': r.delay_seconds
+                }
+                for r in self.reconnect_history[-5:]  # 最近5次
+            ]
+        }
+
+
+class WebSocketHeartbeat:
+    """
+    WebSocket心跳保活机制
+    
+    定期发送ping消息保持连接活跃，检测pong超时
+    """
+    
+    def __init__(self, ws_client):
+        """
+        初始化心跳机制
+        
+        Args:
+            ws_client: WebSocket客户端实例
+        """
+        self.ws_client = ws_client
+        self.ping_interval = settings.WS_PING_INTERVAL
+        self.pong_timeout = settings.WS_PONG_TIMEOUT
+        self.last_ping_time: Optional[datetime] = None
+        self.last_pong_time: Optional[datetime] = None
+        self.heartbeat_task: Optional[asyncio.Task] = None
+        self.is_running = False
+        
+        logger.info(f"💓 心跳机制初始化: ping间隔={self.ping_interval}s, pong超时={self.pong_timeout}s")
+    
+    async def start(self):
+        """启动心跳任务"""
+        if self.is_running:
+            logger.warning("⚠️ 心跳任务已在运行")
+            return
+        
+        self.is_running = True
+        self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        logger.info("💓 心跳任务已启动")
+    
+    async def stop(self):
+        """停止心跳任务"""
+        self.is_running = False
+        
+        if self.heartbeat_task and not self.heartbeat_task.done():
+            self.heartbeat_task.cancel()
+            try:
+                await self.heartbeat_task
+            except asyncio.CancelledError:
+                pass
+        
+        logger.info("💓 心跳任务已停止")
+    
+    async def _heartbeat_loop(self):
+        """心跳循环"""
+        while self.is_running:
+            try:
+                await asyncio.sleep(self.ping_interval)
+                
+                # 发送ping
+                await self.send_ping()
+                
+                # 检查pong超时
+                if self.last_ping_time and self.last_pong_time:
+                    time_since_pong = (datetime.now() - self.last_pong_time).total_seconds()
+                    if time_since_pong > self.pong_timeout:
+                        logger.warning(f"⚠️ Pong超时: {time_since_pong:.1f}秒未收到pong响应")
+                        # 注意：不在这里触发重连，由健康检查任务处理
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"❌ 心跳循环异常: {e}")
+                await asyncio.sleep(5)  # 出错后等待5秒再继续
+    
+    async def send_ping(self):
+        """发送ping消息"""
+        try:
+            if hasattr(self.ws_client, 'ws') and self.ws_client.ws:
+                # 发送ping帧
+                self.ws_client.ws.ping()
+                self.last_ping_time = datetime.now()
+                logger.debug("📤 发送Ping消息")
+            else:
+                logger.debug("⚠️ WebSocket未连接，跳过ping")
+        except Exception as e:
+            logger.error(f"❌ 发送ping失败: {e}")
+    
+    def on_pong_received(self):
+        """处理pong响应"""
+        self.last_pong_time = datetime.now()
+        
+        if self.last_ping_time:
+            rtt = (self.last_pong_time - self.last_ping_time).total_seconds()
+            logger.debug(f"📥 收到Pong响应 (RTT: {rtt*1000:.1f}ms)")
+        else:
+            logger.debug("📥 收到Pong响应")
+    
+    def is_alive(self) -> bool:
+        """
+        检查连接是否存活
+        
+        Returns:
+            连接是否存活
+        """
+        if not self.last_pong_time:
+            return True  # 还没有收到过pong，认为是活的
+        
+        time_since_pong = (datetime.now() - self.last_pong_time).total_seconds()
+        return time_since_pong <= self.pong_timeout
+
+
 class BinanceClient:
     """Binance API客户端"""
     
@@ -27,18 +360,45 @@ class BinanceClient:
         self.api_key = settings.BINANCE_API_KEY
         self.secret_key = settings.BINANCE_SECRET_KEY
         self.testnet = settings.BINANCE_TESTNET
+        # ⛔️ 当前账户不可用，临时禁用需要签名的账户相关接口
+        # TODO: 恢复账户权限后将该标记改为 True 并恢复相关调用
+        self.account_endpoints_enabled = False
         
         # 配置代理地址
         # REST API: https://n8n.do2ge.com/tail/http/relay/fapi/v1/... -> https://fapi.binance.com/fapi/v1/...
         self.base_url = "https://n8n.do2ge.com/tail/http/relay"
         
+        # 🔧 配置REST API代理（如果启用）
+        client_kwargs = {
+            "key": self.api_key,
+            "secret": self.secret_key,
+            "base_url": self.base_url,
+            "timeout": 30  # 增加超时时间
+        }
+        
+        # 添加代理配置
+        if settings.USE_PROXY:
+            proxy_type = settings.PROXY_TYPE.lower()
+            
+            if proxy_type == "socks5":
+                # SOCKS5代理（需要PySocks库支持）
+                proxy_url = f"socks5://{settings.PROXY_HOST}:{settings.PROXY_PORT}"
+                client_kwargs["proxies"] = {
+                    "http": proxy_url,
+                    "https": proxy_url
+                }
+                logger.info(f"🔧 REST API使用SOCKS5代理: {settings.PROXY_HOST}:{settings.PROXY_PORT}")
+            else:
+                # HTTP/HTTPS代理
+                proxy_url = f"{proxy_type}://{settings.PROXY_HOST}:{settings.PROXY_PORT}"
+                client_kwargs["proxies"] = {
+                    "http": proxy_url,
+                    "https": proxy_url
+                }
+                logger.info(f"🔧 REST API使用{proxy_type.upper()}代理: {settings.PROXY_HOST}:{settings.PROXY_PORT}")
+        
         # REST API客户端
-        self.client = UMFutures(
-            key=self.api_key,
-            secret=self.secret_key,
-            base_url=self.base_url,
-            timeout=30  # 增加超时时间
-        )
+        self.client = UMFutures(**client_kwargs)
         
         # 设置默认的recvWindow（在API调用时使用）
         self.recv_window = 60000  # 60秒的时间窗口（默认5000ms）
@@ -63,6 +423,9 @@ class BinanceClient:
             logger.info(f"✓ 服务器时间获取成功: {server_time.get('serverTime')}")
             
             # 测试账户信息（需要签名）
+            if not self.account_endpoints_enabled:
+                logger.warning("⏸️ 已跳过账户信息检测：账户相关接口暂时禁用")
+                return True
             logger.info("正在测试账户信息获取（需要 API Key 签名）...")
             try:
                 account = self.client.account(recvWindow=self.recv_window)
@@ -122,6 +485,14 @@ class BinanceClient:
     ) -> List[Dict[str, Any]]:
         """获取K线数据"""
         try:
+            # ✅ 关键修复：Binance API limit 最大值为 1500
+            if limit > 1500:
+                logger.warning(f"⚠️ limit={limit} 超过Binance最大限制1500，自动调整为1500")
+                limit = 1500
+            elif limit <= 0:
+                logger.warning(f"⚠️ limit={limit} 无效，使用默认值500")
+                limit = 500
+            
             params = {
                 'symbol': symbol,
                 'interval': interval,
@@ -135,23 +506,46 @@ class BinanceClient:
             
             klines = self.client.klines(**params)
             
+            # ✅ 诊断：检查REST API返回的数组长度
+            if klines and len(klines) > 0:
+                first_kline = klines[0]
+                logger.debug(f"📊 REST API K线数组长度: {len(first_kline)} (预期11个字段)")
+                if len(first_kline) < 11:
+                    logger.warning(f"⚠️ REST API返回的K线数组长度不足: {len(first_kline)} < 11")
+                    logger.warning(f"   数组内容: {first_kline}")
+                    logger.warning(f"   可能原因: Binance API版本或代理过滤了某些字段")
+            
             # 转换为标准格式
             formatted_klines = []
-            for kline in klines:
-                formatted_kline = {
-                    'timestamp': kline[0],
-                    'open': float(kline[1]),
-                    'high': float(kline[2]),
-                    'low': float(kline[3]),
-                    'close': float(kline[4]),
-                    'volume': float(kline[5]),
-                    'close_time': kline[6],
-                    'quote_volume': float(kline[7]),
-                    'trades': int(kline[8]),
-                    'taker_buy_base_volume': float(kline[9]),
-                    'taker_buy_quote_volume': float(kline[10])
-                }
-                formatted_klines.append(formatted_kline)
+            for idx, kline in enumerate(klines):
+                try:
+                    # ✅ 安全访问：检查数组长度
+                    if len(kline) < 11:
+                        logger.warning(f"⚠️ K线数组{idx}长度不足: {len(kline)} < 11，使用默认值0")
+                        taker_buy_base = 0.0
+                        taker_buy_quote = 0.0
+                    else:
+                        taker_buy_base = float(kline[9]) if kline[9] else 0.0
+                        taker_buy_quote = float(kline[10]) if kline[10] else 0.0
+                    
+                    formatted_kline = {
+                        'timestamp': kline[0],
+                        'open': float(kline[1]),
+                        'high': float(kline[2]),
+                        'low': float(kline[3]),
+                        'close': float(kline[4]),
+                        'volume': float(kline[5]),
+                        'close_time': kline[6],
+                        'quote_volume': float(kline[7]),
+                        'trades': int(kline[8]),
+                        'taker_buy_base_volume': taker_buy_base,
+                        'taker_buy_quote_volume': taker_buy_quote
+                    }
+                    formatted_klines.append(formatted_kline)
+                except (IndexError, ValueError, TypeError) as e:
+                    logger.error(f"❌ 解析K线数据失败 (索引{idx}): {e}")
+                    logger.error(f"   数组长度: {len(kline)}, 数组内容: {kline}")
+                    continue
             
             logger.debug(f"获取K线数据: {symbol} {interval} {len(formatted_klines)}条")
             return formatted_klines
@@ -160,9 +554,125 @@ class BinanceClient:
             logger.error(f"获取K线数据失败: {e}")
             return []
     
+    def get_klines_paginated(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        rate_limit_delay: float = 0.1
+    ) -> List[Dict[str, Any]]:
+        """
+        分页获取K线数据（自动处理超过1500的情况）
+        
+        Args:
+            symbol: 交易对符号
+            interval: K线间隔
+            limit: 需要获取的总数量
+            start_time: 开始时间（毫秒时间戳，可选）
+            end_time: 结束时间（毫秒时间戳，可选，默认当前时间）
+            rate_limit_delay: API限流延迟（秒）
+        
+        Returns:
+            K线数据列表（按时间升序排列）
+        """
+        try:
+            # 如果 limit <= 1500，直接调用单次获取
+            if limit <= 1500:
+                return self.get_klines(symbol, interval, limit, start_time, end_time)
+            
+            # 超过1500，需要分页获取
+            all_klines = []
+            max_per_request = 1500
+            batches_needed = (limit + max_per_request - 1) // max_per_request
+            
+            logger.debug(f"📊 分页获取K线: {symbol} {interval} 需要{limit}条，分{batches_needed}批获取")
+            
+            current_end_time = end_time
+            
+            for batch in range(batches_needed):
+                remaining = limit - len(all_klines)
+                batch_limit = min(max_per_request, remaining)
+                
+                if batch_limit <= 0:
+                    break
+                
+                # 获取一批数据
+                klines = self.get_klines(
+                    symbol=symbol,
+                    interval=interval,
+                    limit=batch_limit,
+                    start_time=start_time,
+                    end_time=current_end_time
+                )
+                
+                if not klines:
+                    logger.warning(f"⚠️ 批次 {batch + 1}/{batches_needed} 未获取到数据")
+                    break
+                
+                # 添加到总列表
+                all_klines.extend(klines)
+                
+                # 如果已经获取到足够的数据，退出
+                if len(all_klines) >= limit:
+                    break
+                
+                # 如果返回的数据少于请求的数量，说明没有更多数据了
+                if len(klines) < batch_limit:
+                    logger.debug(f"📊 批次 {batch + 1}/{batches_needed} 返回{len(klines)}条 < 请求{batch_limit}条，数据已获取完毕")
+                    break
+                
+                # 设置下一批次的 end_time 为当前批次最早的时间 - 1ms
+                current_end_time = klines[0]['timestamp'] - 1
+                
+                # API限流（最后一批不需要延迟）
+                if batch < batches_needed - 1:
+                    time.sleep(rate_limit_delay)
+            
+            # 按时间戳排序（确保顺序正确）
+            all_klines.sort(key=lambda x: x['timestamp'])
+            
+            # 去重（防止批次边界重复）
+            seen_timestamps = set()
+            unique_klines = []
+            for kline in all_klines:
+                ts = kline['timestamp']
+                if ts not in seen_timestamps:
+                    seen_timestamps.add(ts)
+                    unique_klines.append(kline)
+            
+            logger.debug(f"✅ 分页获取完成: {symbol} {interval} 共{len(unique_klines)}条（去重后）")
+            return unique_klines[:limit]  # 确保不超过请求的数量
+            
+        except Exception as e:
+            logger.error(f"分页获取K线数据失败: {symbol} {interval} - {e}")
+            return []
+    
+    def get_ticker_price(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """获取实时价格（24hr ticker）"""
+        try:
+            # ✅ 使用代理的 REST API
+            ticker = self.client.ticker_price(symbol=symbol)
+            
+            if ticker:
+                return {
+                    'symbol': ticker.get('symbol', symbol),
+                    'price': float(ticker.get('price', 0))
+                }
+            return None
+            
+        except Exception as e:
+            logger.error(f"获取实时价格失败: {symbol} - {e}")
+            return None
+    
     def get_account_info(self) -> Dict[str, Any]:
         """获取账户信息"""
         try:
+            if not self.account_endpoints_enabled:
+                logger.warning("⏸️ 账户接口已临时禁用，返回空账户信息")
+                return {}
+
             account = self.client.account(recvWindow=self.recv_window)
             
             # 格式化账户信息
@@ -189,6 +699,10 @@ class BinanceClient:
     def get_position_info(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """获取持仓信息"""
         try:
+            if not self.account_endpoints_enabled:
+                logger.warning("⏸️ 持仓接口已临时禁用，返回空列表")
+                return []
+
             params = {'recvWindow': self.recv_window}
             if symbol:
                 params['symbol'] = symbol
@@ -238,6 +752,10 @@ class BinanceClient:
     ) -> Dict[str, Any]:
         """下单"""
         try:
+            if not self.account_endpoints_enabled:
+                logger.warning("⏸️ 下单接口已临时禁用，返回空结果")
+                return {}
+
             params = {
                 'symbol': symbol,
                 'side': side,
@@ -273,6 +791,10 @@ class BinanceClient:
     def cancel_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
         """撤销订单"""
         try:
+            if not self.account_endpoints_enabled:
+                logger.warning("⏸️ 撤单接口已临时禁用，返回空结果")
+                return {}
+
             result = self.client.cancel_order(symbol=symbol, orderId=order_id, recvWindow=self.recv_window)
             logger.info(f"撤销订单成功: {symbol} {order_id}")
             return result
@@ -283,6 +805,10 @@ class BinanceClient:
     def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """获取未成交订单"""
         try:
+            if not self.account_endpoints_enabled:
+                logger.warning("⏸️ 未成交订单接口已临时禁用，返回空列表")
+                return []
+
             params = {'recvWindow': self.recv_window}
             if symbol:
                 params['symbol'] = symbol
@@ -297,6 +823,10 @@ class BinanceClient:
     def change_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
         """修改杠杆倍数"""
         try:
+            if not self.account_endpoints_enabled:
+                logger.warning("⏸️ 杠杆调整接口已临时禁用，返回空结果")
+                return {}
+
             result = self.client.change_leverage(symbol=symbol, leverage=leverage, recvWindow=self.recv_window)
             logger.info(f"修改杠杆成功: {symbol} {leverage}x")
             return result
@@ -307,6 +837,10 @@ class BinanceClient:
     def change_margin_type(self, symbol: str, margin_type: str) -> Dict[str, Any]:
         """修改保证金模式（可能已设置，失败不影响）"""
         try:
+            if not self.account_endpoints_enabled:
+                logger.warning("⏸️ 保证金模式调整接口已临时禁用，返回空结果")
+                return {}
+
             result = self.client.change_margin_type(symbol=symbol, marginType=margin_type, recvWindow=self.recv_window)
             logger.info(f"修改保证金模式成功: {symbol} {margin_type}")
             return result
@@ -328,19 +862,19 @@ class BinanceWebSocketClient:
         self.callbacks: Dict[str, Callable] = {}
         self.is_connected = False
         self.is_running = False
-        self.reconnect_delay = 5  # 重连延迟（秒）
-        self.max_reconnect_delay = 60  # 最大重连延迟（秒）
-        self.current_reconnect_delay = 5
-        self.reconnect_task = None
         self.is_reconnecting = False  # 🔒 重连锁，防止重复重连
         self.subscriptions = []  # 保存订阅信息以便重连后恢复
-        self.connection_start_time = None
+        self.reconnect_task = None
         self.monitor_task = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None  # 🔥 保存事件循环
-        self.reconnect_count = 0  # 重连次数统计
-        self.max_reconnect_attempts = 10  # 最大连续重连次数
         self.last_message_time = None  # 最后收到消息的时间
         self.health_check_task = None  # 健康检查任务
+        
+        # 🔥 使用指数退避重连策略
+        self.reconnector = ExponentialBackoffReconnector()
+        
+        # 💓 心跳保活机制
+        self.heartbeat: Optional[WebSocketHeartbeat] = None
         
     def start_websocket(self):
         """启动WebSocket连接"""
@@ -358,19 +892,58 @@ class BinanceWebSocketClient:
             # WebSocket: wss://n8n.do2ge.com/tail/ws/relay -> wss://fstream.binance.com
             stream_url = "wss://n8n.do2ge.com/tail/ws/relay"
             
-            self.ws_client = UMFuturesWebsocketClient(
-                stream_url=stream_url,
-                on_message=self._on_message,
-                on_error=self._on_error,
-                on_close=self._on_close,
-                on_open=self._on_open,
-                on_ping=self._on_ping,
-                on_pong=self._on_pong
-            )
+            # 🔒 配置SSL上下文（增强安全性和稳定性）
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = True
+            ssl_context.verify_mode = ssl.CERT_REQUIRED
+            # 禁用旧的不安全协议
+            ssl_context.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3
+            # 配置安全密码套件
+            ssl_context.set_ciphers('HIGH:!aNULL:!eNULL:!EXPORT:!DES:!MD5:!PSK:!RC4')
+            
+            # 🔧 配置WebSocket参数
+            ws_kwargs = {
+                "stream_url": stream_url,
+                "on_message": self._on_message,
+                "on_error": self._on_error,
+                "on_close": self._on_close,
+                "on_open": self._on_open,
+                "on_ping": self._on_ping,
+                "on_pong": self._on_pong,
+                "sslopt": {
+                    "context": ssl_context,
+                    "check_hostname": True,
+                    "cert_reqs": ssl.CERT_REQUIRED,
+                    "ssl_version": ssl.PROTOCOL_TLS,  # 使用最新TLS版本
+                    "timeout": settings.WS_SSL_TIMEOUT  # SSL握手超时
+                },
+                "timeout": settings.WS_SSL_TIMEOUT,  # 整体超时
+                "ping_interval": settings.WS_PING_INTERVAL,  # 启用内置ping
+                "ping_timeout": settings.WS_PONG_TIMEOUT
+            }
+            
+            # 添加代理配置（仅在USE_PROXY_WS启用时）
+            if settings.USE_PROXY and settings.USE_PROXY_WS:
+                # 🔧 WebSocket代理通过环境变量设置（websocket-client库要求）
+                proxy_type = settings.PROXY_TYPE.lower()
+                proxy_url = f"socks5://{settings.PROXY_HOST}:{settings.PROXY_PORT}"
+                os.environ['http_proxy'] = proxy_url
+                os.environ['https_proxy'] = proxy_url
+                os.environ['HTTP_PROXY'] = proxy_url
+                os.environ['HTTPS_PROXY'] = proxy_url
+            elif settings.USE_PROXY and not settings.USE_PROXY_WS:
+                logger.info("✅ WebSocket直连（不使用代理），仅REST API使用代理")
+            
+            self.ws_client = UMFuturesWebsocketClient(**ws_kwargs)
             
             self.is_running = True
             self.connection_start_time = datetime.now()
             self.last_message_time = datetime.now()
+            
+            # 💓 初始化并启动心跳机制
+            if self.heartbeat is None:
+                self.heartbeat = WebSocketHeartbeat(self.ws_client)
+            asyncio.create_task(self.heartbeat.start())
             
             # 启动连接监控任务（24小时重建连接）
             if self.monitor_task is None or self.monitor_task.done():
@@ -389,8 +962,8 @@ class BinanceWebSocketClient:
     def _on_open(self, ws):
         """WebSocket连接打开"""
         self.is_connected = True
-        self.reconnect_count = 0  # 重置重连计数
-        self.current_reconnect_delay = self.reconnect_delay  # 重置重连延迟
+        # 🔥 重置重连器状态
+        self.reconnector.reset()
         logger.info("✅ WebSocket连接已建立")
     
     def _on_close(self, ws, close_status_code=None, close_msg=None):
@@ -457,6 +1030,9 @@ class BinanceWebSocketClient:
         logger.debug("📥 收到服务端Pong帧")
         # 更新最后消息时间（用于健康检查）
         self.last_message_time = datetime.now()
+        # 💓 通知心跳机制收到pong
+        if self.heartbeat:
+            self.heartbeat.on_pong_received()
     
     def _on_message(self, ws, message):
         """处理WebSocket消息"""
@@ -510,22 +1086,21 @@ class BinanceWebSocketClient:
             logger.error(f"   原始消息: {message[:500]}")
     
     async def _reconnect(self):
-        """自动重连"""
-        # ✅ 立即输出日志，确认重连任务已开始执行
-        logger.warning(f"🔄 重连任务开始执行 (当前重连次数: {self.reconnect_count})...")
+        """自动重连（使用指数退避策略）"""
+        logger.warning(f"🔄 重连任务开始执行...")
         
         try:
-            # 检查是否超过最大重连次数
-            self.reconnect_count += 1
-            if self.reconnect_count > self.max_reconnect_attempts:
-                logger.error(f"❌ 已达到最大重连次数 ({self.max_reconnect_attempts})，停止重连")
+            # 🔥 检查是否应该继续重试
+            if not self.reconnector.should_retry():
+                logger.error(f"❌ 已达到最大重连次数 ({self.reconnector.max_retries})，停止重连")
                 self.is_reconnecting = False
                 self.is_running = False
                 return
             
-            logger.info(f"🔌 尝试重新建立WebSocket连接 (第 {self.reconnect_count}/{self.max_reconnect_attempts} 次)...")
-            logger.info(f"⏱️ 等待 {self.current_reconnect_delay} 秒后开始重连...")
-            await asyncio.sleep(self.current_reconnect_delay)
+            # 🔥 计算并等待重连延迟（指数退避）
+            delay = self.reconnector.on_reconnect_attempt()
+            logger.info(f"⏱️ 等待 {delay:.1f} 秒后开始重连...")
+            await asyncio.sleep(delay)
             
             # 停止旧连接
             if self.ws_client:
@@ -541,7 +1116,7 @@ class BinanceWebSocketClient:
             logger.info("🚀 启动新WebSocket连接...")
             self.start_websocket()
             
-            # 🔥 等待连接建立，增加重试机制和详细日志
+            # 等待连接建立
             max_wait_time = 10  # 最多等待10秒
             wait_time = 0
             while not self.is_connected and wait_time < max_wait_time:
@@ -556,9 +1131,8 @@ class BinanceWebSocketClient:
                 await asyncio.sleep(1)
                 self._restore_subscriptions()
                 
-                # 重置重连延迟和计数
-                self.current_reconnect_delay = self.reconnect_delay
-                self.reconnect_count = 0
+                # 🔥 记录重连成功
+                self.reconnector.on_reconnect_success()
                 self.is_reconnecting = False  # 🔓 释放重连锁
                 logger.warning("✅ ✅ ✅ WebSocket重连成功！连接已恢复正常 ✅ ✅ ✅")
             else:
@@ -567,15 +1141,8 @@ class BinanceWebSocketClient:
                 raise Exception("连接建立超时")
             
         except Exception as e:
-            logger.error(f"❌ WebSocket重连失败 (第 {self.reconnect_count}/{self.max_reconnect_attempts} 次): {e}")
-            logger.error(f"   错误类型: {type(e).__name__}")
-            
-            # 指数退避，增加重连延迟
-            self.current_reconnect_delay = min(
-                self.current_reconnect_delay * 2,
-                self.max_reconnect_delay
-            )
-            logger.warning(f"⏱️ 下次重连延迟: {self.current_reconnect_delay}秒 (指数退避策略)")
+            # 🔥 记录重连失败
+            self.reconnector.on_reconnect_failure(e)
             
             # 🔄 重连失败后，再次尝试重连
             self.is_reconnecting = False  # 释放锁，允许下次重连
@@ -796,6 +1363,11 @@ class BinanceWebSocketClient:
             logger.info("🛑 正在停止WebSocket连接...")
             self.is_running = False
             
+            # 💓 停止心跳任务
+            if self.heartbeat:
+                asyncio.create_task(self.heartbeat.stop())
+                logger.debug("心跳任务已取消")
+            
             # 取消健康检查任务
             if self.health_check_task and not self.health_check_task.done():
                 self.health_check_task.cancel()
@@ -821,18 +1393,20 @@ class BinanceWebSocketClient:
     
     def get_connection_stats(self) -> Dict[str, Any]:
         """获取连接统计信息"""
+        # 🔥 获取重连器统计信息
+        reconnect_stats = self.reconnector.get_statistics()
+        
         stats = {
             'is_connected': self.is_connected,
             'is_running': self.is_running,
             'is_reconnecting': self.is_reconnecting,
-            'reconnect_count': self.reconnect_count,
-            'current_reconnect_delay': self.current_reconnect_delay,
             'subscriptions_count': len(self.subscriptions),
-            'callbacks_count': len(self.callbacks)
+            'callbacks_count': len(self.callbacks),
+            'reconnect_statistics': reconnect_stats
         }
         
-        if self.connection_start_time:
-            uptime = (datetime.now() - self.connection_start_time).total_seconds()
+        if self.reconnector.connection_start_time:
+            uptime = (datetime.now() - self.reconnector.connection_start_time).total_seconds()
             stats['uptime_seconds'] = uptime
             stats['uptime_hours'] = uptime / 3600
         

@@ -12,8 +12,8 @@ import uuid
 from app.core.config import settings
 from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
-from app.services.binance_client import binance_client
-from app.services.signal_generator import TradingSignal
+from app.exchange.binance_client import binance_client
+from app.trading.signal_generator import TradingSignal
 
 logger = logging.getLogger(__name__)
 
@@ -488,7 +488,7 @@ class TradingEngine:
             
             # 获取当前价格（用于虚拟成交）
             try:
-                from app.services.binance_client import binance_client
+                from app.exchange.binance_client import binance_client
                 ticker = binance_client.get_ticker_price(symbol)
                 current_price = float(ticker['price'])
             except:

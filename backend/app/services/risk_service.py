@@ -13,7 +13,7 @@ from app.core.config import settings
 from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
 from app.services.data_service import DataService
-from app.services.position_manager import position_manager
+from app.trading.position_manager import position_manager
 
 logger = logging.getLogger(__name__)
 
@@ -612,10 +612,11 @@ class RiskService:
             包含止损止盈的字典
         """
         try:
-            from app.services.binance_client import binance_client
+            from app.exchange.binance_client import binance_client
             
             # 1. 获取最近的K线数据计算ATR（使用5m主时间框架）
-            klines = binance_client.get_klines(
+            # ✅ 统一使用分页方法（limit=100时自动调用单次获取，不影响性能）
+            klines = binance_client.get_klines_paginated(
                 symbol=symbol,
                 interval='5m',
                 limit=100  # 5m需要更多样本（100个=8.3小时）

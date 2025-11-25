@@ -27,9 +27,9 @@ psycopg2-binary
 # 机器学习（四模型集成 + GPU加速）
 # ========================================
 # 传统机器学习模型（支持GPU加速）
-lightgbm  # GPU: device='gpu'
-xgboost   # GPU: tree_method='hist', device='cuda'
-catboost  # GPU: task_type='GPU'
+lightgbm>=4.0.0  # GPU: device='gpu'
+xgboost>=1.6.0   # GPU: tree_method='hist', device='cuda' (需要1.6.0+支持callbacks参数)
+catboost>=1.2.0  # GPU: task_type='GPU'
 
 # 深度学习模型（Informer-2 + GMADL）
 # 见下方深度学习框架部分
@@ -59,6 +59,7 @@ ta
 # ========================================
 binance-connector
 websocket-client
+PySocks  # SOCKS5代理支持
 
 # ========================================
 # 工具库

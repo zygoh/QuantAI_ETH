@@ -291,7 +291,7 @@ class HealthMonitor:
         """检查 WebSocket 数据接收状态（增强版：检查连接状态和数据新鲜度）"""
         try:
             # 检查WebSocket连接状态
-            from app.services.binance_client import binance_ws_client
+            from app.exchange.binance_client import binance_ws_client
             is_ws_connected = binance_ws_client.is_connected
             
             # 通过检查缓冲区更新判断 WebSocket 是否正常

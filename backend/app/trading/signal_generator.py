@@ -23,7 +23,7 @@ import numpy as np
 from app.core.config import settings
 from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
-from app.services.ml_service import MLService
+from app.model.ml_service import MLService
 from app.services.data_service import DataService, KlineData
 
 logger = logging.getLogger(__name__)
@@ -128,7 +128,7 @@ class SignalGenerator:
     async def _initialize_kline_buffers(self):
         """初始化K线数据缓冲区 - 从API获取初始数据"""
         try:
-            from app.services.binance_client import binance_client
+            from app.exchange.binance_client import binance_client
             
             symbol = settings.SYMBOL
             logger.info(f"初始化WebSocket数据缓冲区: {symbol}")
@@ -142,48 +142,14 @@ class SignalGenerator:
                     max_limit = 1500
                     all_klines = []
                     
-                    if buffer_size <= max_limit:
-                        # 一次性获取
-                        klines = binance_client.get_klines(
+                    # ✅ 统一使用分页方法（自动处理超过1500的情况）
+                    logger.info(f"获取 {timeframe} 初始数据（{buffer_size}条，覆盖{self.buffer_days}天）...")
+                    all_klines = binance_client.get_klines_paginated(
                             symbol=symbol,
                             interval=timeframe,
-                            limit=buffer_size
-                        )
-                        if klines:
-                            all_klines = klines
-                    else:
-                        # 分批获取
-                        logger.info(f"获取 {timeframe} 初始数据（{buffer_size}条，覆盖{self.buffer_days}天，需分批获取）...")
-                        batches = (buffer_size + max_limit - 1) // max_limit
-                        
-                        for batch in range(batches):
-                            batch_limit = min(max_limit, buffer_size - len(all_klines))
-                            
-                            # 计算 end_time（倒推获取）
-                            if all_klines:
-                                # 使用上一批最早的时间戳
-                                end_time = all_klines[0]['timestamp'] - 1
-                            else:
-                                # 第一批使用当前时间
-                                from datetime import datetime
-                                end_time = int(datetime.now().timestamp() * 1000)
-                            
-                            klines = binance_client.get_klines(
-                                symbol=symbol,
-                                interval=timeframe,
-                                limit=batch_limit,
-                                end_time=end_time
-                            )
-                            
-                            if klines:
-                                # 插入到开头（因为是倒序获取）
-                                all_klines = klines + all_klines
-                            else:
-                                logger.warning(f"  批次 {batch + 1} 未获取到数据")
-                                break
-                            
-                            # API限流
-                            await asyncio.sleep(0.2)
+                        limit=buffer_size,
+                        rate_limit_delay=0.2
+                    )
                     
                     if all_klines:
                         # 初始化缓冲区
@@ -441,7 +407,7 @@ class SignalGenerator:
     async def _predict_single_timeframe(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
         """预测单个时间框架"""
         try:
-            from app.services.binance_client import binance_client
+            from app.exchange.binance_client import binance_client
             
             # 确定需要的数据量（超短线策略：较短周期）
             prediction_days_config = {
@@ -464,9 +430,9 @@ class SignalGenerator:
                 df = self.kline_buffers[timeframe].tail(required_klines).copy()
                 logger.debug(f"✓ 使用缓冲区: {timeframe} ({len(df)}条)")
             else:
-                # 从API获取
-                logger.debug(f"⚠️ 缓冲区不足，从API获取: {timeframe}")
-                klines = binance_client.get_klines(
+                # 从API获取（使用统一的分页方法）
+                logger.debug(f"⚠️ 缓冲区不足，从API获取: {timeframe} (需要{required_klines}条)")
+                klines = binance_client.get_klines_paginated(
                     symbol=symbol,
                     interval=timeframe,
                     limit=required_klines
@@ -566,7 +532,7 @@ class SignalGenerator:
     async def _get_multi_timeframe_predictions(self, symbol: str) -> Dict[str, Dict[str, Any]]:
         """获取多时间框架预测 - 使用固定天数确保时间对齐"""
         try:
-            from app.services.binance_client import binance_client
+            from app.exchange.binance_client import binance_client
             
             predictions = {}
             
@@ -600,9 +566,9 @@ class SignalGenerator:
                     data_source = "WebSocket缓冲区"
                     logger.debug(f"✓ 使用WebSocket缓冲区: {timeframe} (需要{required_klines}条, 当前{len(df)}条, {prediction_days}天)")
                 else:
-                    # 缓冲区数据不足，从API获取
-                    logger.debug(f"⚠️ 缓冲区数据不足({len(self.kline_buffers.get(timeframe, []))}条 < {required_klines}条)，从API获取: {timeframe}")
-                    klines = binance_client.get_klines(
+                    # 缓冲区数据不足，从API获取（使用统一的分页方法）
+                    logger.debug(f"⚠️ 缓冲区数据不足({len(self.kline_buffers.get(timeframe, []))}条 < {required_klines}条)，从API获取: {timeframe} (需要{required_klines}条)")
+                    klines = binance_client.get_klines_paginated(
                         symbol=symbol,
                         interval=timeframe,
                         limit=required_klines
@@ -753,7 +719,7 @@ class SignalGenerator:
             
             # 🆕 统一使用 position_manager 计算仓位大小（USDT价值）
             # 从 Redis 读取当前交易模式（支持动态切换）
-            from app.services.position_manager import position_manager
+            from app.trading.position_manager import position_manager
             current_mode = await cache_manager.get("system:trading_mode")
             is_virtual_mode = (current_mode != "AUTO")  # 默认虚拟模式，只有明确是 AUTO 才用实盘
             
@@ -793,7 +759,7 @@ class SignalGenerator:
     async def _get_current_price(self, symbol: str) -> Optional[float]:
         """获取当前价格 - 直接从API获取实时价格"""
         try:
-            from app.services.binance_client import binance_client
+            from app.exchange.binance_client import binance_client
             
             # 优先从缓存获取最新价格（缓存是WebSocket实时更新的）
             ticker_data = await cache_manager.get_market_data(symbol, "ticker")
@@ -804,7 +770,8 @@ class SignalGenerator:
             
             # 缓存失效时，直接从API获取最新价格
             logger.debug(f"从API获取实时价格: {symbol}")
-            klines = binance_client.get_klines(symbol, '1m', limit=1)
+            # ✅ 统一使用分页方法（limit=1时自动调用单次获取，不影响性能）
+            klines = binance_client.get_klines_paginated(symbol, '1m', limit=1)
             
             if klines and len(klines) > 0:
                 price = float(klines[0]['close'])

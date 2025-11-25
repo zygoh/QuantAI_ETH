@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.api.models import PositionsResponse, PositionInfo
 from app.api.dependencies import get_current_user
 from app.services.data_service import DataService
-from app.services.position_manager import position_manager
+from app.trading.position_manager import position_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter()

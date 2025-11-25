@@ -25,30 +25,37 @@ from scipy.stats import entropy as scipy_entropy
 from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report, log_loss
+from sklearn.preprocessing import StandardScaler
 from numpy.lib.format import open_memmap
 
 # Local application imports
-from app.services.ml_service import MLService
+from app.model.ml_service import MLService
 from app.core.config import settings
 from app.core.cache import cache_manager
-from app.services.hyperparameter_optimizer import HyperparameterOptimizer
+from app.model.hyperparameter_optimizer import HyperparameterOptimizer
 from app.services.direction_consistency_checker import TradingDirectionConsistencyChecker, ConsistencyCheck
 from app.services.adaptive_frequency_controller import AdaptiveFrequencyController, FrequencyControl
-from app.services.model_stability_enhancer import ModelStabilityEnhancer
+from app.model.model_stability_enhancer import ModelStabilityEnhancer
 from app.utils.helpers import format_signal_type
+from app.exchange.binance_client import binance_client
 
 logger = logging.getLogger(__name__)
 
-# 🔥 延迟导入避免循环依赖（仅在必要时）
-# binance_client 在方法内导入以避免循环依赖
+# 可选依赖：bitsandbytes（8-bit优化器）
+try:
+    import bitsandbytes as bnb
+    BNB_AVAILABLE = True
+except ImportError:
+    BNB_AVAILABLE = False
 
 # 深度学习模型（PyTorch）
 try:
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, Dataset, TensorDataset
-    from app.services.informer2_model import Informer2ForClassification
-    from app.services.gmadl_loss import create_trade_loss
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
+    from app.model.informer2_model import Informer2ForClassification
+    from app.model.gmadl_loss import create_trade_loss
     TORCH_AVAILABLE = True
     logger.info("✅ PyTorch已加载，Informer-2模型可用")
 except ImportError:
@@ -94,11 +101,14 @@ class InformerWrapper:
                 elif X_seq.dtype != np.float32:
                     X_seq = X_seq.astype(np.float32)
                 
+                # 🔥 优化内存操作：先检查连续性，只在必要时copy
                 if not X_seq.flags['C_CONTIGUOUS']:
                     X_seq = np.ascontiguousarray(X_seq)
-                
-                # 🔥 关键修复：使用copy()避免内存映射问题
-                X_tensor = torch.from_numpy(X_seq.copy()).to(self.device)
+                    # 如果已经是连续的，直接使用from_numpy（避免copy）
+                    X_tensor = torch.from_numpy(X_seq).to(self.device)
+                else:
+                    # 连续内存，直接使用from_numpy（避免copy，节省延迟）
+                    X_tensor = torch.from_numpy(X_seq).to(self.device)
             else:
                 X_tensor = X_seq.to(self.device)
             
@@ -172,7 +182,7 @@ class EnsembleMLService(MLService):
         self.informer_n_layers = 3  # Encoder层数
         self.informer_epochs = 50  # 训练轮数（GPU加速）
         self.informer_batch_size = 256  # 批次大小
-        self.informer_lr = 0.001  # 学习率
+        self.informer_lr = 0.0005  # 学习率（降低以提高数值稳定性：0.001→0.0005）
         
         # 🔥 高级内存优化配置（生产级别）
         self.use_gradient_checkpointing = True  # 梯度检查点（节省50-70%内存）
@@ -292,9 +302,6 @@ class EnsembleMLService(MLService):
             K线数据DataFrame
         """
         try:
-            # 🔥 延迟导入避免循环依赖
-            from app.services.binance_client import binance_client
-            
             symbol = settings.SYMBOL
             
             # 🔑 基础训练天数配置（超短线策略：确保足够样本）
@@ -317,32 +324,13 @@ class EnsembleMLService(MLService):
             
             logger.info(f"📥 获取{timeframe}数据（×{days_multiplier}倍）: {required_klines}条K线 ({training_days}天)")
             
-            # 分批获取
-            all_klines = []
-            batch_size = 1500
-            batches_needed = (required_klines + batch_size - 1) // batch_size
-            
-            end_time = None
-            for batch in range(batches_needed):
-                remaining = required_klines - len(all_klines)
-                batch_limit = min(batch_size, remaining)
-                
-                klines = binance_client.get_klines(
-                    symbol=symbol,
-                    interval=timeframe,
-                    limit=batch_limit,
-                    end_time=end_time
-                )
-                
-                if not klines:
-                    break
-                
-                all_klines.extend(klines)
-                
-                if len(klines) < batch_limit:
-                    break
-                
-                end_time = klines[0]['timestamp'] - 1
+            # ✅ 统一使用分页方法（自动处理超过1500的情况）
+            all_klines = binance_client.get_klines_paginated(
+                symbol=symbol,
+                interval=timeframe,
+                limit=required_klines,
+                rate_limit_delay=0.1
+            )
             
             # 转换为DataFrame（不依赖reverse，直接用时间戳排序）
             df = pd.DataFrame(all_klines)
@@ -640,62 +628,95 @@ class EnsembleMLService(MLService):
                     logger.warning(f"⚠️ 序列输入构造失败，将跳过Informer-2训练")
                     self.enable_informer2 = False
             
-            # 3️⃣ 时间序列分割（使用最短的数据长度作为验证集基准）
+            # 3️⃣ 时间序列分割（三段式：Train 60% / Val 20% / Test 20%）
+            # 🔑 修复数据泄露：使用独立测试集评估元学习器
             min_len = min(len(X_lgb_scaled), len(X_xgb_scaled), len(X_cat_scaled))
-            split_idx = int(min_len * 0.8)
+            train_split_idx = int(min_len * 0.6)  # 60% 训练集
+            val_split_idx = int(min_len * 0.8)     # 20% 验证集（用于训练元学习器）
             
             # 🔑 分割数据（取最新的数据，保证时间对齐）
             if isinstance(X_lgb_scaled, np.ndarray):
-                X_lgb_train, X_lgb_val = X_lgb_scaled[-min_len:][:split_idx], X_lgb_scaled[-min_len:][split_idx:]
-                X_xgb_train, X_xgb_val = X_xgb_scaled[-min_len:][:split_idx], X_xgb_scaled[-min_len:][split_idx:]
-                X_cat_train, X_cat_val = X_cat_scaled[-min_len:][:split_idx], X_cat_scaled[-min_len:][split_idx:]
+                X_lgb_train = X_lgb_scaled[-min_len:][:train_split_idx]
+                X_lgb_val = X_lgb_scaled[-min_len:][train_split_idx:val_split_idx]
+                X_lgb_test = X_lgb_scaled[-min_len:][val_split_idx:]
+                X_xgb_train = X_xgb_scaled[-min_len:][:train_split_idx]
+                X_xgb_val = X_xgb_scaled[-min_len:][train_split_idx:val_split_idx]
+                X_xgb_test = X_xgb_scaled[-min_len:][val_split_idx:]
+                X_cat_train = X_cat_scaled[-min_len:][:train_split_idx]
+                X_cat_val = X_cat_scaled[-min_len:][train_split_idx:val_split_idx]
+                X_cat_test = X_cat_scaled[-min_len:][val_split_idx:]
             else:
-                X_lgb_train, X_lgb_val = X_lgb_scaled.iloc[-min_len:][:split_idx], X_lgb_scaled.iloc[-min_len:][split_idx:]
-                X_xgb_train, X_xgb_val = X_xgb_scaled.iloc[-min_len:][:split_idx], X_xgb_scaled.iloc[-min_len:][split_idx:]
-                X_cat_train, X_cat_val = X_cat_scaled.iloc[-min_len:][:split_idx], X_cat_scaled.iloc[-min_len:][split_idx:]
+                X_lgb_train = X_lgb_scaled.iloc[-min_len:][:train_split_idx]
+                X_lgb_val = X_lgb_scaled.iloc[-min_len:][train_split_idx:val_split_idx]
+                X_lgb_test = X_lgb_scaled.iloc[-min_len:][val_split_idx:]
+                X_xgb_train = X_xgb_scaled.iloc[-min_len:][:train_split_idx]
+                X_xgb_val = X_xgb_scaled.iloc[-min_len:][train_split_idx:val_split_idx]
+                X_xgb_test = X_xgb_scaled.iloc[-min_len:][val_split_idx:]
+                X_cat_train = X_cat_scaled.iloc[-min_len:][:train_split_idx]
+                X_cat_val = X_cat_scaled.iloc[-min_len:][train_split_idx:val_split_idx]
+                X_cat_test = X_cat_scaled.iloc[-min_len:][val_split_idx:]
             
-            y_lgb_train, y_lgb_val = y_lgb.iloc[-min_len:][:split_idx], y_lgb.iloc[-min_len:][split_idx:]
-            y_xgb_train, y_xgb_val = y_xgb.iloc[-min_len:][:split_idx], y_xgb.iloc[-min_len:][split_idx:]
-            y_cat_train, y_cat_val = y_cat.iloc[-min_len:][:split_idx], y_cat.iloc[-min_len:][split_idx:]
+            y_lgb_train = y_lgb.iloc[-min_len:][:train_split_idx]
+            y_lgb_val = y_lgb.iloc[-min_len:][train_split_idx:val_split_idx]
+            y_lgb_test = y_lgb.iloc[-min_len:][val_split_idx:]
+            y_xgb_train = y_xgb.iloc[-min_len:][:train_split_idx]
+            y_xgb_val = y_xgb.iloc[-min_len:][train_split_idx:val_split_idx]
+            y_xgb_test = y_xgb.iloc[-min_len:][val_split_idx:]
+            y_cat_train = y_cat.iloc[-min_len:][:train_split_idx]
+            y_cat_val = y_cat.iloc[-min_len:][train_split_idx:val_split_idx]
+            y_cat_test = y_cat.iloc[-min_len:][val_split_idx:]
             
-            # 🆕 分割序列数据（用于Informer-2）
-            X_seq_train, X_seq_val, y_seq_train, y_seq_val = None, None, None, None
+            # 🆕 分割序列数据（用于Informer-2，三段式）
+            X_seq_train, X_seq_val, X_seq_test, y_seq_train, y_seq_val, y_seq_test = None, None, None, None, None, None
             if self.enable_informer2 and X_seq_lgb is not None:
-                seq_split_idx = int(len(X_seq_lgb) * 0.8)
-                X_seq_train = X_seq_lgb[:seq_split_idx]
-                X_seq_val = X_seq_lgb[seq_split_idx:]
-                y_seq_train = y_seq_lgb[:seq_split_idx]
-                y_seq_val = y_seq_lgb[seq_split_idx:]
-                logger.info(f"📊 {timeframe} 序列数据分割: 训练{len(X_seq_train)}条, 验证{len(X_seq_val)}条")
+                seq_train_split_idx = int(len(X_seq_lgb) * 0.6)
+                seq_val_split_idx = int(len(X_seq_lgb) * 0.8)
+                X_seq_train = X_seq_lgb[:seq_train_split_idx]
+                X_seq_val = X_seq_lgb[seq_train_split_idx:seq_val_split_idx]
+                X_seq_test = X_seq_lgb[seq_val_split_idx:]
+                y_seq_train = y_seq_lgb[:seq_train_split_idx]
+                y_seq_val = y_seq_lgb[seq_train_split_idx:seq_val_split_idx]
+                y_seq_test = y_seq_lgb[seq_val_split_idx:]
+                logger.info(f"📊 {timeframe} 序列数据分割: 训练{len(X_seq_train)}条, 验证{len(X_seq_val)}条, 测试{len(X_seq_test)}条")
                 
-                # 🔑 关键修复：对齐传统模型的验证集到序列数据的长度
+                # 🔑 关键修复：对齐传统模型的验证集和测试集到序列数据的长度
                 # 序列数据比原始数据少seq_len个样本，需要对齐
                 seq_val_len = len(X_seq_val)
-                if seq_val_len < len(X_lgb_val):
-                    logger.warning(f"⚠️ 对齐验证集：传统模型{len(X_lgb_val)}条 → Informer-2{seq_val_len}条")
+                seq_test_len = len(X_seq_test)
+                if seq_val_len < len(X_lgb_val) or seq_test_len < len(X_lgb_test):
+                    logger.warning(f"⚠️ 对齐数据集：传统模型 Val{len(X_lgb_val)}/Test{len(X_lgb_test)}条 → Informer-2 Val{seq_val_len}/Test{seq_test_len}条")
                     # 取传统模型验证集的最后seq_val_len个样本（时间对齐）
                     if isinstance(X_lgb_val, np.ndarray):
                         X_lgb_val = X_lgb_val[-seq_val_len:]
                         X_xgb_val = X_xgb_val[-seq_val_len:]
                         X_cat_val = X_cat_val[-seq_val_len:]
+                        X_lgb_test = X_lgb_test[-seq_test_len:]
+                        X_xgb_test = X_xgb_test[-seq_test_len:]
+                        X_cat_test = X_cat_test[-seq_test_len:]
                     else:
                         X_lgb_val = X_lgb_val.iloc[-seq_val_len:]
                         X_xgb_val = X_xgb_val.iloc[-seq_val_len:]
                         X_cat_val = X_cat_val.iloc[-seq_val_len:]
+                        X_lgb_test = X_lgb_test.iloc[-seq_test_len:]
+                        X_xgb_test = X_xgb_test.iloc[-seq_test_len:]
+                        X_cat_test = X_cat_test.iloc[-seq_test_len:]
                     
                     y_lgb_val = y_lgb_val.iloc[-seq_val_len:]
                     y_xgb_val = y_xgb_val.iloc[-seq_val_len:]
                     y_cat_val = y_cat_val.iloc[-seq_val_len:]
+                    y_lgb_test = y_lgb_test.iloc[-seq_test_len:]
+                    y_xgb_test = y_xgb_test.iloc[-seq_test_len:]
+                    y_cat_test = y_cat_test.iloc[-seq_test_len:]
             
-            logger.info(f"📊 {timeframe} 传统模型数据分割: 训练{len(X_lgb_train)}条（对齐后）, 验证{len(X_lgb_val)}条")
+            logger.info(f"📊 {timeframe} 传统模型数据分割: 训练{len(X_lgb_train)}条, 验证{len(X_lgb_val)}条, 测试{len(X_lgb_test)}条")
             
             # 4️⃣ 训练Stacking集成模型（使用差异化数据 + 序列输入）
             logger.info(f"🚂 开始训练 {timeframe} Stacking集成（差异化数据）...")
             ensemble_result = self._train_stacking_diverse(
-                X_lgb_train, y_lgb_train, X_lgb_val, y_lgb_val,
-                X_xgb_train, y_xgb_train, X_xgb_val, y_xgb_val,
-                X_cat_train, y_cat_train, X_cat_val, y_cat_val,
-                X_seq_train, y_seq_train, X_seq_val, y_seq_val,
+                X_lgb_train, y_lgb_train, X_lgb_val, y_lgb_val, X_lgb_test, y_lgb_test,
+                X_xgb_train, y_xgb_train, X_xgb_val, y_xgb_val, X_xgb_test, y_xgb_test,
+                X_cat_train, y_cat_train, X_cat_val, y_cat_val, X_cat_test, y_cat_test,
+                X_seq_train, y_seq_train, X_seq_val, y_seq_val, X_seq_test, y_seq_test,
                 timeframe
             )
             
@@ -713,10 +734,10 @@ class EnsembleMLService(MLService):
     
     def _train_stacking_diverse(
         self,
-        X_lgb_train, y_lgb_train, X_lgb_val, y_lgb_val,
-        X_xgb_train, y_xgb_train, X_xgb_val, y_xgb_val,
-        X_cat_train, y_cat_train, X_cat_val, y_cat_val,
-        X_seq_train, y_seq_train, X_seq_val, y_seq_val,
+        X_lgb_train, y_lgb_train, X_lgb_val, y_lgb_val, X_lgb_test, y_lgb_test,
+        X_xgb_train, y_xgb_train, X_xgb_val, y_xgb_val, X_xgb_test, y_xgb_test,
+        X_cat_train, y_cat_train, X_cat_val, y_cat_val, X_cat_test, y_cat_test,
+        X_seq_train, y_seq_train, X_seq_val, y_seq_val, X_seq_test, y_seq_test,
         timeframe: str
     ) -> Dict[str, Any]:
         """
@@ -848,149 +869,141 @@ class EnsembleMLService(MLService):
             logger.info(f"🚂 训练CatBoost（{timeframe} +100%数据）...")
             cat_model = self._train_catboost(X_cat_train, y_cat_train, timeframe, custom_params=cat_params_optimized)
             
-            # 2️⃣ 生成验证集的预测概率（元特征）
-            logger.info(f"📊 生成元特征（基于对齐的验证集）...")
+            # 2️⃣ 生成验证集和测试集的预测概率（元特征）
+            # 🔑 修复数据泄露：用验证集训练元学习器，用测试集评估
+            logger.info(f"📊 生成元特征（验证集用于训练元学习器，测试集用于评估）...")
             
-            # 使用各自的验证集生成预测
-            lgb_pred_proba = lgb_model.predict_proba(X_lgb_val)
-            xgb_pred_proba = xgb_model.predict_proba(X_xgb_val)
-            cat_pred_proba = cat_model.predict_proba(X_cat_val)
+            # 使用验证集生成预测（用于训练元学习器）
+            lgb_pred_proba_val = lgb_model.predict_proba(X_lgb_val)
+            xgb_pred_proba_val = xgb_model.predict_proba(X_xgb_val)
+            cat_pred_proba_val = cat_model.predict_proba(X_cat_val)
             
-            # Informer-2预测（如果启用，使用序列验证数据）
+            # 使用测试集生成预测（用于评估元学习器）
+            lgb_pred_proba_test = lgb_model.predict_proba(X_lgb_test)
+            xgb_pred_proba_test = xgb_model.predict_proba(X_xgb_test)
+            cat_pred_proba_test = cat_model.predict_proba(X_cat_test)
+            
+            # Informer-2预测（如果启用，使用序列验证和测试数据）
+            inf_pred_proba_val = None
+            inf_pred_proba_test = None
             if inf_model is not None and X_seq_val is not None:
-                inf_pred_proba = inf_model.predict_proba(X_seq_val)
-                logger.info(f"   Informer-2概率形状: {inf_pred_proba.shape}")
+                inf_pred_proba_val = inf_model.predict_proba(X_seq_val)
+                logger.info(f"   Informer-2验证集概率形状: {inf_pred_proba_val.shape}")
+            if inf_model is not None and X_seq_test is not None:
+                inf_pred_proba_test = inf_model.predict_proba(X_seq_test)
+                logger.info(f"   Informer-2测试集概率形状: {inf_pred_proba_test.shape}")
             
-            logger.info(f"概率形状: lgb={lgb_pred_proba.shape}, xgb={xgb_pred_proba.shape}, cat={cat_pred_proba.shape}")
+            logger.info(f"验证集概率形状: lgb={lgb_pred_proba_val.shape}, xgb={xgb_pred_proba_val.shape}, cat={cat_pred_proba_val.shape}")
+            logger.info(f"测试集概率形状: lgb={lgb_pred_proba_test.shape}, xgb={xgb_pred_proba_test.shape}, cat={cat_pred_proba_test.shape}")
             
-            # 🔑 验证形状一致性
-            assert lgb_pred_proba.shape == xgb_pred_proba.shape == cat_pred_proba.shape, \
-                f"概率数组形状不一致: {lgb_pred_proba.shape} vs {xgb_pred_proba.shape} vs {cat_pred_proba.shape}"
+            # 🔑 验证形状一致性（验证集）
+            assert lgb_pred_proba_val.shape == xgb_pred_proba_val.shape == cat_pred_proba_val.shape, \
+                f"验证集概率数组形状不一致: {lgb_pred_proba_val.shape} vs {xgb_pred_proba_val.shape} vs {cat_pred_proba_val.shape}"
+            # 🔑 验证形状一致性（测试集）
+            assert lgb_pred_proba_test.shape == xgb_pred_proba_test.shape == cat_pred_proba_test.shape, \
+                f"测试集概率数组形状不一致: {lgb_pred_proba_test.shape} vs {xgb_pred_proba_test.shape} vs {cat_pred_proba_test.shape}"
             
-            # 获取预测类别
-            lgb_pred_raw = lgb_model.predict(X_lgb_val)
-            xgb_pred_raw = xgb_model.predict(X_xgb_val)
-            cat_pred_raw = cat_model.predict(X_cat_val)
+            # 获取预测类别（验证集和测试集）
+            lgb_pred_raw_val = lgb_model.predict(X_lgb_val)
+            xgb_pred_raw_val = xgb_model.predict(X_xgb_val)
+            cat_pred_raw_val = cat_model.predict(X_cat_val)
+            
+            lgb_pred_raw_test = lgb_model.predict(X_lgb_test)
+            xgb_pred_raw_test = xgb_model.predict(X_xgb_test)
+            cat_pred_raw_test = cat_model.predict(X_cat_test)
             
             # 🔑 统一转换为1D数组（CatBoost返回2D，需要ravel）
-            lgb_pred = lgb_pred_raw.ravel()
-            xgb_pred = xgb_pred_raw.ravel()
-            cat_pred = cat_pred_raw.ravel()
+            lgb_pred_val = lgb_pred_raw_val.ravel()
+            xgb_pred_val = xgb_pred_raw_val.ravel()
+            cat_pred_val = cat_pred_raw_val.ravel()
+            
+            lgb_pred_test = lgb_pred_raw_test.ravel()
+            xgb_pred_test = xgb_pred_raw_test.ravel()
+            cat_pred_test = cat_pred_raw_test.ravel()
             
             # 🔑 严格验证预测数组形状
-            expected_shape = (len(y_lgb_val),)
-            assert lgb_pred.shape == expected_shape, f"lgb_pred形状错误: {lgb_pred.shape} != {expected_shape}"
-            assert xgb_pred.shape == expected_shape, f"xgb_pred形状错误: {xgb_pred.shape} != {expected_shape}"
-            assert cat_pred.shape == expected_shape, f"cat_pred形状错误: {cat_pred.shape} != {expected_shape}"
+            expected_shape_val = (len(y_lgb_val),)
+            expected_shape_test = (len(y_lgb_test),)
+            assert lgb_pred_val.shape == expected_shape_val, f"lgb_pred_val形状错误: {lgb_pred_val.shape} != {expected_shape_val}"
+            assert xgb_pred_val.shape == expected_shape_val, f"xgb_pred_val形状错误: {xgb_pred_val.shape} != {expected_shape_val}"
+            assert cat_pred_val.shape == expected_shape_val, f"cat_pred_val形状错误: {cat_pred_val.shape} != {expected_shape_val}"
+            assert lgb_pred_test.shape == expected_shape_test, f"lgb_pred_test形状错误: {lgb_pred_test.shape} != {expected_shape_test}"
+            assert xgb_pred_test.shape == expected_shape_test, f"xgb_pred_test形状错误: {xgb_pred_test.shape} != {expected_shape_test}"
+            assert cat_pred_test.shape == expected_shape_test, f"cat_pred_test形状错误: {cat_pred_test.shape} != {expected_shape_test}"
             
-            logger.info(f"预测类别形状验证通过: {lgb_pred.shape} (已统一为1D数组)")
+            logger.info(f"预测类别形状验证通过: 验证集{lgb_pred_val.shape}, 测试集{lgb_pred_test.shape} (已统一为1D数组)")
             
-            # 🆕 增强元特征（提升元学习器决策能力）
-            logger.info(f"生成增强元特征...")
+            # 🆕 生成元特征的辅助函数
+            def _build_meta_features(lgb_proba, xgb_proba, cat_proba, inf_proba, lgb_pred, xgb_pred, cat_pred, y_labels, dataset_name):
+                """构建元特征"""
+                # 1. 模型一致性
+                agreement_bool = (lgb_pred == xgb_pred) & (xgb_pred == cat_pred)
+                agreement = agreement_bool.astype(float).reshape(-1, 1)
+                
+                # 2. 最大概率
+                lgb_max_prob = lgb_proba.max(axis=1).reshape(-1, 1)
+                xgb_max_prob = xgb_proba.max(axis=1).reshape(-1, 1)
+                cat_max_prob = cat_proba.max(axis=1).reshape(-1, 1)
+                
+                # 3. 概率熵
+                lgb_entropy = entr(lgb_proba).sum(axis=1).reshape(-1, 1)
+                xgb_entropy = entr(xgb_proba).sum(axis=1).reshape(-1, 1)
+                cat_entropy = entr(cat_proba).sum(axis=1).reshape(-1, 1)
+                
+                # 4. 平均概率
+                if inf_proba is not None:
+                    avg_proba = (lgb_proba + xgb_proba + cat_proba + inf_proba) / 4
+                    prob_std = np.std(np.stack([lgb_proba, xgb_proba, cat_proba, inf_proba]), axis=0)
+                    inf_max_prob = inf_proba.max(axis=1).reshape(-1, 1)
+                    inf_entropy = entr(inf_proba).sum(axis=1).reshape(-1, 1)
+                else:
+                    avg_proba = (lgb_proba + xgb_proba + cat_proba) / 3
+                    prob_std = np.std(np.stack([lgb_proba, xgb_proba, cat_proba]), axis=0)
+                    inf_max_prob = None
+                    inf_entropy = None
+                
+                prob_std_max = prob_std.max(axis=1).reshape(-1, 1)
+                
+                # 拼接元特征
+                if inf_proba is not None:
+                    meta_list = [
+                        lgb_proba, xgb_proba, cat_proba, inf_proba,
+                        agreement, lgb_max_prob, xgb_max_prob, cat_max_prob, inf_max_prob,
+                        lgb_entropy, xgb_entropy, cat_entropy, inf_entropy,
+                        avg_proba, prob_std_max
+                    ]
+                    expected_features = 25
+                else:
+                    meta_list = [
+                        lgb_proba, xgb_proba, cat_proba,
+                        agreement, lgb_max_prob, xgb_max_prob, cat_max_prob,
+                        lgb_entropy, xgb_entropy, cat_entropy,
+                        avg_proba, prob_std_max
+                    ]
+                    expected_features = 20
+                
+                meta_features = np.hstack(meta_list)
+                assert meta_features.shape == (len(y_labels), expected_features), \
+                    f"{dataset_name}元特征形状错误: {meta_features.shape} != ({len(y_labels)}, {expected_features})"
+                
+                return meta_features
             
-            # 1. 模型一致性（3个模型预测是否一致）
-            # 🔑 已确认都是1D数组，直接比较
-            agreement_bool = (lgb_pred == xgb_pred) & (xgb_pred == cat_pred)  # (6757,) boolean
-            agreement = agreement_bool.astype(float).reshape(-1, 1)  # (6757, 1)
+            # 🆕 生成验证集和测试集的元特征
+            logger.info(f"生成增强元特征（验证集用于训练，测试集用于评估）...")
+            meta_features_val = _build_meta_features(
+                lgb_pred_proba_val, xgb_pred_proba_val, cat_pred_proba_val, inf_pred_proba_val,
+                lgb_pred_val, xgb_pred_val, cat_pred_val, y_lgb_val, "验证集"
+            )
+            meta_features_test = _build_meta_features(
+                lgb_pred_proba_test, xgb_pred_proba_test, cat_pred_proba_test, inf_pred_proba_test,
+                lgb_pred_test, xgb_pred_test, cat_pred_test, y_lgb_test, "测试集"
+            )
             
-            # 验证维度
-            assert agreement.shape == (len(y_lgb_val), 1), f"agreement形状错误: {agreement.shape}"
-            logger.debug(f"✓ agreement: {agreement.shape}")
-            
-            # 2. 最大概率（每个模型的最高置信度）
-            lgb_max_prob = lgb_pred_proba.max(axis=1).reshape(-1, 1)
-            xgb_max_prob = xgb_pred_proba.max(axis=1).reshape(-1, 1)
-            cat_max_prob = cat_pred_proba.max(axis=1).reshape(-1, 1)
-            assert lgb_max_prob.shape == (len(y_lgb_val), 1), f"lgb_max_prob形状错误: {lgb_max_prob.shape}"
-            logger.debug(f"✓ max_prob: {lgb_max_prob.shape}")
-            
-            # 3. 概率熵（不确定性，熵越高越不确定）
-            lgb_entropy = entr(lgb_pred_proba).sum(axis=1).reshape(-1, 1)
-            xgb_entropy = entr(xgb_pred_proba).sum(axis=1).reshape(-1, 1)
-            cat_entropy = entr(cat_pred_proba).sum(axis=1).reshape(-1, 1)
-            assert lgb_entropy.shape == (len(y_lgb_val), 1), f"lgb_entropy形状错误: {lgb_entropy.shape}"
-            logger.debug(f"✓ entropy: {lgb_entropy.shape}")
-            
-            # Informer-2的增强特征（如果启用）
-            if inf_model is not None:
-                inf_max_prob = inf_pred_proba.max(axis=1).reshape(-1, 1)
-                inf_entropy = entr(inf_pred_proba).sum(axis=1).reshape(-1, 1)
-                logger.debug(f"✓ inf_max_prob: {inf_max_prob.shape}, inf_entropy: {inf_entropy.shape}")
-            
-            # 4. 平均概率（三个或四个模型的平均预测概率）
-            if inf_model is not None:
-                avg_proba = (lgb_pred_proba + xgb_pred_proba + cat_pred_proba + inf_pred_proba) / 4
-            else:
-                avg_proba = (lgb_pred_proba + xgb_pred_proba + cat_pred_proba) / 3
-            assert avg_proba.shape == lgb_pred_proba.shape, f"avg_proba形状错误: {avg_proba.shape}"
-            logger.debug(f"✓ avg_proba: {avg_proba.shape}")
-            
-            # 5. 概率标准差（模型间的预测差异）
-            if inf_model is not None:
-                prob_std = np.std(np.stack([lgb_pred_proba, xgb_pred_proba, cat_pred_proba, inf_pred_proba]), axis=0)
-            else:
-                prob_std = np.std(np.stack([lgb_pred_proba, xgb_pred_proba, cat_pred_proba]), axis=0)
-            prob_std_max = prob_std.max(axis=1).reshape(-1, 1)
-            assert prob_std_max.shape == (len(y_lgb_val), 1), f"prob_std_max形状错误: {prob_std_max.shape}"
-            logger.debug(f"✓ prob_std_max: {prob_std_max.shape}")
-            
-            # 🔑 拼接所有元特征（严格验证每一步）
-            logger.info(f"开始拼接元特征...")
-            
-            # 逐步拼接并验证
-            if inf_model is not None:
-                # 包含Informer-2（25个特征）
-                meta_list = [
-                    lgb_pred_proba,      # (N, 3)
-                    xgb_pred_proba,      # (N, 3)
-                    cat_pred_proba,      # (N, 3)
-                    inf_pred_proba,      # (N, 3) ← 新增
-                    agreement,           # (N, 1)
-                    lgb_max_prob,        # (N, 1)
-                    xgb_max_prob,        # (N, 1)
-                    cat_max_prob,        # (N, 1)
-                    inf_max_prob,        # (N, 1) ← 新增
-                    lgb_entropy,         # (N, 1)
-                    xgb_entropy,         # (N, 1)
-                    cat_entropy,         # (N, 1)
-                    inf_entropy,         # (N, 1) ← 新增
-                    avg_proba,           # (N, 3)
-                    prob_std_max         # (N, 1)
-                ]
-                expected_features = 25  # 3+3+3+3+1+1+1+1+1+1+1+1+1+3+1 = 25
-            else:
-                # 仅传统模型（20个特征）
-                meta_list = [
-                    lgb_pred_proba,      # (N, 3)
-                    xgb_pred_proba,      # (N, 3)
-                    cat_pred_proba,      # (N, 3)
-                    agreement,           # (N, 1)
-                    lgb_max_prob,        # (N, 1)
-                    xgb_max_prob,        # (N, 1)
-                    cat_max_prob,        # (N, 1)
-                    lgb_entropy,         # (N, 1)
-                    xgb_entropy,         # (N, 1)
-                    cat_entropy,         # (N, 1)
-                    avg_proba,           # (N, 3)
-                    prob_std_max         # (N, 1)
-                ]
-                expected_features = 20  # 3+3+3+1+1+1+1+1+1+1+3+1
-            
-            # 验证所有数组的第0维度都相同
-            expected_rows = len(y_lgb_val)
-            for i, arr in enumerate(meta_list):
-                assert arr.shape[0] == expected_rows, \
-                    f"元特征{i}第0维度错误: {arr.shape[0]} != {expected_rows}, 完整形状: {arr.shape}"
-            
-            # 拼接
-            meta_features_val = np.hstack(meta_list)
-            
-            # 最终验证
-            assert meta_features_val.shape == (expected_rows, expected_features), \
-                f"元特征最终形状错误: {meta_features_val.shape} != ({expected_rows}, {expected_features})"
-            
-            # 元标签（使用LightGBM的y_val，因为验证集已对齐）
+            # 元标签
             meta_labels_val = y_lgb_val
+            meta_labels_test = y_lgb_test
+            
+            logger.info(f"✅ 元特征生成完成: 验证集{meta_features_val.shape}, 测试集{meta_features_test.shape}")
             
             if inf_model is not None:
                 logger.info(f"✅ 增强元特征生成完成: {meta_features_val.shape} (基础12+增强13=25个，含Informer-2)")
@@ -1102,29 +1115,30 @@ class EnsembleMLService(MLService):
             logger.info(f"✅ {timeframe} 时间序列CV结果: {cv_mean:.4f} ± {cv_std:.4f}")
             logger.info(f"   CV分数: {[f'{s:.4f}' for s in cv_scores]}")
             
-            # 使用完整验证集评估最终模型
-            ensemble_pred = meta_learner.predict(meta_features_val)
-            ensemble_proba = meta_learner.predict_proba(meta_features_val)
-            accuracy = accuracy_score(meta_labels_val, ensemble_pred)
+            # 🔑 修复数据泄露：使用独立测试集评估最终模型（而不是验证集）
+            logger.info(f"📊 使用独立测试集评估元学习器（修复数据泄露）...")
+            ensemble_pred = meta_learner.predict(meta_features_test)
+            ensemble_proba = meta_learner.predict_proba(meta_features_test)
+            accuracy = accuracy_score(meta_labels_test, ensemble_pred)
             precision, recall, f1, _ = precision_recall_fscore_support(
-                meta_labels_val, ensemble_pred, average='weighted', zero_division=0
+                meta_labels_test, ensemble_pred, average='weighted', zero_division=0
             )
             
             # 🆕 类别级别详细指标
             class_report = classification_report(
-                meta_labels_val, ensemble_pred, 
+                meta_labels_test, ensemble_pred, 
                 target_names=['SHORT', 'HOLD', 'LONG'], 
                 output_dict=True,
                 zero_division=0
             )
             
             # 🆕 混淆矩阵和致命错误分析
-            cm = confusion_matrix(meta_labels_val, ensemble_pred)
+            cm = confusion_matrix(meta_labels_test, ensemble_pred)
             
             # 安全检查：确保混淆矩阵至少是3x3
             if cm.shape[0] >= 3 and cm.shape[1] >= 3:
                 fatal_errors = int(cm[0, 2] + cm[2, 0])  # SHORT→LONG + LONG→SHORT
-                fatal_error_rate = fatal_errors / len(meta_labels_val) if len(meta_labels_val) > 0 else 0.0
+                fatal_error_rate = fatal_errors / len(meta_labels_test) if len(meta_labels_test) > 0 else 0.0
                 long_to_short = int(cm[2, 0])  # LONG→SHORT
                 short_to_long = int(cm[0, 2])  # SHORT→LONG
             else:
@@ -1718,6 +1732,33 @@ class EnsembleMLService(MLService):
                 logger.debug(f"   转换y_seq_train为连续数组")
                 y_seq_train = np.ascontiguousarray(y_seq_train)
             
+            # ✅ 关键修复：对3D序列数据进行归一化（防止数值溢出）
+            logger.info(f"🔧 对序列数据进行归一化（防止数值溢出）...")
+            logger.info(f"   归一化前统计: 范围=[{X_seq_train.min():.4f}, {X_seq_train.max():.4f}], 均值={X_seq_train.mean():.4f}, 标准差={X_seq_train.std():.4f}")
+            
+            # 方法：将3D数据reshape为2D，按特征归一化，再reshape回3D
+            # 这样每个特征在所有样本和时间步上都被归一化
+            original_shape = X_seq_train.shape
+            n_features = original_shape[2]
+            
+            # Reshape为2D: (n_samples * seq_len, n_features)
+            X_seq_train_2d = X_seq_train.reshape(-1, n_features)
+            
+            # 使用StandardScaler归一化
+            scaler = StandardScaler()
+            X_seq_train_2d_scaled = scaler.fit_transform(X_seq_train_2d)
+            
+            # Reshape回3D: (n_samples, seq_len, n_features)
+            X_seq_train = X_seq_train_2d_scaled.reshape(original_shape).astype(np.float32)
+            
+            logger.info(f"   ✅ 归一化完成")
+            logger.info(f"   归一化后统计: 范围=[{X_seq_train.min():.4f}, {X_seq_train.max():.4f}], 均值={X_seq_train.mean():.4f}, 标准差={X_seq_train.std():.4f}")
+            
+            # 保存scaler用于预测时使用
+            if timeframe not in self.scalers:
+                self.scalers[timeframe] = {}
+            self.scalers[timeframe]['informer2'] = scaler
+            
             X_tensor = torch.from_numpy(X_seq_train)  # (n_samples, seq_len, n_features) - 避免复制
             y_tensor = torch.from_numpy(y_seq_train)  # (n_samples,) - LongTensor需要int64
             
@@ -1826,8 +1867,8 @@ class EnsembleMLService(MLService):
             optimizer_created = False
             if self.use_8bit_adam and device.type == 'cuda':
                 try:
-                    # 🔥 动态导入可选依赖（bitsandbytes可能未安装）
-                    import bitsandbytes as bnb
+                    if not BNB_AVAILABLE:
+                        raise ImportError("bitsandbytes未安装")
                     optimizer = bnb.optim.Adam8bit(
                         model.parameters(),
                         lr=lr,
@@ -1847,15 +1888,30 @@ class EnsembleMLService(MLService):
                 optimizer = torch.optim.Adam(
                     model.parameters(),
                     lr=lr,
-                    weight_decay=1e-5  # L2正则化
+                    weight_decay=1e-5,  # L2正则化
+                    betas=(0.9, 0.999)
                 )
             
-            # 8. 学习率调度器（余弦退火）
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            # ✅ 修复C: 添加Warmup + ReduceLROnPlateau组合调度器
+            # Warmup配置
+            warmup_epochs = 5  # 前5个epoch warmup
+            target_lr = lr
+            
+            # 主调度器：ReduceLROnPlateau（用于warmup后的学习率调整）
+            scheduler = ReduceLROnPlateau(
                 optimizer,
-                T_max=epochs,
-                eta_min=1e-6
+                mode='min',
+                factor=0.5,
+                patience=5,
+                min_lr=1e-6,
+                threshold=1e-4,
+                threshold_mode='rel',
+                cooldown=2,
+                verbose=True
             )
+            
+            logger.info(f"   ✅ 学习率调度: Warmup({warmup_epochs}轮) + ReduceLROnPlateau")
+            logger.info(f"      目标LR: {target_lr:.6f}, Warmup后自动调整")
             
             # 🚀 9. 梯度累积配置（解决GPU OOM问题，不降低模型复杂度）
             # 将大批次分成小批次，累积梯度，保持等效训练效果
@@ -1875,44 +1931,147 @@ class EnsembleMLService(MLService):
             logger.info(f"   🎮 梯度累积策略: 有效批次={effective_batch_size}, 物理批次={actual_batch_size}, 累积步数={accumulation_steps}")
             logger.info(f"   💾 预期GPU内存节省: ~{100*(1-actual_batch_size/batch_size):.0f}%")
             
-            # 🚀 10. 混合精度训练（FP16，进一步节省GPU内存）
+            # ✅ 修复D: 动态混合精度配置（而非完全禁用）
             use_amp = device.type == 'cuda' and torch.cuda.is_available()
 
-            if settings.USE_GMADL_LOSS and use_amp:
-                logger.info("   ⚠️ GMADL开启 → 为保障数值稳定，禁用AMP改用FP32训练")
-                use_amp = False
-            
-            # 🔥 激进混合精度优化
-            if use_amp and self.use_aggressive_amp:
-                # 设置更高的初始缩放因子
-                scaler = torch.amp.GradScaler('cuda', init_scale=2.**16)
+            if use_amp:
+                # 根据模型规模动态调整初始缩放因子
+                num_params = sum(p.numel() for p in model.parameters())
                 
-                # 启用TF32（Ampere架构GPU：RTX 30/40系列）
-                torch.backends.cuda.matmul.allow_tf32 = True
-                torch.backends.cudnn.allow_tf32 = True
+                if num_params > 10_000_000:  # >10M参数：大模型
+                    init_scale = 2.**12  # 4096
+                    logger.info(f"   检测到大模型({num_params/1e6:.1f}M参数)，使用init_scale=2^12")
+                elif num_params > 1_000_000:  # 1M-10M参数：中等模型
+                    init_scale = 2.**14  # 16384
+                    logger.info(f"   检测到中等模型({num_params/1e6:.1f}M参数)，使用init_scale=2^14")
+                else:  # <1M参数：小模型
+                    init_scale = 2.**16  # 65536（默认值）
+                    logger.info(f"   检测到小模型({num_params/1e6:.1f}M参数)，使用init_scale=2^16")
                 
-                logger.info(f"   ⚡ 启用激进混合精度训练（FP16 + TF32 + 高缩放因子）")
-            elif use_amp:
-                scaler = torch.amp.GradScaler('cuda')
-                logger.info(f"   ⚡ 启用混合精度训练（AMP）：FP16计算 + 动态损失缩放")
+                # ✅ 修复：使用新的torch.amp.GradScaler API（PyTorch 2.0+）
+                scaler = torch.amp.GradScaler(
+                    'cuda',
+                    init_scale=init_scale,  # 动态调整的初始缩放
+                    growth_factor=1.5,      # 增长因子（默认2.0，改为1.5更温和）
+                    backoff_factor=0.5,     # 回退因子（检测到溢出时）
+                    growth_interval=1000,   # 增长间隔（默认2000，改为1000更谨慎）
+                    enabled=True
+                )
+                logger.info("   混合精度训练: 启用（动态缩放策略）")
+                logger.info(f"      初始缩放: {init_scale}, 增长因子: 1.5")
             else:
                 scaler = None
+                logger.info("   混合精度训练: 禁用（CPU环境）")
+            
+            # 可选：如果未来需要重新启用AMP，使用保守策略
+            # if settings.USE_GMADL_LOSS and use_amp:
+            #     logger.info("   ⚠️ GMADL开启 → 为保障数值稳定，禁用AMP改用FP32训练")
+            #     use_amp = False
+            # 
+            # # 🔥 激进混合精度优化
+            # if use_amp and self.use_aggressive_amp:
+            #     # 设置更高的初始缩放因子
+            #     scaler = torch.amp.GradScaler('cuda', init_scale=2.**16)
+            #     
+            #     # 启用TF32（Ampere架构GPU：RTX 30/40系列）
+            #     torch.backends.cuda.matmul.allow_tf32 = True
+            #     torch.backends.cudnn.allow_tf32 = True
+            #     
+            #     logger.info(f"   ⚡ 启用激进混合精度训练（FP16 + TF32 + 高缩放因子）")
+            # elif use_amp:
+            #     scaler = torch.amp.GradScaler('cuda')
+            #     logger.info(f"   ⚡ 启用混合精度训练（AMP）：FP16计算 + 动态损失缩放")
+            # else:
+            #     scaler = None
+            
+            # ✅ 修复E: 训练前数据质量检查
+            logger.info("🔍 执行训练前数据质量检查...")
+            
+            # 检查特征数据
+            if torch.isnan(X_tensor).any():
+                nan_count = torch.isnan(X_tensor).sum().item()
+                logger.error(f"❌ 训练数据包含{nan_count}个NaN值，训练终止！")
+                raise ValueError(f"训练数据包含NaN值：{nan_count}个")
+            
+            if torch.isinf(X_tensor).any():
+                inf_count = torch.isinf(X_tensor).sum().item()
+                logger.error(f"❌ 训练数据包含{inf_count}个INF值，训练终止！")
+                raise ValueError(f"训练数据包含INF值：{inf_count}个")
+            
+            # 检查标签数据
+            if torch.isnan(y_tensor.float()).any() or torch.isinf(y_tensor.float()).any():
+                logger.error(f"❌ 训练标签包含NaN/INF值，训练终止！")
+                raise ValueError("训练标签包含NaN/INF值")
+            
+            # 检查标签范围
+            unique_labels = torch.unique(y_tensor)
+            if not all(label in [0, 1, 2] for label in unique_labels.tolist()):
+                logger.error(f"❌ 训练标签包含非法值：{unique_labels.tolist()}，期望[0,1,2]")
+                raise ValueError(f"训练标签包含非法值：{unique_labels.tolist()}")
+            
+            # 统计数据范围
+            logger.info(f"   特征范围: [{X_tensor.min().item():.4f}, {X_tensor.max().item():.4f}]")
+            logger.info(f"   特征均值: {X_tensor.mean().item():.4f}, 标准差: {X_tensor.std().item():.4f}")
+            logger.info(f"   标签分布: {torch.bincount(y_tensor.long()).tolist()}")
+            logger.info(f"✅ 数据质量检查通过")
+            
+            # 🔍 模型权重初始化检查
+            logger.info("🔍 检查模型权重初始化...")
+            has_nan_weights = False
+            has_inf_weights = False
+            
+            for name, param in model.named_parameters():
+                if torch.isnan(param).any():
+                    logger.error(f"❌ 模型参数 {name} 包含NaN值！")
+                    has_nan_weights = True
+                if torch.isinf(param).any():
+                    logger.error(f"❌ 模型参数 {name} 包含INF值！")
+                    has_inf_weights = True
+            
+            if has_nan_weights or has_inf_weights:
+                logger.error("❌ 模型权重初始化异常，训练终止！")
+                raise ValueError("模型权重初始化包含NaN/INF值")
+            
+            logger.info("✅ 模型权重初始化正常")
             
             # 11. 训练循环（带梯度累积和混合精度）
             model.train()
             best_loss = float('inf')
+            
+            # ✅ 修复F: 平衡的早期终止阈值
+            nan_inf_count = 0  # 统计nan/inf出现次数
+            max_nan_inf_tolerance = 30  # 从50降低到30（平衡值）
+            consecutive_nan_inf = 0  # 连续nan/inf次数
+            max_consecutive_nan_inf = 8  # 从10降低到8（平衡值）
+            
+            logger.info(f"   早期终止阈值: 连续{max_consecutive_nan_inf}次 或 累计{max_nan_inf_tolerance}次")
             
             for epoch in range(epochs):
                 epoch_loss = 0.0
                 correct = 0
                 total = 0
                 processed_batches = 0  # 实际处理的batch数（排除nan/inf的batch）
+                epoch_nan_inf_count = 0  # 本epoch的nan/inf次数
                 
                 optimizer.zero_grad()  # 初始化梯度
                 
                 for i, (batch_X, batch_y) in enumerate(dataloader):
                     batch_X = batch_X.to(device, non_blocking=True)
                     batch_y = batch_y.to(device, non_blocking=True)
+                    
+                    # ✅ 修复A - 诊断1: 检查输入数据
+                    if torch.isnan(batch_X).any() or torch.isinf(batch_X).any():
+                        logger.error(f"❌ Batch {i+1}: 输入数据包含NaN/INF")
+                        logger.error(f"   NaN数量: {torch.isnan(batch_X).sum().item()}")
+                        logger.error(f"   INF数量: {torch.isinf(batch_X).sum().item()}")
+                        # 保存异常batch用于离线分析
+                        try:
+                            torch.save({'X': batch_X.cpu(), 'y': batch_y.cpu()}, 
+                                      f'debug_batch_{epoch}_{i}.pt')
+                        except:
+                            pass
+                        optimizer.zero_grad()
+                        continue
                     
                     # 🎯 混合精度前向传播
                     if use_amp:
@@ -1926,11 +2085,98 @@ class EnsembleMLService(MLService):
                         loss = criterion(logits.float(), batch_y.long())
                         loss = loss / accumulation_steps
                     
-                    # 🔍 检测数值不稳定（fp16下容易出现）
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        logger.warning(f"⚠️ Epoch {epoch+1}: 检测到损失为nan/inf，跳过该batch")
+                    # ✅ 修复A - 诊断2: 检查模型输出
+                    if torch.isnan(logits).any() or torch.isinf(logits).any():
+                        logger.error(f"❌ Batch {i+1}: 模型输出(logits)包含NaN/INF")
+                        logger.error(f"   输入范围: [{batch_X.min().item():.4f}, {batch_X.max().item():.4f}]")
+                        
+                        # 逐层诊断（使用forward hooks，更安全）
+                        logger.error("   🔍 逐层诊断（使用hooks）:")
+                        activation_stats = {}
+                        hooks = []
+                        
+                        def get_activation_hook(name):
+                            def hook(module, input, output):
+                                if isinstance(output, torch.Tensor):
+                                    has_nan = torch.isnan(output).any().item()
+                                    has_inf = torch.isinf(output).any().item()
+                                    activation_stats[name] = {
+                                        'has_nan': has_nan,
+                                        'has_inf': has_inf,
+                                        'min': output.min().item() if not (has_nan or has_inf) else None,
+                                        'max': output.max().item() if not (has_nan or has_inf) else None
+                                    }
+                            return hook
+                        
+                        # 注册hooks
+                        with torch.no_grad():
+                            for name, module in model.named_modules():
+                                if len(list(module.children())) == 0:  # 只对叶子模块
+                                    hook = module.register_forward_hook(get_activation_hook(name))
+                                    hooks.append(hook)
+                            
+                            # 重新执行forward
+                            try:
+                                _ = model(batch_X)
+                                
+                                # 打印异常层
+                                for name, stats in activation_stats.items():
+                                    if stats['has_nan'] or stats['has_inf']:
+                                        logger.error(f"      {name}: NaN={stats['has_nan']}, INF={stats['has_inf']}")
+                            except Exception as e:
+                                logger.error(f"      逐层诊断失败: {e}")
+                            finally:
+                                # 移除所有hooks
+                                for hook in hooks:
+                                    hook.remove()
+                        
                         optimizer.zero_grad()
                         continue
+                    
+                    # ✅ 修复A - 诊断3: 检查损失值
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        nan_inf_count += 1
+                        consecutive_nan_inf += 1
+                        epoch_nan_inf_count += 1
+                        
+                        logger.error(f"❌ Batch {i+1}: 损失为NaN/INF")
+                        logger.error(f"   Logits统计: min={logits.min().item():.4f}, "
+                                    f"max={logits.max().item():.4f}, "
+                                    f"mean={logits.mean().item():.4f}")
+                        logger.error(f"   Target分布: {torch.bincount(batch_y.long()).tolist()}")
+                        
+                        # ✅ 修复A - 诊断4: 检查梯度
+                        loss.backward()
+                        max_grad_norm = 0.0
+                        for name, param in model.named_parameters():
+                            if param.grad is not None:
+                                grad_norm = param.grad.norm().item()
+                                max_grad_norm = max(max_grad_norm, grad_norm)
+                                if grad_norm > 1000 or grad_norm != grad_norm:  # 梯度爆炸或NaN
+                                    logger.error(f"   {name}: 梯度异常 norm={grad_norm:.4f}")
+                        
+                        logger.error(f"   最大梯度范数: {max_grad_norm:.4f}")
+                        
+                        # 仅在前5次或每50次打印警告，避免日志刷屏
+                        if nan_inf_count <= 5 or nan_inf_count % 50 == 0:
+                            logger.warning(f"⚠️ Epoch {epoch+1} Batch {i+1}: 检测到损失为nan/inf（累计{nan_inf_count}次，连续{consecutive_nan_inf}次）")
+                        
+                        # 🚨 检查是否超过容忍阈值
+                        if consecutive_nan_inf >= max_consecutive_nan_inf:
+                            logger.error(f"❌ 连续{consecutive_nan_inf}个batch出现nan/inf损失，训练终止！")
+                            logger.error(f"   可能原因：1) 学习率过大 2) GMADL损失函数数值不稳定 3) 数据异常")
+                            logger.error(f"   建议：1) 降低学习率 2) 使用FP32精度 3) 检查数据质量")
+                            raise ValueError(f"训练过程数值不稳定：连续{consecutive_nan_inf}个batch出现nan/inf损失")
+                        
+                        if nan_inf_count >= max_nan_inf_tolerance:
+                            logger.error(f"❌ 累计{nan_inf_count}个batch出现nan/inf损失（超过阈值{max_nan_inf_tolerance}），训练终止！")
+                            raise ValueError(f"训练过程数值不稳定：累计{nan_inf_count}个batch出现nan/inf损失")
+                        
+                        optimizer.zero_grad()
+                        continue
+                    
+                    # 成功处理batch，重置连续nan/inf计数器
+                    consecutive_nan_inf = 0
                     
                     # 🎯 混合精度反向传播
                     if use_amp:
@@ -1938,15 +2184,25 @@ class EnsembleMLService(MLService):
                     else:
                         loss.backward()
                     
+                    # ✅ 修复B: 梯度裁剪（核心修复）⭐
                     # 🎯 梯度累积：每accumulation_steps步更新一次参数
                     if (i + 1) % accumulation_steps == 0 or (i + 1) == len(dataloader):
+                        # ⚠️ 重要：混合精度训练时必须先unscale_()再裁剪
                         if use_amp:
-                            scaler.unscale_(optimizer)  # 取消缩放（用于梯度裁剪）
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 梯度裁剪
+                            scaler.unscale_(optimizer)  # 先反缩放梯度，否则裁剪无效
+                        
+                        # ⭐ 核心修复：梯度裁剪（防止梯度爆炸）
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), 
+                            max_norm=1.0,      # 梯度范数上限（Informer2建议1.0）
+                            norm_type=2.0       # L2范数
+                        )
+                        
+                        # 优化器步进
+                        if use_amp:
                             scaler.step(optimizer)
                             scaler.update()
                         else:
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                             optimizer.step()
                         
                         optimizer.zero_grad()  # 清空梯度
@@ -1963,26 +2219,66 @@ class EnsembleMLService(MLService):
                         total += batch_y.size(0)
                         correct += (predicted == batch_y).sum().item()
                 
-                # 更新学习率
-                scheduler.step()
-                
                 # 🧹 每个epoch结束后清理GPU缓存
                 if device.type == 'cuda':
                     torch.cuda.empty_cache()
                 
-                # 计算准确率（使用实际处理的batch数）
-                if processed_batches > 0:
-                    epoch_loss /= processed_batches
-                epoch_acc = 100.0 * correct / total if total > 0 else 0.0
+                # ✅ 修复F: Epoch级别检查
+                total_batches = len(dataloader)
                 
-                # 每10轮或最后1轮打印进度
-                if (epoch + 1) % 10 == 0 or epoch == self.informer_epochs - 1:
-                    logger.info(f"   Epoch [{epoch+1}/{self.informer_epochs}] "
-                               f"Loss: {epoch_loss:.4f}, Acc: {epoch_acc:.2f}%")
+                if processed_batches == 0:
+                    logger.error(f"❌ Epoch {epoch+1}: 没有任何batch成功处理（全部{total_batches}个batch均为nan/inf），训练终止！")
+                    raise ValueError(f"Epoch {epoch+1}所有batch均出现nan/inf，训练无法继续")
+                
+                if epoch_nan_inf_count > total_batches * 0.5:
+                    logger.error(f"❌ Epoch {epoch+1}: {epoch_nan_inf_count}/{total_batches} batch出现nan/inf "
+                                f"({100*epoch_nan_inf_count/total_batches:.1f}%，超过50%阈值），训练终止！")
+                    raise ValueError(f"Epoch {epoch+1}超过50%的batch出现nan/inf，训练质量无法保证")
+                
+                if epoch_nan_inf_count > total_batches * 0.3:
+                    logger.warning(f"⚠️ Epoch {epoch+1}: {epoch_nan_inf_count}/{total_batches} batch出现nan/inf "
+                                  f"({100*epoch_nan_inf_count/total_batches:.1f}%），数值稳定性问题！")
+                
+                # 计算平均损失和准确率
+                avg_loss = epoch_loss / max(processed_batches, 1)
+                accuracy = 100.0 * correct / max(total, 1)
                 
                 # 保存最佳模型
-                if epoch_loss < best_loss:
-                    best_loss = epoch_loss
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+                
+                # ✅ 修复C: 学习率调度（简化的Warmup + ReduceLROnPlateau）
+                if epoch < warmup_epochs:
+                    # Warmup阶段：线性增长学习率
+                    warmup_lr = target_lr * (epoch + 1) / warmup_epochs
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = warmup_lr
+                    phase = "Warmup"
+                    current_lr = warmup_lr
+                else:
+                    # 主调度阶段：根据loss自动调整
+                    scheduler.step(avg_loss)
+                    phase = "Main"
+                    current_lr = optimizer.param_groups[0]['lr']
+                
+                # 每10轮或最后1轮打印进度（带学习率）
+                if (epoch + 1) % 10 == 0 or epoch == epochs - 1:
+                    nan_info = f", nan/inf跳过: {epoch_nan_inf_count}" if epoch_nan_inf_count > 0 else ""
+                    logger.info(
+                        f"   Epoch [{epoch+1}/{epochs}] "
+                        f"Loss: {avg_loss:.4f}, Acc: {accuracy:.2f}%, "
+                        f"LR: {current_lr:.6f} ({phase}){nan_info}"
+                    )
+            
+            # 📊 训练完成总结
+            if nan_inf_count > 0:
+                logger.warning(f"⚠️ Informer2训练完成，但出现{nan_inf_count}次nan/inf损失（已跳过）")
+                logger.warning(f"   数值稳定性问题可能影响模型质量，建议：")
+                logger.warning(f"   1. 降低学习率（当前：{lr}）")
+                logger.warning(f"   2. 禁用混合精度训练（use_amp=False）")
+                logger.warning(f"   3. 调整GMADL损失函数参数")
+            else:
+                logger.info(f"✅ Informer2训练完成，无数值稳定性问题")
             
             # 9. 切换到评估模式
             model.eval()
@@ -2096,6 +2392,19 @@ class EnsembleMLService(MLService):
                     # 取最新seq_len个时间步构造序列
                     latest_seq = processed_data.iloc[-seq_len:][feature_columns].values
                     latest_seq = latest_seq.reshape(1, seq_len, -1)  # (1, seq_len, n_features)
+                    
+                    # ✅ 关键修复：预测时也需要归一化（使用训练时的scaler）
+                    if timeframe in self.scalers and 'informer2' in self.scalers[timeframe]:
+                        scaler = self.scalers[timeframe]['informer2']
+                        # Reshape为2D进行归一化
+                        original_shape = latest_seq.shape
+                        n_features = original_shape[2]
+                        latest_seq_2d = latest_seq.reshape(-1, n_features)
+                        latest_seq_2d_scaled = scaler.transform(latest_seq_2d)
+                        latest_seq = latest_seq_2d_scaled.reshape(original_shape).astype(np.float32)
+                        logger.debug(f"   ✅ Informer-2预测数据已归一化")
+                    else:
+                        logger.warning(f"⚠️ {timeframe} Informer-2 scaler未找到，预测数据未归一化")
                     
                     inf_proba = models['inf'].predict_proba(latest_seq)[0]
                     inf_pred = models['inf'].predict(latest_seq)[0]

@@ -12,7 +12,7 @@ import numpy as np
 from app.core.config import settings
 from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
-from app.services.position_manager import position_manager
+from app.trading.position_manager import position_manager
 
 logger = logging.getLogger(__name__)
 

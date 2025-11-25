@@ -22,12 +22,10 @@ import joblib
 from app.core.config import settings
 from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
-from app.services.feature_engineering import feature_engineer
+from app.model.feature_engineering import feature_engineer
 from app.services.data_service import DataService
 from app.utils.helpers import format_signal_type
-
-# 延迟导入避免循环依赖
-# from app.services.binance_client import binance_client  # 在方法内导入
+from app.exchange.binance_client import binance_client
 
 logger = logging.getLogger(__name__)
 
@@ -417,8 +415,6 @@ class MLService:
     async def _prepare_training_data_for_timeframe(self, timeframe: str) -> pd.DataFrame:
         """为单个时间框架准备训练数据（差异化训练天数）"""
         try:
-            from app.services.binance_client import binance_client
-            
             symbol = settings.SYMBOL
             
             # 🔑 超短线训练天数配置：确保足够的高频样本
@@ -442,33 +438,13 @@ class MLService:
             
             logger.info(f"📥 获取 {timeframe} 数据: {required_klines}条K线 ({training_days}天)")
             
-            # 分批获取数据（每次最多1500条）
-            all_klines = []
-            max_per_request = 1500
-            batches_needed = (required_klines + max_per_request - 1) // max_per_request
-            
-            end_time = None  # 最新数据
-            
-            for batch in range(batches_needed):
-                batch_limit = min(max_per_request, required_klines - len(all_klines))
-                
-                if batch_limit <= 0:
-                    break
-                
-                klines = binance_client.get_klines(
+            # ✅ 统一使用分页方法（自动处理超过1500的情况）
+            all_klines = binance_client.get_klines_paginated(
                     symbol=symbol,
                     interval=timeframe,
-                    limit=batch_limit,
-                    end_time=end_time
-                )
-                
-                if klines:
-                    all_klines.extend(klines)
-                    # 设置下一批次的end_time为当前批次最早的时间 - 1ms
-                    end_time = klines[0]['timestamp'] - 1
-                    await asyncio.sleep(0.1)  # 避免API限流
-                else:
-                    break
+                limit=required_klines,
+                rate_limit_delay=0.1
+            )
             
             # 转换为DataFrame（不依赖reverse，直接用时间戳排序）
             df = pd.DataFrame(all_klines)
@@ -570,75 +546,99 @@ class MLService:
             raise
     
     def _create_labels(self, df: pd.DataFrame, timeframe: str = None) -> pd.DataFrame:
-        """创建标签（动态阈值，基于ATR波动率自适应调整）
+        """
+        创建标签（优化版：解决HOLD占比过高问题）
+        
+        改进:
+        1. 基于市场波动率的自适应阈值
+        2. 分位数阈值确保类别平衡
+        3. 混合策略提升稳定性
+        
+        目标分布:
+        - LONG: 28-32%
+        - HOLD: 36-44%
+        - SHORT: 28-32%
         
         Args:
             df: K线数据
             timeframe: 时间框架（用于差异化阈值配置）
         """
         try:
-            # ✅ 修复：只看下一根K线（不是未来5根）
+            # 计算下一根K线收益率
             df['next_return'] = df['close'].shift(-1) / df['close'] - 1
             
-            # 🎯 动态阈值：基于ATR波动率自适应调整
-            # 计算ATR（14周期）
-            if 'atr' not in df.columns or df['atr'].isna().all():
-                # 如果没有ATR特征，手动计算
-                high_low = df['high'] - df['low']
-                high_close = np.abs(df['high'] - df['close'].shift())
-                low_close = np.abs(df['low'] - df['close'].shift())
-                true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-                atr = true_range.rolling(window=14).mean()
+            # ========================================
+            # 🔥 新增：自适应阈值计算（三种方法）
+            # ========================================
+            
+            # 方法1：基于历史波动率
+            returns = df['close'].pct_change()
+            historical_volatility = returns.rolling(100).std()
+            median_vol = historical_volatility.median()
+            
+            # 时间框架系数（优化版v2：针对低波动市场）
+            # 分析：当前阈值0.215%仍导致HOLD占比88%，说明需要更激进的系数
+            timeframe_multiplier = {
+                '3m': 1.50,   # 150%历史波动率（降低系数，让分位数主导）
+                '5m': 1.60,   # 160%历史波动率
+                '15m': 1.80   # 180%历史波动率
+            }
+            multiplier = timeframe_multiplier.get(timeframe, 1.60)
+            vol_threshold = median_vol * multiplier if not pd.isna(median_vol) else 0.0025
+            
+            # 方法2：基于收益率分位数（缩小范围以降低HOLD占比）
+            returns_clean = returns.dropna()
+            if len(returns_clean) > 100:
+                # 🔥 关键优化：使用60%/40%分位数（缩小范围，阈值更小，更多LONG/SHORT）
+                # 原理：60%/40%意味着只有中间20%是HOLD，其余80%是LONG/SHORT
+                upper_quantile = returns_clean.quantile(0.60)  # 60%分位数（缩小范围）
+                lower_quantile = returns_clean.quantile(0.40)  # 40%分位数（缩小范围）
+                quantile_threshold = max(abs(upper_quantile), abs(lower_quantile))
             else:
-                atr = df['atr']
+                quantile_threshold = 0.0025
             
-            # ATR百分比（相对于价格）
-            atr_pct = (atr / df['close']).rolling(window=50).mean()  # 50根K线平均
+            # 方法3：混合阈值（提高分位数权重）
+            # 🔥 关键优化：增加分位数权重到90%，几乎完全依赖分位数
+            # 原因：在低波动市场，分位数法更可靠，能确保类别平衡
+            hybrid_threshold = vol_threshold * 0.10 + quantile_threshold * 0.90
             
-            # 基础阈值配置（多时间框架策略）
-            base_threshold_config = {
-                '3m': 0.0008,   # 基础±0.08% 🔥 高频超灵敏
-                '5m': 0.0010,   # 基础±0.10% 🔥 高频灵敏
-                '15m': 0.0015,  # 基础±0.15% ✅ 中频灵敏
+            # 设置合理范围（防止极端值，但放宽最小值以适配低波动市场）
+            min_threshold_config = {
+                '3m': 0.0003,  # 最小0.03%（3分钟单期波动率约0.06%，允许更低阈值）
+                '5m': 0.0004,  # 最小0.04%
+                '15m': 0.0008  # 最小0.08%
+            }
+            max_threshold_config = {
+                '3m': 0.0050,  # 最大0.50%
+                '5m': 0.0060,  # 最大0.60%
+                '15m': 0.0080  # 最大0.80%
             }
             
-            base_threshold = base_threshold_config.get(timeframe, 0.010)
+            min_threshold = min_threshold_config.get(timeframe, 0.0020)
+            max_threshold = max_threshold_config.get(timeframe, 0.0060)
             
-            # 动态调整系数（基于ATR波动率）
-            # 如果波动率高 → 扩大阈值；波动率低 → 缩小阈值
-            median_atr_pct = atr_pct.median()
+            # 最终阈值（限制在合理范围）
+            up_threshold = np.clip(hybrid_threshold, min_threshold, max_threshold)
+            down_threshold = -up_threshold
             
-            if pd.isna(median_atr_pct) or median_atr_pct == 0:
-                # 降级为固定阈值
-                up_threshold = base_threshold
-                down_threshold = -base_threshold
-                logger.info(f"⚠️ ATR计算失败，使用固定阈值: ±{base_threshold*100:.2f}%")
-            else:
-                # 动态调整：ATR高时放宽阈值，ATR低时收紧阈值
-                # 调整范围：0.7x ~ 1.3x
-                adjustment = np.clip(median_atr_pct / 0.005, 0.7, 1.3)  # 0.5%为基准
-                
-                up_threshold = base_threshold * adjustment
-                down_threshold = -base_threshold * adjustment
-                
-                logger.info(f"🎯 {timeframe} 动态阈值: ±{up_threshold*100:.2f}% "
-                          f"(基础={base_threshold*100:.2f}%, ATR调整={adjustment:.2f}x, "
-                          f"ATR%={median_atr_pct*100:.3f}%)")
-            
+            # ========================================
             # 创建分类标签
+            # ========================================
             conditions = [
-                df['next_return'] <= down_threshold,  # 下跌 → SHORT
-                (df['next_return'] > down_threshold) & (df['next_return'] < up_threshold),  # 横盘 → HOLD
-                df['next_return'] >= up_threshold     # 上涨 → LONG
+                df['next_return'] <= down_threshold,  # SHORT (0)
+                (df['next_return'] > down_threshold) & (df['next_return'] < up_threshold),  # HOLD (1)
+                df['next_return'] >= up_threshold     # LONG (2)
             ]
             
-            choices = [0, 1, 2]  # 0: SHORT, 1: HOLD, 2: LONG
+            choices = [0, 1, 2]
             df['label'] = np.select(conditions, choices, default=1)
             
             # 移除最后1行（没有next_return）
             df = df[:-1]
             
-            # ✅ 详细的标签分布统计（生产环境必须监控）
+            # ========================================
+            # 标签分布统计与质量检查
+            # ========================================
             label_counts = df['label'].value_counts().sort_index()
             total = len(df)
             
@@ -646,23 +646,39 @@ class MLService:
             hold_count = label_counts.get(1, 0)
             long_count = label_counts.get(2, 0)
             
-            logger.info(f"📊 {timeframe} 标签分布（阈值: ±{up_threshold*100:.2f}%）:")  # 改为.2f精确显示
-            logger.info(f"  SHORT (0): {short_count:5d}条 ({short_count/total*100:5.1f}%)")
-            logger.info(f"  HOLD  (1): {hold_count:5d}条 ({hold_count/total*100:5.1f}%)")
-            logger.info(f"  LONG  (2): {long_count:5d}条 ({long_count/total*100:5.1f}%)")
+            short_pct = short_count / total * 100
+            hold_pct = hold_count / total * 100
+            long_pct = long_count / total * 100
             
-            # 警告：类别严重不平衡
-            if hold_count / total > 0.60:
-                logger.warning(f"⚠️ {timeframe} HOLD类别占比过高 ({hold_count/total*100:.1f}%)，建议提高阈值")
+            logger.info(f"📊 {timeframe} 标签分布（自适应阈值: ±{up_threshold*100:.3f}%）:")
+            logger.info(f"  SHORT (0): {short_count:5d}条 ({short_pct:5.1f}%)")
+            logger.info(f"  HOLD  (1): {hold_count:5d}条 ({hold_pct:5.1f}%)")
+            logger.info(f"  LONG  (2): {long_count:5d}条 ({long_pct:5.1f}%)")
+            logger.info(f"  阈值来源: 波动率={vol_threshold*100:.3f}%, "
+                       f"分位数={quantile_threshold*100:.3f}%, "
+                       f"混合={hybrid_threshold*100:.3f}%")
             
-            if short_count / total < 0.20 or long_count / total < 0.20:
-                logger.warning(f"⚠️ {timeframe} LONG/SHORT类别过少，建议降低阈值")
+            # 质量检查与告警
+            if hold_pct > 50:
+                logger.warning(f"⚠️ {timeframe} HOLD占比仍然过高 ({hold_pct:.1f}%)，"
+                             f"建议检查市场波动率或调整系数")
+            elif hold_pct < 30:
+                logger.warning(f"⚠️ {timeframe} HOLD占比过低 ({hold_pct:.1f}%)，"
+                             f"可能导致过度交易")
+            else:
+                logger.info(f"✅ {timeframe} 标签分布健康 (HOLD={hold_pct:.1f}%)")
             
+            if short_pct < 25 or long_pct < 25:
+                logger.warning(f"⚠️ {timeframe} LONG/SHORT占比不足 "
+                             f"(LONG={long_pct:.1f}%, SHORT={short_pct:.1f}%)，"
+                             f"可能影响模型学习")
             
             return df
             
         except Exception as e:
             logger.error(f"创建标签失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return df
     
     def _prepare_features_labels(self, df: pd.DataFrame, timeframe: str) -> Tuple[pd.DataFrame, pd.Series]:

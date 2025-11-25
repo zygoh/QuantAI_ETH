@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from app.core.config import settings
 from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
-from app.services.binance_client import binance_client, binance_ws_client
+from app.exchange.binance_client import binance_client, binance_ws_client
 
 logger = logging.getLogger(__name__)
 
@@ -250,21 +250,76 @@ class DataService:
             
             # 已完成的K线
             logger.info(f"✅ 处理已完成K线: {symbol} {interval} close={k.get('c')}")
+            
+            # ✅ 关键修复：数据质量验证（防止close/volume为0）- 增强诊断
+            close_price = float(k['c'])
+            volume = float(k['v'])
+            open_price = float(k['o'])
+            high_price = float(k['h'])
+            low_price = float(k['l'])
+            
+            # ✅ 详细诊断：记录原始接收到的数据
+            logger.debug(f"📥 原始K线数据: {symbol} {interval}")
+            logger.debug(f"   open={open_price}, high={high_price}, low={low_price}, close={close_price}, volume={volume}")
+            logger.debug(f"   时间戳: t={k.get('t')}, T={k.get('T')}, is_closed={is_closed}")
+            
+            # ✅ 关键诊断：检查V和Q字段是否存在（taker buy volume）
+            has_V = 'V' in k
+            has_Q = 'Q' in k
+            V_value = k.get('V', None)
+            Q_value = k.get('Q', None)
+            logger.debug(f"   taker_buy字段检查: V存在={has_V}, Q存在={has_Q}, V值={V_value}, Q值={Q_value}")
+            logger.debug(f"   k对象所有字段: {list(k.keys())}")
+            if not has_V or not has_Q:
+                logger.warning(f"⚠️ Binance WebSocket K线数据缺少taker_buy字段: V={has_V}, Q={has_Q}")
+                logger.warning(f"   可用字段: {list(k.keys())}")
+                logger.warning(f"   完整k对象: {k}")
+            
+            # 验证价格数据
+            if close_price <= 0:
+                logger.error(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                logger.error(f"❌ 收到无效K线数据: {symbol} {interval} close={close_price}（价格不应为0或负数）")
+                logger.error(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                logger.error(f"   完整K线数据:")
+                logger.error(f"      open={open_price}, high={high_price}, low={low_price}, close={close_price}")
+                logger.error(f"      volume={volume}, quote_volume={k.get('q', 'N/A')}")
+                logger.error(f"      trades={k.get('n', 'N/A')}, is_closed={is_closed}")
+                logger.error(f"      时间戳: t={k.get('t')}, T={k.get('T')}")
+                logger.error(f"   原始JSON数据（前1000字符）: {str(k)[:1000]}")
+                logger.error(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                return  # 跳过无效数据
+            
+            if volume < 0:
+                logger.warning(f"⚠️ 收到异常K线数据: {symbol} {interval} volume={volume}（成交量不应为负数）")
+                logger.warning(f"   完整数据: o={open_price}, h={high_price}, l={low_price}, c={close_price}, v={volume}")
+                volume = 0  # 设为0而不是负数
+            
+            # ✅ 详细诊断：检查数据合理性
+            if close_price < low_price or close_price > high_price:
+                logger.warning(f"⚠️ 价格数据异常: close={close_price}不在[low={low_price}, high={high_price}]范围内")
+            
+            if high_price < low_price:
+                logger.error(f"❌ 价格数据严重异常: high={high_price} < low={low_price}")
+            
+            if volume == 0:
+                logger.debug(f"   ℹ️ volume=0（可能是极低流动性时段，但会导致pct_change产生inf）")
+            
             # 创建K线数据对象（保留Binance原始时间戳，不转换）
             kline = KlineData(
                 symbol=symbol,
                 interval=interval,
                 open_time=k['t'],  # ✅ 保留毫秒时间戳（整数）
                 close_time=k['T'],  # ✅ 保留毫秒时间戳（整数）
-                open_price=float(k['o']),
-                high_price=float(k['h']),
-                low_price=float(k['l']),
-                close_price=float(k['c']),
-                volume=float(k['v']),
+                open_price=open_price,
+                high_price=high_price,
+                low_price=low_price,
+                close_price=close_price,
+                volume=volume,
                 quote_volume=float(k['q']),
                 trades=int(k['n']),
                 taker_buy_base_volume=float(k.get('V', 0)),    # ✅ 主动买入量
-                taker_buy_quote_volume=float(k.get('Q', 0))    # ✅ 主动买入额
+                taker_buy_quote_volume=float(k.get('Q', 0)),   # ✅ 主动买入额
+                is_closed=True  # 🔑 K线已完成（只处理已完成的K线）
             )
             
             # 🔥 直接通知回调函数（signal_generator），不需要额外处理
@@ -340,8 +395,8 @@ class DataService:
     async def _fetch_historical_klines(self, symbol: str, interval: str, limit: int = 1000):
         """获取历史K线数据"""
         try:
-            # 获取最近的数据
-            klines = binance_client.get_klines(symbol, interval, limit)
+            # ✅ 统一使用分页方法（自动处理超过1500的情况）
+            klines = binance_client.get_klines_paginated(symbol, interval, limit)
             
             if not klines:
                 logger.warning(f"未获取到历史数据: {symbol} {interval}")
@@ -381,7 +436,8 @@ class DataService:
             if df.empty:
                 # 如果数据库没有数据，从API获取
                 logger.debug(f"数据库无数据，从API获取: {symbol} {interval}")
-                klines = binance_client.get_klines(symbol, interval, limit)
+                # ✅ 统一使用分页方法（自动处理超过1500的情况）
+                klines = binance_client.get_klines_paginated(symbol, interval, limit)
                 return klines
             
             # 转换为字典列表

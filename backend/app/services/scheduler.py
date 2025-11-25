@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import pytz
 
 from app.core.config import settings
-from app.services.ml_service import MLService
+from app.model.ml_service import MLService
 from app.services.data_service import DataService
 from app.services.historical_data import historical_data_manager
 

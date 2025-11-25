@@ -15,11 +15,11 @@ from app.core.config import settings
 from app.api.routes import api_router
 from app.api.middleware import LoggingMiddleware, ErrorHandlingMiddleware
 from app.services.data_service import DataService
-from app.services.ensemble_ml_service import ensemble_ml_service  # 🆕 使用Stacking集成
-from app.services.trading_engine import TradingEngine
+from app.model.ensemble_ml_service import ensemble_ml_service  # 🆕 使用Stacking集成
+from app.trading.trading_engine import TradingEngine
 from app.services.risk_service import RiskService
-from app.services.signal_generator import SignalGenerator
-from app.services.trading_controller import TradingController
+from app.trading.signal_generator import SignalGenerator
+from app.trading.trading_controller import TradingController
 from app.services.scheduler import TaskScheduler
 from app.services.drawdown_monitor import drawdown_monitor
 from app.services.health_monitor import health_monitor

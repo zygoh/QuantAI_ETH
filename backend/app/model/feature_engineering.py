@@ -24,6 +24,90 @@ class FeatureEngineer:
             
             logger.info(f"🔧 开始特征工程: {len(df)}行原始数据")
             
+            # ✅ 详细诊断：记录原始数据状态
+            logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            logger.info(f"📊 特征工程 - 原始数据详细诊断")
+            logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            logger.info(f"   数据形状: {df.shape}")
+            logger.info(f"   列名: {list(df.columns)}")
+            
+            # 详细检查关键字段
+            if 'close' in df.columns:
+                close_stats = {
+                    'count': len(df['close']),
+                    'non_null': df['close'].notna().sum(),
+                    'null': df['close'].isna().sum(),
+                    'zero': (df['close'] == 0).sum(),
+                    'negative': (df['close'] < 0).sum(),
+                    'min': df['close'].min() if df['close'].notna().any() else None,
+                    'max': df['close'].max() if df['close'].notna().any() else None,
+                    'mean': df['close'].mean() if df['close'].notna().any() else None,
+                    'inf': np.isinf(df['close']).sum() if df['close'].notna().any() else 0
+                }
+                logger.info(f"   📈 close价格统计:")
+                logger.info(f"      总数: {close_stats['count']}, 非空: {close_stats['non_null']}, 空值: {close_stats['null']}")
+                logger.info(f"      零值: {close_stats['zero']}, 负值: {close_stats['negative']}, 无穷大: {close_stats['inf']}")
+                if close_stats['non_null'] > 0:
+                    logger.info(f"      范围: [{close_stats['min']:.4f}, {close_stats['max']:.4f}], 均值: {close_stats['mean']:.4f}")
+                
+                # ✅ 详细记录零值位置
+                if close_stats['zero'] > 0:
+                    zero_indices = df[df['close'] == 0].index.tolist()
+                    logger.error(f"   ❌ 发现{close_stats['zero']}个close为0的位置:")
+                    for idx in zero_indices[:10]:  # 只显示前10个
+                        row = df.loc[idx]
+                        logger.error(f"      索引{idx}: close=0, open={row.get('open', 'N/A')}, high={row.get('high', 'N/A')}, low={row.get('low', 'N/A')}, volume={row.get('volume', 'N/A')}")
+                    if len(zero_indices) > 10:
+                        logger.error(f"      ... 还有{len(zero_indices) - 10}个零值未显示")
+            
+            if 'volume' in df.columns:
+                volume_stats = {
+                    'count': len(df['volume']),
+                    'non_null': df['volume'].notna().sum(),
+                    'null': df['volume'].isna().sum(),
+                    'zero': (df['volume'] == 0).sum(),
+                    'negative': (df['volume'] < 0).sum(),
+                    'min': df['volume'].min() if df['volume'].notna().any() else None,
+                    'max': df['volume'].max() if df['volume'].notna().any() else None,
+                    'mean': df['volume'].mean() if df['volume'].notna().any() else None,
+                    'inf': np.isinf(df['volume']).sum() if df['volume'].notna().any() else 0
+                }
+                logger.info(f"   📊 volume成交量统计:")
+                logger.info(f"      总数: {volume_stats['count']}, 非空: {volume_stats['non_null']}, 空值: {volume_stats['null']}")
+                logger.info(f"      零值: {volume_stats['zero']}, 负值: {volume_stats['negative']}, 无穷大: {volume_stats['inf']}")
+                if volume_stats['non_null'] > 0:
+                    logger.info(f"      范围: [{volume_stats['min']:.4f}, {volume_stats['max']:.4f}], 均值: {volume_stats['mean']:.4f}")
+                
+                # ✅ 详细记录零值位置
+                if volume_stats['zero'] > 0:
+                    zero_indices = df[df['volume'] == 0].index.tolist()
+                    logger.warning(f"   ⚠️ 发现{volume_stats['zero']}个volume为0的位置（前10个）:")
+                    for idx in zero_indices[:10]:
+                        row = df.loc[idx]
+                        logger.error(f"      索引{idx}:row={row}")
+                        logger.warning(f"      索引{idx}: volume=0, close={row.get('close', 'N/A')}")
+            
+            # ✅ 关键修复：数据质量验证（防止close/volume为0导致inf）
+            if 'close' in df.columns:
+                zero_close_count = (df['close'] == 0).sum()
+                if zero_close_count > 0:
+                    logger.error(f"❌ 检测到{zero_close_count}个close价格为0，将替换为NaN")
+                    logger.error(f"   替换前，检查这些行的其他字段:")
+                    zero_close_rows = df[df['close'] == 0]
+                    for idx, row in zero_close_rows.head(5).iterrows():
+                        logger.error(f"      索引{idx}: open={row.get('open', 'N/A')}, high={row.get('high', 'N/A')}, low={row.get('low', 'N/A')}, volume={row.get('volume', 'N/A')}")
+                    df.loc[df['close'] == 0, 'close'] = np.nan
+                    # 如果close为0，对应的high/low/open也应该为NaN
+                    df.loc[df['close'].isna(), ['high', 'low', 'open']] = np.nan
+                    logger.info(f"   ✅ 已将{zero_close_count}个close=0替换为NaN")
+            
+            if 'volume' in df.columns:
+                zero_volume_count = (df['volume'] == 0).sum()
+                if zero_volume_count > 0:
+                    logger.warning(f"⚠️ 检测到{zero_volume_count}个volume为0（可能是异常数据或极低流动性）")
+                    # 注意：volume为0在现实中可能存在（极低流动性），但为了计算稳定性，我们标记为NaN
+                    # 可以根据业务需求决定是否替换
+            
             # 处理 timestamp：如果是 index，重置为列
             if df.index.name == 'timestamp' or 'timestamp' not in df.columns:
                 df = df.reset_index()
@@ -36,34 +120,77 @@ class FeatureEngineer:
             # 确保数据按时间排序
             df = df.sort_values('timestamp').reset_index(drop=True)
             
+            # ✅ 详细追踪：在每个特征添加步骤后检查inf
+            inf_tracker = {}  # 追踪每个步骤产生的inf
+            
             # 基础价格特征
+            logger.debug(f"   🔧 步骤1: 添加价格特征...")
+            df_before = df.copy()
             df = self._add_price_features(df)
+            inf_after_price = sum(np.isinf(df[col]).sum() for col in df.columns if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]))
+            if inf_after_price > 0:
+                inf_tracker['_add_price_features'] = inf_after_price
+                logger.warning(f"      ⚠️ 价格特征后产生{inf_after_price}个inf值")
             
             # 技术指标特征
+            logger.debug(f"   🔧 步骤2: 添加技术指标特征...")
             df = self._add_technical_indicators(df)
+            inf_after_tech = sum(np.isinf(df[col]).sum() for col in df.columns if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]))
+            if inf_after_tech > inf_after_price:
+                new_inf = inf_after_tech - inf_after_price
+                inf_tracker['_add_technical_indicators'] = new_inf
+                logger.warning(f"      ⚠️ 技术指标特征新增{new_inf}个inf值（累计{inf_after_tech}）")
             
             # 成交量特征
+            logger.debug(f"   🔧 步骤3: 添加成交量特征...")
             df = self._add_volume_features(df)
+            inf_after_volume = sum(np.isinf(df[col]).sum() for col in df.columns if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]))
+            if inf_after_volume > inf_after_tech:
+                new_inf = inf_after_volume - inf_after_tech
+                inf_tracker['_add_volume_features'] = new_inf
+                logger.warning(f"      ⚠️ 成交量特征新增{new_inf}个inf值（累计{inf_after_volume}）")
             
             # 时间特征
+            logger.debug(f"   🔧 步骤4: 添加时间特征...")
             df = self._add_time_features(df)
             
             # 市场微观结构特征
+            logger.debug(f"   🔧 步骤5: 添加市场微观结构特征...")
             df = self._add_microstructure_features(df)
+            inf_after_micro = sum(np.isinf(df[col]).sum() for col in df.columns if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]))
+            if inf_after_micro > inf_after_volume:
+                new_inf = inf_after_micro - inf_after_volume
+                inf_tracker['_add_microstructure_features'] = new_inf
+                logger.warning(f"      ⚠️ 微观结构特征新增{new_inf}个inf值（累计{inf_after_micro}）")
             
             # 波动率特征
+            logger.debug(f"   🔧 步骤6: 添加波动率特征...")
             df = self._add_volatility_features(df)
+            inf_after_vol = sum(np.isinf(df[col]).sum() for col in df.columns if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]))
+            if inf_after_vol > inf_after_micro:
+                new_inf = inf_after_vol - inf_after_micro
+                inf_tracker['_add_volatility_features'] = new_inf
+                logger.warning(f"      ⚠️ 波动率特征新增{new_inf}个inf值（累计{inf_after_vol}）")
             
             # 动量特征
+            logger.debug(f"   🔧 步骤7: 添加动量特征...")
             df = self._add_momentum_features(df)
             
             # 🆕 市场情绪特征
+            logger.debug(f"   🔧 步骤8: 添加市场情绪特征...")
             df = self._add_sentiment_features(df)
+            inf_after_sentiment = sum(np.isinf(df[col]).sum() for col in df.columns if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]))
+            if inf_after_sentiment > inf_after_vol:
+                new_inf = inf_after_sentiment - inf_after_vol
+                inf_tracker['_add_sentiment_features'] = new_inf
+                logger.warning(f"      ⚠️ 市场情绪特征新增{new_inf}个inf值（累计{inf_after_sentiment}）")
             
             # 🆕 多时间框架特征融合
+            logger.debug(f"   🔧 步骤9: 添加多时间框架特征...")
             df = self._add_multi_timeframe_features(df)
             
             # 🆕 高级特征（Phase 2优化）
+            logger.debug(f"   🔧 步骤10: 添加高级特征...")
             df = self._add_trend_strength_features(df)
             df = self._add_support_resistance_features(df)
             df = self._add_advanced_momentum_features(df)
@@ -71,18 +198,109 @@ class FeatureEngineer:
             df = self._add_order_flow_features(df)
             df = self._add_swing_features(df)
             
-            # 🔥 第一步：处理无穷大值（inf）- 必须在NaN处理前完成
+            # ✅ 输出inf追踪总结
+            if inf_tracker:
+                logger.warning(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                logger.warning(f"📊 Inf值产生步骤追踪:")
+                for step, count in sorted(inf_tracker.items(), key=lambda x: x[1], reverse=True):
+                    logger.warning(f"   {step}: {count}个inf值")
+                logger.warning(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            
+            # 🔥 第一步：处理无穷大值（inf）- 必须在NaN处理前完成（增强诊断）
             inf_count = 0
+            inf_details = {}  # 记录每个列产生inf的详细信息
+            
             for col in df.columns:
                 if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]):
                     inf_mask = np.isinf(df[col])
                     if inf_mask.any():
-                        inf_count += inf_mask.sum()
+                        col_inf_count = inf_mask.sum()
+                        inf_count += col_inf_count
+                        
+                        # ✅ 详细诊断：记录inf的详细信息
+                        inf_indices = df[inf_mask].index.tolist()
+                        inf_values = df.loc[inf_mask, col].tolist()
+                        
+                        # 记录前10个inf的详细信息
+                        sample_indices = inf_indices[:10]
+                        sample_values = inf_values[:10]
+                        
+                        # 获取inf前后的值（用于分析原因）
+                        detail_info = []
+                        for idx in sample_indices:
+                            idx_pos = df.index.get_loc(idx)
+                            prev_val = df[col].iloc[idx_pos - 1] if idx_pos > 0 else None
+                            curr_val = df.loc[idx, col]
+                            next_val = df[col].iloc[idx_pos + 1] if idx_pos < len(df) - 1 else None
+                            
+                            # 检查是否是pct_change产生的inf（前一个值为0或NaN）
+                            if col in ['price_change', 'price_change_2', 'price_change_3', 'price_change_5', 
+                                     'price_change_10', 'price_change_20', 'volume_change']:
+                                if idx_pos > 0:
+                                    base_col = 'close' if 'price' in col else 'volume'
+                                    if base_col in df.columns:
+                                        base_val = df[base_col].iloc[idx_pos - 1]
+                                        detail_info.append({
+                                            'index': idx,
+                                            'inf_value': curr_val,
+                                            f'{base_col}_prev': base_val,
+                                            f'{base_col}_curr': df[base_col].iloc[idx_pos] if idx_pos < len(df) else None,
+                                            'reason': f'{base_col}_prev={base_val} (可能是0或NaN导致pct_change产生inf)'
+                                        })
+                                    else:
+                                        detail_info.append({
+                                            'index': idx,
+                                            'inf_value': curr_val,
+                                            'prev': prev_val,
+                                            'next': next_val
+                                        })
+                                else:
+                                    detail_info.append({
+                                        'index': idx,
+                                        'inf_value': curr_val,
+                                        'reason': '第一个值，无法检查前值'
+                                    })
+                            else:
+                                detail_info.append({
+                                    'index': idx,
+                                    'inf_value': curr_val,
+                                    'prev': prev_val,
+                                    'next': next_val
+                                })
+                        
+                        inf_details[col] = {
+                            'count': col_inf_count,
+                            'total_in_column': len(df[col]),
+                            'percentage': 100.0 * col_inf_count / len(df[col]),
+                            'samples': detail_info
+                        }
+                        
                         # 将inf替换为NaN（后续统一处理）
                         df.loc[inf_mask, col] = np.nan
             
             if inf_count > 0:
+                logger.warning(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
                 logger.warning(f"⚠️ 检测到{inf_count}个无穷大值（inf），已替换为NaN")
+                logger.warning(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                logger.warning(f"📊 Inf值详细统计（按列）:")
+                for col, details in sorted(inf_details.items(), key=lambda x: x[1]['count'], reverse=True):
+                    logger.warning(f"   {col}:")
+                    logger.warning(f"      总数量: {details['count']}个 ({details['percentage']:.2f}%)")
+                    logger.warning(f"      列总数: {details['total_in_column']}个")
+                    logger.warning(f"      详细样本（前{min(len(details['samples']), 5)}个）:")
+                    for i, sample in enumerate(details['samples'][:5]):
+                        logger.warning(f"         样本{i+1}:")
+                        logger.warning(f"            行索引: {sample['index']}")
+                        logger.warning(f"            Inf值: {sample['inf_value']}")
+                        if 'reason' in sample:
+                            logger.warning(f"            原因: {sample['reason']}")
+                        if 'close_prev' in sample:
+                            logger.warning(f"            close前值: {sample['close_prev']}, close当前值: {sample['close_curr']}")
+                        if 'volume_prev' in sample:
+                            logger.warning(f"            volume前值: {sample['volume_prev']}, volume当前值: {sample['volume_curr']}")
+                        if 'prev' in sample and 'next' in sample:
+                            logger.warning(f"            前值: {sample['prev']}, 后值: {sample['next']}")
+                logger.warning(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
             
             # 🔥 第二步：处理过大值（可能导致缩放时溢出）
             large_value_threshold = 1e15  # 防止后续缩放时溢出
@@ -110,8 +328,34 @@ class FeatureEngineer:
                 df = df.ffill()
                 # 如果前向填充后仍有NaN（开头的行），用后向填充
                 df = df.bfill()
-                # 如果还有NaN，用0填充
-                df = df.fillna(0)
+                
+                # ✅ 关键修复：对于close/volume等关键字段，使用更合理的填充策略
+                # 而不是简单地用0填充（避免导致pct_change产生inf）
+                if 'close' in df.columns:
+                    # close价格：如果仍有NaN，使用前一个有效值或后一个有效值
+                    # 如果完全没有有效值，保留NaN（不要用0）
+                    if df['close'].isna().any():
+                        # 尝试用open/high/low的平均值填充
+                        for idx in df[df['close'].isna()].index:
+                            if not df.loc[idx, ['open', 'high', 'low']].isna().all():
+                                df.loc[idx, 'close'] = df.loc[idx, ['open', 'high', 'low']].mean()
+                
+                # 对于其他字段，如果仍有NaN，用0填充（但close/volume已处理）
+                # 但确保close/volume不会为0
+                for col in df.columns:
+                    if col not in ['timestamp', 'close', 'volume']:
+                        df[col] = df[col].fillna(0)
+                    elif col == 'volume':
+                        # volume为0可以接受，但NaN保留（避免影响计算）
+                        pass
+                
+                # 最后检查：确保close不为0
+                if 'close' in df.columns:
+                    zero_close = (df['close'] == 0).sum()
+                    if zero_close > 0:
+                        logger.warning(f"⚠️ 预测场景：仍有{zero_close}个close为0，将替换为NaN")
+                        df.loc[df['close'] == 0, 'close'] = np.nan
+                
                 logger.debug(f"✅ 特征工程完成（预测模式）: {len(df)}行，特征数: {len(df.columns)}")
             else:
                 # 训练场景，正常删除NaN
@@ -134,30 +378,130 @@ class FeatureEngineer:
     def _add_price_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """添加价格特征 - 优化性能"""
         try:
+            logger.debug(f"   📊 _add_price_features: 开始处理，输入数据形状: {df.shape}")
+            logger.debug(f"      close统计: min={df['close'].min():.4f}, max={df['close'].max():.4f}, "
+                        f"零值={(df['close'] == 0).sum()}, NaN={df['close'].isna().sum()}")
             new_features = {}
             
-            # 价格变化率
-            price_change = df['close'].pct_change()
+            # 价格变化率（修复：pct_change在除数为0时会产生inf）
+            # ✅ 详细诊断：检查close数据质量
+            close_zero_count = (df['close'] == 0).sum()
+            close_nan_count = df['close'].isna().sum()
+            if close_zero_count > 0 or close_nan_count > 0:
+                logger.warning(f"⚠️ _add_price_features: close数据异常 - 零值={close_zero_count}, NaN={close_nan_count}")
+                if close_zero_count > 0:
+                    zero_indices = df[df['close'] == 0].index.tolist()[:5]
+                    logger.warning(f"   close=0的位置（前5个）: {zero_indices}")
+            
+            # ✅ 关键修复：在pct_change之前，将close=0替换为NaN（双重保护）
+            # 如果入口处理失败，这里再次处理
+            if close_zero_count > 0:
+                logger.warning(f"⚠️ _add_price_features: 仍有{close_zero_count}个close=0，临时替换为NaN以避免pct_change产生inf")
+                close_for_pct = df['close'].replace(0, np.nan)
+            else:
+                close_for_pct = df['close']
+            
+            price_change = close_for_pct.pct_change(fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
+            
+            # ✅ 详细诊断：检查pct_change产生的inf
+            inf_mask = np.isinf(price_change)
+            if inf_mask.any():
+                inf_count = inf_mask.sum()
+                logger.error(f"❌ _add_price_features: price_change产生{inf_count}个inf值！")
+                inf_indices = price_change[inf_mask].index.tolist()[:5]
+                for idx in inf_indices:
+                    idx_pos = df.index.get_loc(idx)
+                    prev_close = df['close'].iloc[idx_pos - 1] if idx_pos > 0 else None
+                    curr_close = df['close'].iloc[idx_pos]
+                    inf_value = price_change.iloc[idx_pos]
+                    logger.error(f"   位置{idx}: close前值={prev_close}, close当前值={curr_close}, pct_change={inf_value}")
+                    if prev_close == 0:
+                        logger.error(f"      ❌ 原因确认：前一个close值为0，导致pct_change产生inf")
+                    elif prev_close is None or np.isnan(prev_close):
+                        logger.error(f"      ❌ 原因确认：前一个close值为NaN，导致pct_change产生inf")
+                    else:
+                        logger.error(f"      ⚠️ 原因不明：前一个close值={prev_close}（非0非NaN），但仍产生inf")
+            
+            # ✅ 修复：替换inf值（当close从前一个0值变化时）
+            price_change = price_change.replace([np.inf, -np.inf], np.nan)
             new_features['price_change'] = price_change
             new_features['price_change_abs'] = price_change.abs()
             
-            # 价格范围
-            new_features['price_range'] = (df['high'] - df['low']) / df['close']
+            # 价格范围（避免除以零）
+            close_safe = df['close'].replace(0, np.nan)  # 避免除以0
+            
+            # ✅ 详细诊断：检查close_safe替换后的情况
+            close_safe_zero_after = (close_safe == 0).sum()
+            if close_safe_zero_after > 0:
+                logger.error(f"❌ _add_price_features: close_safe仍有{close_safe_zero_after}个0值（替换失败）")
+            
+            new_features['price_range'] = (df['high'] - df['low']) / close_safe
+            
+            # ✅ 详细诊断：检查price_range是否产生inf
+            inf_mask_price_range = np.isinf(new_features['price_range'])
+            if inf_mask_price_range.any():
+                inf_count = inf_mask_price_range.sum()
+                logger.error(f"❌ _add_price_features: price_range产生{inf_count}个inf值！")
+                inf_indices = new_features['price_range'][inf_mask_price_range].index.tolist()[:3]
+                for idx in inf_indices:
+                    idx_pos = df.index.get_loc(idx)
+                    logger.error(f"   位置{idx}: high={df['high'].iloc[idx_pos]}, low={df['low'].iloc[idx_pos]}, close={df['close'].iloc[idx_pos]}, close_safe={close_safe.iloc[idx_pos]}")
+            
             # 注：upper_shadow 和 lower_shadow 在市场微观结构特征中添加（更好的归一化）
             
-            # 开盘价与收盘价关系
-            new_features['open_close_ratio'] = df['open'] / df['close']
-            new_features['body_size'] = abs(df['close'] - df['open']) / df['close']
+            # 开盘价与收盘价关系（避免除以零）
+            new_features['open_close_ratio'] = df['open'] / close_safe
+            
+            # ✅ 详细诊断：检查open_close_ratio是否产生inf
+            inf_mask_open_close = np.isinf(new_features['open_close_ratio'])
+            if inf_mask_open_close.any():
+                inf_count = inf_mask_open_close.sum()
+                logger.error(f"❌ _add_price_features: open_close_ratio产生{inf_count}个inf值！")
+            
+            new_features['body_size'] = abs(df['close'] - df['open']) / close_safe
+            
+            # ✅ 详细诊断：检查body_size是否产生inf
+            inf_mask_body = np.isinf(new_features['body_size'])
+            if inf_mask_body.any():
+                inf_count = inf_mask_body.sum()
+                logger.error(f"❌ _add_price_features: body_size产生{inf_count}个inf值！")
             
             # 价格位置（避免除以零）
             price_range_safe = df['high'] - df['low']
             price_range_safe = price_range_safe.replace(0, np.nan)  # 零范围设为NaN
             new_features['close_position'] = (df['close'] - df['low']) / price_range_safe
             
-            # 多周期价格变化
+            # 多周期价格变化（修复：pct_change可能产生inf）
+            # ✅ 使用预处理后的close_for_pct（已处理0值）
             for period in [2, 3, 5, 10, 20]:
-                new_features[f'price_change_{period}'] = df['close'].pct_change(period)
-                new_features[f'high_low_ratio_{period}'] = df['high'].rolling(period).max() / df['low'].rolling(period).min()
+                pct_chg = close_for_pct.pct_change(period, fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
+                
+                # ✅ 详细诊断：检查每个period的inf情况（理论上不应该有）
+                inf_mask = np.isinf(pct_chg)
+                if inf_mask.any():
+                    inf_count = inf_mask.sum()
+                    logger.error(f"❌ _add_price_features: price_change_{period}仍产生{inf_count}个inf值（异常！）")
+                    # 只记录前3个inf的详细信息
+                    inf_indices = pct_chg[inf_mask].index.tolist()[:3]
+                    for idx in inf_indices:
+                        idx_pos = df.index.get_loc(idx)
+                        prev_close = df['close'].iloc[idx_pos - period] if idx_pos >= period else None
+                        curr_close = df['close'].iloc[idx_pos]
+                        prev_close_for_pct = close_for_pct.iloc[idx_pos - period] if idx_pos >= period else None
+                        logger.error(f"   位置{idx}: {period}周期前close={prev_close}, 当前close={curr_close}")
+                        logger.error(f"      {period}周期前close_for_pct={prev_close_for_pct}")
+                        if prev_close == 0:
+                            logger.error(f"      ❌ 原因：{period}周期前close=0，但预处理可能失败")
+                else:
+                    if close_zero_count > 0:
+                        logger.debug(f"   ✅ price_change_{period}通过预处理避免了inf产生")
+                
+                pct_chg = pct_chg.replace([np.inf, -np.inf], np.nan)  # ✅ 双重保护：替换inf
+                new_features[f'price_change_{period}'] = pct_chg
+                # 避免除以零（low可能为0）
+                rolling_low_min = df['low'].rolling(period).min()
+                rolling_low_safe = rolling_low_min.replace(0, np.nan)  # 避免除以0
+                new_features[f'high_low_ratio_{period}'] = df['high'].rolling(period).max() / rolling_low_safe
             
             # ✅ 价格加速度（一阶、三阶、五阶）
             new_features['price_acceleration'] = price_change - price_change.shift(1)  # 一阶加速度（基础版本）
@@ -222,8 +566,11 @@ class FeatureEngineer:
                 
                 new_features[f'sma_{period}'] = sma
                 new_features[f'ema_{period}'] = ema
-                new_features[f'price_sma_ratio_{period}'] = df['close'] / sma
-                new_features[f'price_ema_ratio_{period}'] = df['close'] / ema
+                # 避免除以零（虽然sma/ema通常不为0，但为安全起见）
+                sma_safe = sma.replace(0, np.nan)
+                ema_safe = ema.replace(0, np.nan)
+                new_features[f'price_sma_ratio_{period}'] = df['close'] / sma_safe
+                new_features[f'price_ema_ratio_{period}'] = df['close'] / ema_safe
             
             # 移动平均线交叉
             new_features['sma_5_20_cross'] = np.where(sma_dict[5] > sma_dict[20], 1, 0)
@@ -267,14 +614,50 @@ class FeatureEngineer:
             new_features = {}
             
             # 成交量变化
-            volume_change = df['volume'].pct_change()
-            volume_sma_5 = df['volume'].rolling(5).mean()
+            # ✅ 详细诊断：检查volume数据质量
+            volume_zero_count = (df['volume'] == 0).sum()
+            volume_nan_count = df['volume'].isna().sum()
+            if volume_zero_count > 0:
+                logger.warning(f"⚠️ _add_volume_features: 检测到{volume_zero_count}个volume为0（可能导致pct_change产生inf）")
+                logger.warning(f"   这些零值将被临时替换为NaN，避免pct_change产生inf")
+                # ✅ 关键修复：在pct_change之前，将volume=0替换为NaN
+                # 这样pct_change就不会产生inf（因为NaN的pct_change结果是NaN，不是inf）
+                volume_for_pct = df['volume'].replace(0, np.nan)
+            else:
+                volume_for_pct = df['volume']
+            
+            volume_change = volume_for_pct.pct_change(fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
+            
+            # ✅ 详细诊断：检查volume_change是否仍有inf（理论上不应该有）
+            inf_mask = np.isinf(volume_change)
+            if inf_mask.any():
+                inf_count = inf_mask.sum()
+                logger.error(f"❌ _add_volume_features: volume_change仍产生{inf_count}个inf值（异常！）")
+                inf_indices = volume_change[inf_mask].index.tolist()[:5]
+                for idx in inf_indices:
+                    idx_pos = df.index.get_loc(idx)
+                    prev_volume = df['volume'].iloc[idx_pos - 1] if idx_pos > 0 else None
+                    curr_volume = df['volume'].iloc[idx_pos]
+                    logger.error(f"   位置{idx}: volume前值={prev_volume}, volume当前值={curr_volume}")
+                    logger.error(f"      volume_for_pct前值={volume_for_pct.iloc[idx_pos - 1] if idx_pos > 0 else None}, "
+                               f"volume_for_pct当前值={volume_for_pct.iloc[idx_pos]}")
+            else:
+                # ✅ 修复成功：没有产生inf
+                if volume_zero_count > 0:
+                    logger.info(f"   ✅ 通过预处理（volume=0→NaN）成功避免了inf产生")
+            
+            # ✅ 双重保护：即使仍有inf，也替换为NaN
+            volume_change = volume_change.replace([np.inf, -np.inf], np.nan)
+            # 🔑 修复非平稳特征：移除绝对值volume_sma，只保留比率特征
+            # 计算volume_sma_20用于比率计算（不添加到特征中）
             volume_sma_20 = df['volume'].rolling(20).mean()
+            # 避免除以零（volume_sma_20可能为0）
+            volume_sma_20_safe = volume_sma_20.replace(0, np.nan)
             
             new_features['volume_change'] = volume_change
-            new_features['volume_sma_5'] = volume_sma_5
-            new_features['volume_sma_20'] = volume_sma_20
-            new_features['volume_ratio'] = df['volume'] / volume_sma_20
+            # ✅ 移除非平稳绝对值特征：volume_sma_5, volume_sma_20
+            # ✅ 只保留比率特征：volume_ratio（已转换为相对值，对模型更友好）
+            new_features['volume_ratio'] = df['volume'] / volume_sma_20_safe
             
             # 价量关系
             new_features['price_volume_trend'] = df['price_change'] * volume_change
@@ -293,25 +676,136 @@ class FeatureEngineer:
             # Chaikin Money Flow
             new_features['cmf'] = ta.volume.ChaikinMoneyFlowIndicator(df['high'], df['low'], df['close'], df['volume']).chaikin_money_flow()
             
-            # Volume Weighted Average Price (VWAP)
-            vwap = (df['close'] * df['volume']).rolling(20).sum() / df['volume'].rolling(20).sum()
-            new_features['vwap'] = vwap
-            new_features['price_vwap_ratio'] = df['close'] / vwap
+            # Volume Weighted Average Price (VWAP)（避免除以零）
+            volume_rolling_sum = df['volume'].rolling(20).sum()
             
-            # ✅ 成交量突破（捕捉放量信号）
+            # ✅ 详细诊断：检查volume_rolling_sum
+            volume_rolling_sum_zero = (volume_rolling_sum == 0).sum()
+            if volume_rolling_sum_zero > 0:
+                logger.warning(f"⚠️ _add_volume_features: volume_rolling_sum有{volume_rolling_sum_zero}个0值")
+                zero_indices = volume_rolling_sum[volume_rolling_sum == 0].index.tolist()[:5]
+                for idx in zero_indices:
+                    idx_pos = df.index.get_loc(idx)
+                    volume_window = df['volume'].iloc[max(0, idx_pos-19):idx_pos+1]
+                    logger.warning(f"   位置{idx}: volume_rolling_sum=0")
+                    logger.warning(f"      volume窗口: 总数={len(volume_window)}, 零值={(volume_window == 0).sum()}, "
+                                 f"NaN={volume_window.isna().sum() if hasattr(volume_window, 'isna') else 0}")
+                    if len(volume_window) > 0:
+                        logger.warning(f"      volume范围: [{volume_window.min():.4f}, {volume_window.max():.4f}]")
+            
+            volume_rolling_sum_safe = volume_rolling_sum.replace(0, np.nan)  # 避免除以0
+            
+            # ✅ 详细诊断：检查替换后的情况
+            volume_rolling_sum_safe_zero_after = (volume_rolling_sum_safe == 0).sum()
+            if volume_rolling_sum_safe_zero_after > 0:
+                logger.error(f"❌ _add_volume_features: volume_rolling_sum_safe仍有{volume_rolling_sum_safe_zero_after}个0值（替换失败）")
+            
+            # 计算vwap
+            numerator = (df['close'] * df['volume']).rolling(20).sum()
+            vwap = numerator / volume_rolling_sum_safe
+            
+            # ✅ 详细诊断：检查vwap是否产生inf
+            inf_mask_vwap = np.isinf(vwap)
+            if inf_mask_vwap.any():
+                inf_count = inf_mask_vwap.sum()
+                logger.error(f"❌ _add_volume_features: vwap产生{inf_count}个inf值！")
+                inf_indices = vwap[inf_mask_vwap].index.tolist()[:5]
+                for idx in inf_indices:
+                    idx_pos = df.index.get_loc(idx)
+                    logger.error(f"   位置{idx}:")
+                    logger.error(f"      numerator={numerator.iloc[idx_pos]}, volume_rolling_sum={volume_rolling_sum.iloc[idx_pos]}")
+                    logger.error(f"      volume_rolling_sum_safe={volume_rolling_sum_safe.iloc[idx_pos]}")
+                    logger.error(f"      vwap={vwap.iloc[idx_pos]}")
+                    # 检查窗口内的详细数据
+                    volume_window = df['volume'].iloc[max(0, idx_pos-19):idx_pos+1]
+                    close_window = df['close'].iloc[max(0, idx_pos-19):idx_pos+1]
+                    logger.error(f"      volume窗口（前5个）: {volume_window.head(5).tolist()}")
+                    logger.error(f"      close窗口（前5个）: {close_window.head(5).tolist()}")
+            
+            new_features['vwap'] = vwap
+            # 避免除以零（vwap可能为NaN）
+            vwap_safe = vwap.replace(0, np.nan).replace(np.nan, 1.0)  # 如果vwap为NaN，用1.0避免inf
+            
+            # ✅ 详细诊断：检查vwap_safe替换后的情况
+            vwap_safe_zero_after = (vwap_safe == 0).sum()
+            if vwap_safe_zero_after > 0:
+                logger.error(f"❌ _add_volume_features: vwap_safe仍有{vwap_safe_zero_after}个0值（替换失败）")
+            
+            new_features['price_vwap_ratio'] = df['close'] / vwap_safe
+            
+            # ✅ 详细诊断：检查price_vwap_ratio是否产生inf
+            inf_mask_vwap_ratio = np.isinf(new_features['price_vwap_ratio'])
+            if inf_mask_vwap_ratio.any():
+                inf_count = inf_mask_vwap_ratio.sum()
+                logger.error(f"❌ _add_volume_features: price_vwap_ratio产生{inf_count}个inf值！")
+                inf_indices = new_features['price_vwap_ratio'][inf_mask_vwap_ratio].index.tolist()[:5]
+                for idx in inf_indices:
+                    idx_pos = df.index.get_loc(idx)
+                    logger.error(f"   位置{idx}:")
+                    logger.error(f"      close={df['close'].iloc[idx_pos]}, vwap={vwap.iloc[idx_pos]}")
+                    logger.error(f"      vwap_safe={vwap_safe.iloc[idx_pos]}, price_vwap_ratio={new_features['price_vwap_ratio'].iloc[idx_pos]}")
+                    if vwap_safe.iloc[idx_pos] == 0:
+                        logger.error(f"      ❌ 原因确认：vwap_safe=0（替换失败）")
+            
+            # ✅ 成交量突破（捕捉放量信号）（避免除以零）
             volume_ma_5 = df['volume'].rolling(5).mean()
             volume_ma_20 = df['volume'].rolling(20).mean()
-            new_features['volume_spike'] = df['volume'] / volume_ma_20
-            new_features['volume_trend'] = volume_ma_5 / volume_ma_20
             
-            # ✅ 价格-成交量背离（重要信号）
-            price_change_1 = df['close'].pct_change(1)  # 定义价格变化率
-            price_change_5 = df['close'].pct_change(5)
-            volume_change_5 = df['volume'].pct_change(5)
+            # ✅ 详细诊断：检查volume_ma_20
+            volume_ma_20_zero = (volume_ma_20 == 0).sum()
+            if volume_ma_20_zero > 0:
+                logger.warning(f"⚠️ _add_volume_features: volume_ma_20有{volume_ma_20_zero}个0值")
+                zero_indices = volume_ma_20[volume_ma_20 == 0].index.tolist()[:3]
+                for idx in zero_indices:
+                    idx_pos = df.index.get_loc(idx)
+                    volume_window = df['volume'].iloc[max(0, idx_pos-19):idx_pos+1]
+                    logger.warning(f"   位置{idx}: volume_ma_20=0, volume窗口统计: 零值={(volume_window == 0).sum()}/{len(volume_window)}")
+            
+            volume_ma_20_safe = volume_ma_20.replace(0, np.nan)  # 避免除以0
+            
+            # ✅ 详细诊断：检查volume_ma_20_safe替换后的情况
+            volume_ma_20_safe_zero_after = (volume_ma_20_safe == 0).sum()
+            if volume_ma_20_safe_zero_after > 0:
+                logger.error(f"❌ _add_volume_features: volume_ma_20_safe仍有{volume_ma_20_safe_zero_after}个0值（替换失败）")
+            
+            new_features['volume_spike'] = df['volume'] / volume_ma_20_safe
+            
+            # ✅ 详细诊断：检查volume_spike是否产生inf
+            inf_mask_spike = np.isinf(new_features['volume_spike'])
+            if inf_mask_spike.any():
+                inf_count = inf_mask_spike.sum()
+                logger.error(f"❌ _add_volume_features: volume_spike产生{inf_count}个inf值！")
+                inf_indices = new_features['volume_spike'][inf_mask_spike].index.tolist()[:3]
+                for idx in inf_indices:
+                    idx_pos = df.index.get_loc(idx)
+                    logger.error(f"   位置{idx}: volume={df['volume'].iloc[idx_pos]}, volume_ma_20={volume_ma_20.iloc[idx_pos]}, volume_ma_20_safe={volume_ma_20_safe.iloc[idx_pos]}")
+            
+            new_features['volume_trend'] = volume_ma_5 / volume_ma_20_safe
+            
+            # ✅ 详细诊断：检查volume_trend是否产生inf
+            inf_mask_trend = np.isinf(new_features['volume_trend'])
+            if inf_mask_trend.any():
+                inf_count = inf_mask_trend.sum()
+                logger.error(f"❌ _add_volume_features: volume_trend产生{inf_count}个inf值！")
+            
+            # ✅ 价格-成交量背离（重要信号）（修复：pct_change可能产生inf）
+            # ✅ 使用预处理后的close_for_pct和volume_for_pct（已处理0值）
+            close_for_pct_corr = df['close'].replace(0, np.nan) if (df['close'] == 0).sum() > 0 else df['close']
+            volume_for_pct_corr = df['volume'].replace(0, np.nan) if (df['volume'] == 0).sum() > 0 else df['volume']
+            
+            price_change_1 = close_for_pct_corr.pct_change(1, fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
+            price_change_1 = price_change_1.replace([np.inf, -np.inf], np.nan)  # ✅ 双重保护
+            
+            price_change_5 = close_for_pct_corr.pct_change(5, fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
+            price_change_5 = price_change_5.replace([np.inf, -np.inf], np.nan)  # ✅ 双重保护
+            
+            volume_change_5 = volume_for_pct_corr.pct_change(5, fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
+            volume_change_5 = volume_change_5.replace([np.inf, -np.inf], np.nan)  # ✅ 双重保护
             new_features['price_volume_correlation'] = price_change_5 * volume_change_5  # 同向为正，背离为负（连续值）
             
-            # ✅ 成交量加权价格变化（结合量价）
-            new_features['volume_weighted_price_change'] = price_change_1 * (df['volume'] / volume_ma_20)
+            # ✅ 成交量加权价格变化（结合量价）（避免除以零）
+            # volume_ma_20_safe已在上面定义（Line 317），直接使用
+            new_features['volume_weighted_price_change'] = price_change_1 * (df['volume'] / volume_ma_20_safe)
             
             # 一次性添加所有特征
             df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
@@ -417,7 +911,10 @@ class FeatureEngineer:
                 new_features[f'price_efficiency_{period}'] = price_change.abs() / (sum_abs_changes + 1e-10)
             
             # 7. 🆕 价格加速度（捕捉拐点）
-            returns = df['close'].pct_change()
+            close_for_returns = df['close'].replace(0, np.nan) if (df['close'] == 0).sum() > 0 else df['close']
+            returns = close_for_returns.pct_change(fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
+            # ✅ 修复：替换inf值
+            returns = returns.replace([np.inf, -np.inf], np.nan)
             # 注：price_acceleration 已在价格特征中定义，这里添加更高阶的
             new_features['price_jerk'] = returns.diff().diff()  # 加加速度（三阶导数）
             
@@ -452,7 +949,10 @@ class FeatureEngineer:
             new_features = {}
             
             # 历史波动率
-            returns = df['close'].pct_change()
+            close_for_returns = df['close'].replace(0, np.nan) if (df['close'] == 0).sum() > 0 else df['close']
+            returns = close_for_returns.pct_change(fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
+            # ✅ 修复：替换inf值
+            returns = returns.replace([np.inf, -np.inf], np.nan)
             for period in [5, 10, 20, 50]:
                 new_features[f'volatility_{period}'] = returns.rolling(period).std() * np.sqrt(252)
             
@@ -664,7 +1164,10 @@ class FeatureEngineer:
             new_features = {}
             
             # 1. 恐慌指数（基于价格波动）
-            returns = df['close'].pct_change()
+            close_for_returns = df['close'].replace(0, np.nan) if (df['close'] == 0).sum() > 0 else df['close']
+            returns = close_for_returns.pct_change(fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
+            # ✅ 修复：替换inf值
+            returns = returns.replace([np.inf, -np.inf], np.nan)
             short_vol = returns.rolling(20).std()
             long_vol = returns.rolling(100).std()
             new_features['fear_index'] = short_vol / (long_vol + 1e-10)
@@ -684,7 +1187,10 @@ class FeatureEngineer:
                 new_features['rsi_volatility'] = rsi.rolling(10).std()  # RSI波动率
             
             # 4. 🆕 价格加速度幅度（情绪转变强度）
-            price_change = df['close'].pct_change()
+            close_for_price_change = df['close'].replace(0, np.nan) if (df['close'] == 0).sum() > 0 else df['close']
+            price_change = close_for_price_change.pct_change(fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
+            # ✅ 修复：替换inf值
+            price_change = price_change.replace([np.inf, -np.inf], np.nan)
             # 注：price_acceleration 已在价格特征中定义，这里只添加幅度
             acceleration = price_change.diff()
             new_features['acceleration_magnitude'] = acceleration.abs()
@@ -697,7 +1203,11 @@ class FeatureEngineer:
                 
                 # 价量背离（价涨量跌 = 看跌信号）
                 price_trend = (price_change.rolling(5).mean() > 0).astype(int)
-                volume_trend = (df['volume'].pct_change().rolling(5).mean() > 0).astype(int)
+                volume_for_chg = df['volume'].replace(0, np.nan) if (df['volume'] == 0).sum() > 0 else df['volume']
+                volume_chg = volume_for_chg.pct_change(fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
+                # ✅ 修复：替换inf值
+                volume_chg = volume_chg.replace([np.inf, -np.inf], np.nan)
+                volume_trend = (volume_chg.rolling(5).mean() > 0).astype(int)
                 new_features['price_volume_divergence'] = (price_trend != volume_trend).astype(int)
             
             # 6. 🆕 市场波动情绪
@@ -825,15 +1335,25 @@ class FeatureEngineer:
             trend_1h[sma_20_1h < sma_50_1h] = -1  # 空头
             
             # 1h波动率
-            returns_1h = close_1h.pct_change()
+            close_1h_safe = close_1h.replace(0, np.nan) if (close_1h == 0).sum() > 0 else close_1h
+            returns_1h = close_1h_safe.pct_change(fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
+            # ✅ 修复：替换inf值
+            returns_1h = returns_1h.replace([np.inf, -np.inf], np.nan)
             volatility_1h = returns_1h.rolling(20).std()
             
-            # 将1h数据对齐到原始时间框架
-            new_features['trend_1h'] = trend_1h.reindex(df_temp.index, method='ffill')
-            new_features['rsi_1h'] = rsi_1h.reindex(df_temp.index, method='ffill')
-            new_features['volatility_1h'] = volatility_1h.reindex(df_temp.index, method='ffill')
-            new_features['sma_20_1h'] = sma_20_1h.reindex(df_temp.index, method='ffill')
-            new_features['sma_50_1h'] = sma_50_1h.reindex(df_temp.index, method='ffill')
+            # 🔑 修复未来函数：shift(1)确保只使用上一根已收盘的1h K线数据
+            # 将1h数据对齐到原始时间框架（使用shift(1)避免未来数据泄露）
+            trend_1h_shifted = trend_1h.shift(1)
+            rsi_1h_shifted = rsi_1h.shift(1)
+            volatility_1h_shifted = volatility_1h.shift(1)
+            sma_20_1h_shifted = sma_20_1h.shift(1)
+            sma_50_1h_shifted = sma_50_1h.shift(1)
+            
+            new_features['trend_1h'] = trend_1h_shifted.reindex(df_temp.index, method='ffill')
+            new_features['rsi_1h'] = rsi_1h_shifted.reindex(df_temp.index, method='ffill')
+            new_features['volatility_1h'] = volatility_1h_shifted.reindex(df_temp.index, method='ffill')
+            new_features['sma_20_1h'] = sma_20_1h_shifted.reindex(df_temp.index, method='ffill')
+            new_features['sma_50_1h'] = sma_50_1h_shifted.reindex(df_temp.index, method='ffill')
             
             # 2. 模拟15m数据（中期趋势参考，对3m/5m有用）
             df_15m = df_temp.resample('15min').agg({
@@ -855,15 +1375,25 @@ class FeatureEngineer:
             trend_15m[sma_20_15m < sma_50_15m] = -1
             
             # 15m波动率
-            returns_15m = close_15m.pct_change()
+            close_15m_safe = close_15m.replace(0, np.nan) if (close_15m == 0).sum() > 0 else close_15m
+            returns_15m = close_15m_safe.pct_change(fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
+            # ✅ 修复：替换inf值
+            returns_15m = returns_15m.replace([np.inf, -np.inf], np.nan)
             volatility_15m = returns_15m.rolling(20).std()
             
-            # 将15m数据对齐到原始时间框架
-            new_features['trend_15m'] = trend_15m.reindex(df_temp.index, method='ffill')
-            new_features['rsi_15m'] = rsi_15m.reindex(df_temp.index, method='ffill')
-            new_features['volatility_15m'] = volatility_15m.reindex(df_temp.index, method='ffill')
-            new_features['sma_20_15m'] = sma_20_15m.reindex(df_temp.index, method='ffill')
-            new_features['sma_50_15m'] = sma_50_15m.reindex(df_temp.index, method='ffill')
+            # 🔑 修复未来函数：shift(1)确保只使用上一根已收盘的15m K线数据
+            # 将15m数据对齐到原始时间框架（使用shift(1)避免未来数据泄露）
+            trend_15m_shifted = trend_15m.shift(1)
+            rsi_15m_shifted = rsi_15m.shift(1)
+            volatility_15m_shifted = volatility_15m.shift(1)
+            sma_20_15m_shifted = sma_20_15m.shift(1)
+            sma_50_15m_shifted = sma_50_15m.shift(1)
+            
+            new_features['trend_15m'] = trend_15m_shifted.reindex(df_temp.index, method='ffill')
+            new_features['rsi_15m'] = rsi_15m_shifted.reindex(df_temp.index, method='ffill')
+            new_features['volatility_15m'] = volatility_15m_shifted.reindex(df_temp.index, method='ffill')
+            new_features['sma_20_15m'] = sma_20_15m_shifted.reindex(df_temp.index, method='ffill')
+            new_features['sma_50_15m'] = sma_50_15m_shifted.reindex(df_temp.index, method='ffill')
             
             # 3. 趋势一致性特征（短中长周期是否一致）
             if 'sma_20' in df_temp.columns and 'sma_50' in df_temp.columns:

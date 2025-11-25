@@ -19,7 +19,7 @@ import asyncio
 from app.core.config import settings
 from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
-from app.services.binance_client import binance_client
+from app.exchange.binance_client import binance_client
 
 logger = logging.getLogger(__name__)
 

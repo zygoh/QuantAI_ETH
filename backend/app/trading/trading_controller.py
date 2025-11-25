@@ -10,10 +10,10 @@ from dataclasses import dataclass
 
 from app.core.config import settings
 from app.core.cache import cache_manager
-from app.services.trading_engine import TradingEngine, TradingMode
-from app.services.signal_generator import SignalGenerator, TradingSignal
-from app.services.position_manager import position_manager
-from app.services.ml_service import MLService
+from app.trading.trading_engine import TradingEngine, TradingMode
+from app.trading.signal_generator import SignalGenerator, TradingSignal
+from app.trading.position_manager import position_manager
+from app.model.ml_service import MLService
 from app.services.data_service import DataService
 
 logger = logging.getLogger(__name__)

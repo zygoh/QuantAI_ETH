@@ -9,7 +9,7 @@ import pandas as pd
 
 from app.core.config import settings
 from app.core.database import postgresql_manager
-from app.services.binance_client import binance_client
+from app.exchange.binance_client import binance_client
 
 logger = logging.getLogger(__name__)
 
@@ -80,42 +80,20 @@ class HistoricalDataManager:
             all_klines = []
             current_end_time = int(end_time.timestamp() * 1000)
             
-            for batch in range(batches):
-                try:
-                    # 获取一批数据
-                    klines = binance_client.get_klines(
+            # ✅ 统一使用分页方法（自动处理超过1500的情况）
+            all_klines = binance_client.get_klines_paginated(
                         symbol=symbol,
                         interval=interval,
-                        limit=self.batch_size,
-                        end_time=current_end_time
-                    )
-                    
-                    if not klines:
-                        break
-                    
-                    # 添加到总列表
-                    all_klines.extend(klines)
-                    
-                    # 更新时间范围
-                    current_end_time = klines[0]['timestamp'] - 1
-                    
-                    # 检查是否已经获取到足够的数据
-                    if klines[0]['timestamp'] < int(start_time.timestamp() * 1000):
-                        break
-                    
-                    logger.debug(f"批次 {batch + 1}/{batches} 完成: {len(klines)}条")
-                    
-                    # API限流
-                    await asyncio.sleep(self.rate_limit_delay)
-                    
-                except Exception as e:
-                    logger.error(f"获取批次数据失败: {e}")
-                    continue
+                limit=total_klines,
+                end_time=current_end_time,
+                rate_limit_delay=self.rate_limit_delay
+            )
             
-            # 过滤时间范围内的数据
+            # 过滤时间范围内的数据（因为分页方法可能获取了超出范围的数据）
+            start_time_ms = int(start_time.timestamp() * 1000)
             filtered_klines = [
                 kline for kline in all_klines
-                if kline['timestamp'] >= int(start_time.timestamp() * 1000)
+                if kline['timestamp'] >= start_time_ms
             ]
             
             # 按时间排序
@@ -224,8 +202,9 @@ class HistoricalDataManager:
             
             end_time_ms = int(end_time.timestamp() * 1000)
             
+            # ✅ 统一使用分页方法（自动处理超过1500的情况）
             # 获取最新数据（只到最后已完成的K线）
-            klines = binance_client.get_klines(
+            klines = binance_client.get_klines_paginated(
                 symbol=symbol,
                 interval=interval,
                 limit=limit,
