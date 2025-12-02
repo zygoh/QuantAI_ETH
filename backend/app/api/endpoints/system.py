@@ -5,6 +5,11 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from app.api.models import SystemResponse, SystemStatus, SystemControlRequest
 from app.api.dependencies import get_current_user
+from app.services.health_monitor import health_monitor
+from app.core.config import settings
+import platform
+import sys
+from app.core.cache import cache_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -94,7 +99,6 @@ async def get_system_health(current_user: str = Depends(get_current_user)):
         logger.info("获取系统健康状态")
         
         # 从健康监控服务获取状态
-        from app.services.health_monitor import health_monitor
         health_status = health_monitor.get_health_status()
         
         # 如果健康状态为空或过旧，立即执行一次检查
@@ -116,10 +120,6 @@ async def get_system_info(current_user: str = Depends(get_current_user)):
     """获取系统信息"""
     try:
         logger.info("获取系统信息")
-        
-        from app.core.config import settings
-        import platform
-        import sys
         
         system_info = {
             'application': {
@@ -242,7 +242,6 @@ async def get_cache_stats(current_user: str = Depends(get_current_user)):
     try:
         logger.info("获取缓存统计")
         
-        from app.core.cache import cache_manager
         stats = await cache_manager.get_cache_stats()
         
         return {

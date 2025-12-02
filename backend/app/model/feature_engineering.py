@@ -2,6 +2,7 @@
 特征工程模块
 """
 import logging
+import traceback
 from typing import Dict, List, Any, Optional
 import pandas as pd
 import numpy as np
@@ -371,7 +372,6 @@ class FeatureEngineer:
             
         except Exception as e:
             logger.error(f"❌ 特征工程失败: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             return df
     
@@ -939,7 +939,6 @@ class FeatureEngineer:
             
         except Exception as e:
             logger.error(f"❌ 添加市场微观结构特征失败: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             return df
     
@@ -1292,7 +1291,6 @@ class FeatureEngineer:
             
         except Exception as e:
             logger.error(f"❌ 添加市场情绪特征失败: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             return df
     
@@ -1433,7 +1431,6 @@ class FeatureEngineer:
             
         except Exception as e:
             logger.error(f"❌ 添加多时间框架特征失败: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             return df
     

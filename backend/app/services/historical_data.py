@@ -9,7 +9,7 @@ import pandas as pd
 
 from app.core.config import settings
 from app.core.database import postgresql_manager
-from app.exchange.binance_client import binance_client
+from app.exchange.exchange_factory import ExchangeFactory
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,8 @@ class HistoricalDataManager:
     def __init__(self):
         self.batch_size = 1000  # 每批获取的数据量
         self.rate_limit_delay = 0.1  # API调用间隔（秒）
+        # 🔑 获取交易所客户端（使用工厂模式，支持多交易所）
+        self.exchange_client = ExchangeFactory.get_current_client()
     
     async def fetch_all_historical_data(self, symbol: str, days: int = 30):
         """获取所有时间框架的历史数据"""
@@ -81,7 +83,7 @@ class HistoricalDataManager:
             current_end_time = int(end_time.timestamp() * 1000)
             
             # ✅ 统一使用分页方法（自动处理超过1500的情况）
-            all_klines = binance_client.get_klines_paginated(
+            all_klines = self.exchange_client.get_klines_paginated(
                         symbol=symbol,
                         interval=interval,
                 limit=total_klines,
@@ -204,7 +206,7 @@ class HistoricalDataManager:
             
             # ✅ 统一使用分页方法（自动处理超过1500的情况）
             # 获取最新数据（只到最后已完成的K线）
-            klines = binance_client.get_klines_paginated(
+            klines = self.exchange_client.get_klines_paginated(
                 symbol=symbol,
                 interval=interval,
                 limit=limit,

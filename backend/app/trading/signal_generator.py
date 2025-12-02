@@ -25,6 +25,11 @@ from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
 from app.model.ml_service import MLService
 from app.services.data_service import DataService, KlineData
+from app.exchange.exchange_factory import ExchangeFactory
+from app.utils.helpers import format_signal_type
+from app.services.risk_service import RiskService
+from app.trading.position_manager import position_manager
+import pytz
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +55,9 @@ class SignalGenerator:
         self.ml_service = ml_service
         self.data_service = data_service
         self.is_running = False
+        
+        # 🔑 获取交易所客户端（使用工厂模式）
+        self.exchange_client = ExchangeFactory.get_current_client()
         self.signal_callbacks: List[callable] = []
         self.last_signals: Dict[str, TradingSignal] = {}
         
@@ -128,8 +136,6 @@ class SignalGenerator:
     async def _initialize_kline_buffers(self):
         """初始化K线数据缓冲区 - 从API获取初始数据"""
         try:
-            from app.exchange.binance_client import binance_client
-            
             symbol = settings.SYMBOL
             logger.info(f"初始化WebSocket数据缓冲区: {symbol}")
             
@@ -144,7 +150,7 @@ class SignalGenerator:
                     
                     # ✅ 统一使用分页方法（自动处理超过1500的情况）
                     logger.info(f"获取 {timeframe} 初始数据（{buffer_size}条，覆盖{self.buffer_days}天）...")
-                    all_klines = binance_client.get_klines_paginated(
+                    all_klines = self.exchange_client.get_klines_paginated(
                             symbol=symbol,
                             interval=timeframe,
                         limit=buffer_size,
@@ -257,7 +263,6 @@ class SignalGenerator:
             signal = await self._try_synthesize_cached_signals(kline_data.symbol)
             
             if signal:
-                from app.utils.helpers import format_signal_type
                 logger.info(f"✅ 生成合成信号: {format_signal_type(signal.signal_type)} 置信度={signal.confidence:.4f}")
                 await self._process_signal(signal)
             else:
@@ -315,10 +320,6 @@ class SignalGenerator:
             
             # ✅ 写入数据库持久化（PostgreSQL + TimescaleDB）
             try:
-                from app.core.database import postgresql_manager
-                from datetime import datetime
-                import pytz
-                
                 # 直接使用 Binance 的时间戳（毫秒），不做任何转换
                 kline_dict = {
                     'symbol': kline_data.symbol,
@@ -337,7 +338,6 @@ class SignalGenerator:
                 }
                 
                 # 🚀 异步写入数据库（不等待完成，避免阻塞信号生成）
-                import asyncio
                 asyncio.create_task(postgresql_manager.write_kline_data([kline_dict]))
                 
                 # ✅ 简化日志输出（改为DEBUG级别，减少日志量）
@@ -376,7 +376,6 @@ class SignalGenerator:
                     prediction = await self._predict_single_timeframe(symbol, timeframe)
                     if prediction:
                         self.cached_predictions[timeframe] = prediction
-                        from app.utils.helpers import format_signal_type
                         logger.info(f"✅ {timeframe} 首次预测完成: {format_signal_type(prediction.get('signal_type'))} (置信度={prediction.get('confidence'):.4f})")
                     else:
                         logger.warning(f"⚠️ {timeframe} 首次预测返回空结果")
@@ -393,7 +392,6 @@ class SignalGenerator:
                 # 预热信号应该从实时WebSocket信号开始计数
                 signal = await self._try_synthesize_cached_signals(symbol)
                 if signal:
-                    from app.utils.helpers import format_signal_type
                     logger.info(f"✅ 生成初始信号: {format_signal_type(signal.signal_type)} 置信度={signal.confidence:.4f}")
                     logger.info(f"💡 首次信号不计入预热（预热从实时WebSocket信号开始）")
                 else:
@@ -407,8 +405,6 @@ class SignalGenerator:
     async def _predict_single_timeframe(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
         """预测单个时间框架"""
         try:
-            from app.exchange.binance_client import binance_client
-            
             # 确定需要的数据量（超短线策略：较短周期）
             prediction_days_config = {
                 '3m': 10,    # 10天=4800条（超短期）
@@ -432,7 +428,7 @@ class SignalGenerator:
             else:
                 # 从API获取（使用统一的分页方法）
                 logger.debug(f"⚠️ 缓冲区不足，从API获取: {timeframe} (需要{required_klines}条)")
-                klines = binance_client.get_klines_paginated(
+                klines = self.exchange_client.get_klines_paginated(
                     symbol=symbol,
                     interval=timeframe,
                     limit=required_klines
@@ -521,7 +517,6 @@ class SignalGenerator:
                 logger.info(f"✗ 信号已存在，拒绝重复: {signal.signal_type} {signal.confidence:.4f}")
                 return None
             
-            from app.utils.helpers import format_signal_type
             logger.info(f"✅ 生成新交易信号: {format_signal_type(signal.signal_type)} 置信度:{signal.confidence:.4f}")
             return signal
             
@@ -532,8 +527,6 @@ class SignalGenerator:
     async def _get_multi_timeframe_predictions(self, symbol: str) -> Dict[str, Dict[str, Any]]:
         """获取多时间框架预测 - 使用固定天数确保时间对齐"""
         try:
-            from app.exchange.binance_client import binance_client
-            
             predictions = {}
             
             # ✅ 差异化预测天数：每个时间框架使用最优配置
@@ -568,7 +561,7 @@ class SignalGenerator:
                 else:
                     # 缓冲区数据不足，从API获取（使用统一的分页方法）
                     logger.debug(f"⚠️ 缓冲区数据不足({len(self.kline_buffers.get(timeframe, []))}条 < {required_klines}条)，从API获取: {timeframe} (需要{required_klines}条)")
-                    klines = binance_client.get_klines_paginated(
+                    klines = self.exchange_client.get_klines_paginated(
                         symbol=symbol,
                         interval=timeframe,
                         limit=required_klines
@@ -665,7 +658,6 @@ class SignalGenerator:
             confidence = weighted_scores[signal_type]
             
             # 记录合成过程
-            from app.utils.helpers import format_signal_type
             logger.info(f"🔄 信号合成: {len(predictions)}个时间框架")
             for tf, pred in predictions.items():
                 logger.info(f"  • {tf}: {format_signal_type(pred['signal_type'])} (置信度={pred['confidence']:.4f})")
@@ -695,7 +687,6 @@ class SignalGenerator:
                 return None
             
             # 🆕 使用动态止损止盈（基于ATR）
-            from app.services.risk_service import RiskService
             stop_levels = await RiskService.calculate_dynamic_stop_levels(
                 symbol=symbol,
                 entry_price=current_price,
@@ -719,7 +710,6 @@ class SignalGenerator:
             
             # 🆕 统一使用 position_manager 计算仓位大小（USDT价值）
             # 从 Redis 读取当前交易模式（支持动态切换）
-            from app.trading.position_manager import position_manager
             current_mode = await cache_manager.get("system:trading_mode")
             is_virtual_mode = (current_mode != "AUTO")  # 默认虚拟模式，只有明确是 AUTO 才用实盘
             
@@ -759,8 +749,6 @@ class SignalGenerator:
     async def _get_current_price(self, symbol: str) -> Optional[float]:
         """获取当前价格 - 直接从API获取实时价格"""
         try:
-            from app.exchange.binance_client import binance_client
-            
             # 优先从缓存获取最新价格（缓存是WebSocket实时更新的）
             ticker_data = await cache_manager.get_market_data(symbol, "ticker")
             
@@ -771,7 +759,7 @@ class SignalGenerator:
             # 缓存失效时，直接从API获取最新价格
             logger.debug(f"从API获取实时价格: {symbol}")
             # ✅ 统一使用分页方法（limit=1时自动调用单次获取，不影响性能）
-            klines = binance_client.get_klines_paginated(symbol, '1m', limit=1)
+            klines = self.exchange_client.get_klines_paginated(symbol, '1m', limit=1)
             
             if klines and len(klines) > 0:
                 price = float(klines[0]['close'])
@@ -792,7 +780,6 @@ class SignalGenerator:
         """检查是否应该发送信号 - 基于缓存的上一次信号去重"""
         try:
             # 从缓存获取上一次的信号
-            from app.core.cache import cache_manager
             last_signal = await cache_manager.get_trading_signal(symbol)
             
             # 如果没有缓存的信号，直接发送
@@ -824,7 +811,6 @@ class SignalGenerator:
             # 注意：signal_counter已在_on_new_data中+1，这里不再重复
             
             if self.signal_counter <= self.warmup_signals:
-                from app.utils.helpers import format_signal_type
                 logger.warning(f"⚠️ 预热信号 [{self.signal_counter}/{self.warmup_signals}]：仅记录，不执行交易")
                 logger.info(f"   信号详情: {format_signal_type(signal.signal_type)} 置信度={signal.confidence:.4f} 入场={signal.entry_price:.2f}")
                 
@@ -835,7 +821,6 @@ class SignalGenerator:
                 return  # 🔒 直接返回，不执行后续交易逻辑
             
             # ✅ 预热完成，正式交易信号
-            from app.utils.helpers import format_signal_type
             logger.info(f"🚀 正式交易信号 (第{self.signal_counter}个): {format_signal_type(signal.signal_type)} 置信度={signal.confidence:.4f}")
             
             # 更新最后信号记录
@@ -1039,8 +1024,6 @@ class SignalGenerator:
             # 5. 信号频率限制（动态限制，基于主时间框架）
             # 超短线策略需要在保持灵活性的同时避免过度交易
             try:
-                from app.core.config import settings
-                
                 # 🔑 基于时间框架的动态限制策略
                 # 计算逻辑：1小时内的K线数 × 合理触发率
                 timeframe_limits = {
@@ -1116,8 +1099,6 @@ class SignalGenerator:
     async def _load_warmup_state(self):
         """从Redis加载预热状态（持久化，避免重启/重训练后重新预热）"""
         try:
-            from app.core.cache import cache_manager
-            
             # 从Redis加载信号计数器
             cached_counter = await cache_manager.get(f"warmup:signal_counter:{settings.SYMBOL}")
             
@@ -1138,8 +1119,6 @@ class SignalGenerator:
     async def _save_warmup_state(self):
         """保存预热状态到Redis（无过期时间，永久保存）"""
         try:
-            from app.core.cache import cache_manager
-            
             # 保存信号计数器到Redis（不过期）
             await cache_manager.set(
                 f"warmup:signal_counter:{settings.SYMBOL}",

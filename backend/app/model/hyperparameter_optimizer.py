@@ -4,6 +4,7 @@
 
 import logging
 import gc
+import traceback
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from datetime import datetime
@@ -587,16 +588,16 @@ class HyperparameterOptimizer:
         
         # 获取搜索空间
         try:
-        if self.model_type == "lightgbm":
-            params = self._get_lightgbm_search_space(trial)
-        elif self.model_type == "xgboost":
-            params = self._get_xgboost_search_space(trial)
-        elif self.model_type == "catboost":
-            params = self._get_catboost_search_space(trial)
-        elif self.model_type == "informer2":
-            params = self._get_informer2_search_space(trial)
-        else:
-            raise ValueError(f"不支持的模型类型: {self.model_type}")
+            if self.model_type == "lightgbm":
+                params = self._get_lightgbm_search_space(trial)
+            elif self.model_type == "xgboost":
+                params = self._get_xgboost_search_space(trial)
+            elif self.model_type == "catboost":
+                params = self._get_catboost_search_space(trial)
+            elif self.model_type == "informer2":
+                params = self._get_informer2_search_space(trial)
+            else:
+                raise ValueError(f"不支持的模型类型: {self.model_type}")
             
             # ✅ 详细日志：记录所有超参数
             logger.info(f"📋 Trial {trial.number} 超参数配置:")
@@ -608,7 +609,6 @@ class HyperparameterOptimizer:
         except Exception as e:
             logger.error(f"❌ Trial {trial.number}: 获取搜索空间失败: {e}")
             logger.error(f"   错误类型: {type(e).__name__}")
-            import traceback
             logger.error(f"   堆栈跟踪:\n{traceback.format_exc()}")
             raise
         
@@ -818,7 +818,6 @@ class HyperparameterOptimizer:
                     except Exception as e:
                         logger.error(f"❌ XGBoost训练失败: {e}")
                         logger.error(f"   XGBoost版本: {xgb.__version__}")
-                        import traceback
                         logger.error(traceback.format_exc())
                         
                         # 降级到CPU重试
@@ -866,7 +865,6 @@ class HyperparameterOptimizer:
                             logger.info(f"✅ XGBoost降级到CPU后训练成功")
                         except Exception as e2:
                             logger.error(f"❌ XGBoost CPU降级也失败: {e2}")
-                            import traceback
                             logger.error(traceback.format_exc())
                             raise
                         
@@ -1512,19 +1510,6 @@ class HyperparameterOptimizer:
                                         if (i + 1) % (accumulation_steps * 100) == 0:
                                             stats = scaler_monitor.get_statistics()
                                             logger.debug(f"📊 Scale统计: 当前={stats['current_scale']:.2f}, 平均={stats['avg_scale']:.2f}, 最大={stats['max_scale']:.2f}")
-                                            backoff_factor=0.5,     # 检测到溢出时回退
-                                            growth_interval=2000,   # 更谨慎的增长间隔（从1000增加）
-                                            enabled=True
-                                        )
-                                        logger.warning(
-                                            f"   缩放器已强制重置: {current_scale:.2f} -> {new_init_scale:.2f} "
-                                            f"(模型参数: {num_params/1e6:.1f}M)"
-                                        )
-                                    elif current_scale > 1e5:  # 警告阈值：记录日志
-                                        logger.warning(
-                                            f"⚠️ Trial {trial.number} Fold {fold_idx+1} Epoch {epoch+1} Batch {i+1}: "
-                                            f"缩放器scale较大 ({current_scale:.2f})，持续监控中"
-                                        )
                                 else:
                                     optimizer.step()
                                 
@@ -1625,7 +1610,6 @@ class HyperparameterOptimizer:
                 fold_fail_count += 1
                 # ✅ 提升日志级别并添加详细错误信息
                 logger.error(f"❌ Trial {trial.number} Fold {fold_idx+1} 失败: {e}")
-                import traceback
                 logger.error(f"   错误详情: {traceback.format_exc()}")
                 # 失败的trial返回很差的分数
                 cv_scores.append(0.0)

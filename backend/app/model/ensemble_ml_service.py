@@ -37,7 +37,7 @@ from app.services.direction_consistency_checker import TradingDirectionConsisten
 from app.services.adaptive_frequency_controller import AdaptiveFrequencyController, FrequencyControl
 from app.model.model_stability_enhancer import ModelStabilityEnhancer
 from app.utils.helpers import format_signal_type
-from app.exchange.binance_client import binance_client
+from app.exchange.exchange_factory import ExchangeFactory
 
 logger = logging.getLogger(__name__)
 
@@ -324,8 +324,8 @@ class EnsembleMLService(MLService):
             
             logger.info(f"📥 获取{timeframe}数据（×{days_multiplier}倍）: {required_klines}条K线 ({training_days}天)")
             
-            # ✅ 统一使用分页方法（自动处理超过1500的情况）
-            all_klines = binance_client.get_klines_paginated(
+            # ✅ 统一使用分页方法（自动处理超过1500的情况，支持多交易所）
+            all_klines = self.exchange_client.get_klines_paginated(
                 symbol=symbol,
                 interval=timeframe,
                 limit=required_klines,
@@ -334,6 +334,12 @@ class EnsembleMLService(MLService):
             
             # 转换为DataFrame（不依赖reverse，直接用时间戳排序）
             df = pd.DataFrame(all_klines)
+            
+            # 🔧 检查数据是否为空（防止 KeyError: 'timestamp'）
+            if df.empty:
+                logger.warning(f"⚠️ {timeframe} 数据为空，无法准备训练数据")
+                return pd.DataFrame()
+            
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             
             # 🔑 关键：依赖时间戳排序，而不是假设API返回顺序
@@ -1148,7 +1154,7 @@ class EnsembleMLService(MLService):
                 long_to_short = 0
                 short_to_long = 0
             
-            # 🆕 信号质量分析
+            # 🆕 信号质量分析（使用测试集，因为ensemble_pred是对测试集的预测）
             signal_mask = ensemble_pred != 1  # 非HOLD预测
             signal_count = int(np.sum(signal_mask))
             signal_frequency = float(np.mean(signal_mask))
@@ -1156,16 +1162,18 @@ class EnsembleMLService(MLService):
             
             # 只在有信号时计算信号准确率
             if signal_count > 0:
-                signal_labels = meta_labels_val[signal_mask]
+                # 🔧 修复：使用meta_labels_test而不是meta_labels_val（因为ensemble_pred是对测试集的预测）
+                signal_labels = meta_labels_test[signal_mask]
                 signal_preds = ensemble_pred[signal_mask]
                 # 信号准确率：只看LONG/SHORT的预测准确率
                 signal_accuracy = float(accuracy_score(signal_labels, signal_preds))
             else:
                 signal_accuracy = 0.0
             
-            # 🆕 概率校准指标
+            # 🆕 概率校准指标（使用测试集，因为ensemble_proba是对测试集的预测）
             try:
-                log_loss_score = float(log_loss(meta_labels_val, ensemble_proba))
+                # 🔧 修复：使用meta_labels_test而不是meta_labels_val（因为ensemble_proba是对测试集的预测）
+                log_loss_score = float(log_loss(meta_labels_test, ensemble_proba))
             except Exception as e:
                 logger.warning(f"⚠️ Log Loss计算失败: {e}")
                 log_loss_score = 0.0
@@ -1181,11 +1189,11 @@ class EnsembleMLService(MLService):
             cv_min = float(np.min(cv_scores))
             cv_max = float(np.max(cv_scores))
             
-            # 基础模型一致性
+            # 基础模型一致性（使用验证集预测结果）
             model_agreement = float(np.mean([
-                (lgb_pred == xgb_pred).mean(),
-                (lgb_pred == cat_pred).mean(),
-                (xgb_pred == cat_pred).mean()
+                (lgb_pred_val == xgb_pred_val).mean(),
+                (lgb_pred_val == cat_pred_val).mean(),
+                (xgb_pred_val == cat_pred_val).mean()
             ]))
             
             # 🆕 交易经济性指标
@@ -1208,12 +1216,13 @@ class EnsembleMLService(MLService):
                 confidence_q75 = 0.0
                 confidence_q90 = 0.0
             
-            # 高置信度预测的准确率
+            # 高置信度预测的准确率（使用测试集，因为ensemble_pred是对测试集的预测）
             try:
                 high_confidence_mask = confidence_values > 0.7
                 if np.sum(high_confidence_mask) > 0:
+                    # 🔧 修复：使用meta_labels_test而不是meta_labels_val（因为ensemble_pred是对测试集的预测）
                     high_confidence_accuracy = float(accuracy_score(
-                        meta_labels_val[high_confidence_mask],
+                        meta_labels_test[high_confidence_mask],
                         ensemble_pred[high_confidence_mask]
                     ))
                     high_confidence_ratio = float(np.mean(high_confidence_mask))
@@ -1239,13 +1248,14 @@ class EnsembleMLService(MLService):
                 short_ratio = 0.0
                 long_ratio = 0.0
             
-            # 🆕 错误严重性加权指标
+            # 🆕 错误严重性加权指标（使用测试集，因为ensemble_pred是对测试集的预测）
             try:
                 fatal_weight = 3.0
-                total_errors = len(meta_labels_val) - np.sum(ensemble_pred == meta_labels_val)
+                # 🔧 修复：使用meta_labels_test而不是meta_labels_val（因为ensemble_pred是对测试集的预测）
+                total_errors = len(meta_labels_test) - np.sum(ensemble_pred == meta_labels_test)
                 normal_errors = max(0, total_errors - fatal_errors)  # 确保非负
-                if len(meta_labels_val) > 0:
-                    weighted_error_rate = float((fatal_errors * fatal_weight + normal_errors) / (len(meta_labels_val) * fatal_weight))
+                if len(meta_labels_test) > 0:
+                    weighted_error_rate = float((fatal_errors * fatal_weight + normal_errors) / (len(meta_labels_test) * fatal_weight))
                 else:
                     weighted_error_rate = 0.0
                 fatal_error_ratio_in_errors = float(fatal_errors / total_errors if total_errors > 0 else 0)

@@ -8,6 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.api.models import SignalsResponse, TradingSignal, SignalRequest
 from app.api.dependencies import get_current_user
 from app.core.config import settings
+from app.core.database import postgresql_manager
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -195,7 +197,6 @@ async def get_signal_statistics(
         end_time = datetime.now()
         start_time = end_time - timedelta(days=days)
         
-        from app.core.database import postgresql_manager
         signals = await postgresql_manager.query_signals(
             query_symbol, start_time, end_time, limit=1000
         )
@@ -253,7 +254,6 @@ async def get_model_prediction(
             raise HTTPException(status_code=404, detail="无法获取市场数据")
         
         # 转换为DataFrame
-        import pandas as pd
         df = pd.DataFrame(latest_data)
         
         # 模型预测

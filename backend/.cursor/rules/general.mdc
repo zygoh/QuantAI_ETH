@@ -287,6 +287,14 @@ class ClassName:
 
 ---
 
+## 🌐 Multi-Exchange Compatibility Standards
+
+### Critical Requirement: Multi-Exchange Support
+
+**Critical Rule**: **ALL code that processes exchange data MUST support multiple exchanges (Binance, OKX, etc.) without hardcoding exchange-specific logic. Use automatic format detection by field names (`s`/`c` for Binance, `instId`/`last` for OKX) and always use `SymbolMapper` for symbol format conversion. WebSocket callbacks MUST use `asyncio.run_coroutine_threadsafe()` instead of `asyncio.create_task()`.**
+
+---
+
 ## 🔍 Error Handling Standards
 
 ### Comprehensive Error Management
@@ -426,6 +434,7 @@ if not (min_val <= value <= max_val):
 - [ ] Proper separation of concerns
 - [ ] Error handling implemented
 - [ ] Performance requirements met
+- [ ] Multi-exchange compatibility verified (no hardcoded exchange logic)
 
 ---
 
@@ -596,11 +605,12 @@ if not (min_val <= value <= max_val):
 8. **Testing**: Complete test coverage
 9. **Code Review**: Follow checklist before commits
 10. **Architecture**: Single responsibility and loose coupling
-11. **Professional Standards**: Zero tolerance for low-level errors
+11. **Multi-Exchange Compatibility**: Automatic format detection, no hardcoded exchange logic (CRITICAL)
+12. **Professional Standards**: Zero tolerance for low-level errors
 
 ---
 
-**Version**: v10.1  
-**Last Update**: 2025-10-30  
-**Focus**: Development standards, code quality, Windows PowerShell, and indentation rules  
+**Version**: v10.2  
+**Last Update**: 2025-12-02  
+**Focus**: Development standards, code quality, Windows PowerShell, indentation rules, and multi-exchange compatibility  
 **Scope**: All project files and modules

@@ -40,7 +40,7 @@ log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 # 创建文件处理器（支持日志轮转，单文件最大10MB，保留5个备份）
 file_handler = RotatingFileHandler(
     log_file,
-    maxBytes=10*1024*1024,  # 10MB
+    maxBytes=10 * 1024 * 1024,  # 10MB
     backupCount=5,
     encoding='utf-8'
 )
@@ -76,23 +76,24 @@ signal_generator = None
 trading_controller = None
 scheduler = None
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     global data_service, ml_service, trading_engine, risk_service
     global signal_generator, trading_controller, scheduler
-    
+
     logger.info("启动ETH合约中频智能交易系统...")
-    
+
     try:
         # 初始化数据库
         await init_database()
         logger.info("数据库初始化完成")
-        
+
         # 清理旧数据（必须在启动时完成，避免新旧数据混合）
         await cleanup_database()
         logger.info("数据库清理完成")
-        
+
         # 初始化服务
         data_service = DataService()
         ml_service = ensemble_ml_service  # 🆕 使用Stacking集成ML服务
@@ -103,10 +104,10 @@ async def lifespan(app: FastAPI):
             trading_engine, signal_generator, ml_service, data_service
         )
         scheduler = TaskScheduler(ml_service, data_service, signal_generator)  # 🔥 传入signal_generator
-        
+
         # 设置API端点的服务依赖
         from app.api.endpoints import account, positions, signals, trading, training, performance, system, websocket
-        
+
         account.set_data_service(data_service)
         positions.set_data_service(data_service)
         signals.set_services(signal_generator, ml_service, data_service)
@@ -115,55 +116,55 @@ async def lifespan(app: FastAPI):
         performance.set_services(risk_service, trading_controller)
         system.set_services(trading_controller, scheduler)
         websocket.set_services(data_service, signal_generator, trading_controller)
-        
+
         # 启动数据服务
         await data_service.start()
         logger.info("数据服务启动完成")
-        
+
         # 启动机器学习服务
         await ml_service.start()
         logger.info("机器学习服务启动完成")
-        
+
         # 启动交易引擎
         await trading_engine.start()
         logger.info("交易引擎启动完成")
-        
+
         # 启动信号生成器
         await signal_generator.start()
         logger.info("信号生成器启动完成")
-        
+
         # 启动回撤监控
         await drawdown_monitor.start()
         logger.info("回撤监控启动完成")
-        
+
         # 启动任务调度器
         await scheduler.start()
         logger.info("任务调度器启动完成")
-        
+
         # 启动健康监控服务（由scheduler在每天00:00执行）
         health_monitor.set_signal_generator(signal_generator)
         await health_monitor.start()
         logger.info("健康监控服务启动完成（检查时间: 每天00:00）")
-        
+
         # 启动WebSocket推送任务
         from app.api.endpoints.websocket import start_websocket_tasks, on_signal_generated, on_risk_alert
         await start_websocket_tasks()
-        
+
         # 注册回调函数
         signal_generator.add_signal_callback(on_signal_generated)
         drawdown_monitor.add_alert_callback(on_risk_alert)
-        
+
         logger.info("系统启动完成")
-        
+
         yield
-        
+
     except Exception as e:
         logger.error(f"系统启动失败: {e}")
         raise
     finally:
         # 清理资源
         logger.info("正在关闭系统...")
-        
+
         if health_monitor:
             await health_monitor.stop()
         if scheduler:
@@ -178,11 +179,12 @@ async def lifespan(app: FastAPI):
             await ml_service.stop()
         if data_service:
             await data_service.stop()
-        
+
         # 关闭数据库连接
         await close_database()
-            
+
         logger.info("系统关闭完成")
+
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -214,6 +216,7 @@ try:
 except Exception:
     logger.warning("前端静态文件目录不存在，跳过挂载")
 
+
 @app.get("/health")
 async def health_check():
     """健康检查端点"""
@@ -227,6 +230,7 @@ async def health_check():
             "scheduler": scheduler.is_running if scheduler else False,
         }
     }
+
 
 if __name__ == "__main__":
     # 禁用自动重载（避免日志文件触发频繁重载）

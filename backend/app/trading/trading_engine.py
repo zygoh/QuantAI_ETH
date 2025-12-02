@@ -12,7 +12,7 @@ import uuid
 from app.core.config import settings
 from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
-from app.exchange.binance_client import binance_client
+from app.exchange.exchange_factory import ExchangeFactory
 from app.trading.signal_generator import TradingSignal
 
 logger = logging.getLogger(__name__)
@@ -90,6 +90,9 @@ class TradingEngine:
         
         # 🔑 保存 data_service 引用（用于注册价格回调）
         self.data_service = data_service
+        
+        # 🔑 获取交易所客户端（使用工厂模式）
+        self.exchange_client = ExchangeFactory.get_current_client()
         
         # 从配置文件读取默认交易模式
         default_mode = settings.TRADING_MODE
@@ -307,8 +310,8 @@ class TradingEngine:
             # 生成客户端订单ID
             client_order_id = f"ETH_TRADING_{int(datetime.now().timestamp() * 1000)}"
             
-            # 调用Binance API下单
-            api_result = binance_client.place_order(
+            # 调用交易所API下单
+            api_result = self.exchange_client.place_order(
                 symbol=symbol,
                 side=side.value,
                 order_type=order_type.value,
@@ -378,7 +381,7 @@ class TradingEngine:
                 }
             
             # 调用API撤销订单
-            api_result = binance_client.cancel_order(order.symbol, int(order.order_id))
+            api_result = self.exchange_client.cancel_order(order.symbol, order.order_id)
             
             if api_result:
                 # 更新订单状态
@@ -463,7 +466,7 @@ class TradingEngine:
         """取消止损止盈订单"""
         try:
             # 获取未成交订单
-            open_orders = binance_client.get_open_orders(symbol)
+            open_orders = self.exchange_client.get_open_orders(symbol)
             
             for order_data in open_orders:
                 order_type = order_data.get('type', '')
@@ -471,7 +474,7 @@ class TradingEngine:
                 if order_type in ['STOP_MARKET', 'TAKE_PROFIT_MARKET']:
                     order_id = order_data.get('orderId')
                     if order_id:
-                        binance_client.cancel_order(symbol, order_id)
+                        self.exchange_client.cancel_order(symbol, str(order_id))
             
             logger.info(f"止损止盈订单已取消: {symbol}")
             
@@ -488,9 +491,12 @@ class TradingEngine:
             
             # 获取当前价格（用于虚拟成交）
             try:
-                from app.exchange.binance_client import binance_client
-                ticker = binance_client.get_ticker_price(symbol)
-                current_price = float(ticker['price'])
+                ticker = self.exchange_client.get_ticker_price(symbol)
+                if ticker:
+                    current_price = float(ticker.price)
+                else:
+                    current_price = signal.entry_price
+                    logger.warning(f"无法获取实时价格，使用信号价格: {current_price}")
             except:
                 current_price = signal.entry_price
                 logger.warning(f"无法获取实时价格，使用信号价格: {current_price}")
@@ -801,7 +807,7 @@ class TradingEngine:
                 }
             
             # 检查账户余额
-            account_info = binance_client.get_account_info()
+            account_info = self.exchange_client.get_account_info()
             available_balance = float(account_info.get('available_balance', 0))
             
             if available_balance <= 0:
@@ -811,7 +817,7 @@ class TradingEngine:
                 }
             
             # 检查置信度
-            if signal.confidence < self.confidence_threshold:
+            if signal.confidence < settings.CONFIDENCE_THRESHOLD:
                 return {
                     'allowed': False,
                     'reason': f'信号置信度不足: {signal.confidence} < {settings.CONFIDENCE_THRESHOLD}'
@@ -832,7 +838,7 @@ class TradingEngine:
     async def _get_position(self, symbol: str) -> Optional[Position]:
         """获取持仓信息"""
         try:
-            positions = binance_client.get_position_info(symbol)
+            positions = self.exchange_client.get_position_info(symbol)
             
             if positions:
                 pos_data = positions[0]
@@ -863,7 +869,7 @@ class TradingEngine:
         """加载订单和持仓"""
         try:
             # 从API获取未成交订单
-            open_orders = binance_client.get_open_orders()
+            open_orders = self.exchange_client.get_open_orders()
             
             for order_data in open_orders:
                 order = Order(

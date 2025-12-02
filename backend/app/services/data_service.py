@@ -12,9 +12,11 @@ from dataclasses import dataclass
 from app.core.config import settings
 from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
-from app.exchange.binance_client import binance_client, binance_ws_client
+from app.exchange.exchange_factory import ExchangeFactory
+from app.exchange.mappers import SymbolMapper
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class KlineData:
@@ -33,6 +35,7 @@ class KlineData:
     taker_buy_base_volume: float = 0.0  # ✅ 主动买入成交量
     taker_buy_quote_volume: float = 0.0  # ✅ 主动买入成交额
     is_closed: bool = False  # 🔑 K线是否完成（修复预测频率问题）
+
 
 class DataService:
     """数据获取服务"""
@@ -60,24 +63,39 @@ class DataService:
         self._last_connection_state = False  # 上次连接状态
         self._monitor_task = None  # 监控任务
         
+        # 🔑 获取交易所客户端（使用工厂模式）
+        self.exchange_client = ExchangeFactory.get_current_client()
+
+        # 🔑 WebSocket客户端（根据交易所类型动态获取）
+        self.ws_client = None
+
     async def start(self):
         """启动数据服务"""
         try:
             logger.info("启动数据获取服务...")
             
-            # ✅ 显式输出Binance客户端初始化状态（确保日志可见）
-            logger.info(f"✅ Binance客户端初始化完成")
-            logger.info(f"   - 模式: {'测试网' if binance_client.testnet else '生产环境'}")
-            logger.info(f"   - REST URL: {binance_client.base_url}")
-            logger.info(f"   - API Key 长度: {len(binance_client.api_key) if binance_client.api_key else 0} 字符")
-            logger.info(f"   - API Key (前8位): {binance_client.api_key[:8] if binance_client.api_key and len(binance_client.api_key) >= 8 else 'N/A'}...")
+            # ✅ 显式输出交易所客户端初始化状态（确保日志可见）
+            exchange_type = settings.EXCHANGE_TYPE
+            logger.info(f"✅ {exchange_type}客户端初始化完成")
+            logger.info(f"   - 交易所类型: {exchange_type}")
             
             # 🔥 保存当前事件循环（用于WebSocket回调）
             self.loop = asyncio.get_running_loop()
             
             # 测试API连接
-            if not await binance_client.test_connection():
-                raise Exception("Binance API连接失败")
+            if not await self.exchange_client.test_connection():
+                raise Exception(f"{exchange_type} API连接失败")
+
+            # 🔑 根据交易所类型初始化WebSocket客户端
+            if exchange_type == "BINANCE":
+                from app.exchange.binance_client import binance_ws_client
+                self.ws_client = binance_ws_client
+            elif exchange_type == "OKX":
+                from app.exchange.okx_client import OKXWebSocketClient
+                self.ws_client = OKXWebSocketClient()
+            else:
+                logger.warning(f"⚠️ {exchange_type}暂不支持WebSocket，仅使用REST API")
+                self.ws_client = None
             
             # 设置杠杆
             await self._setup_leverage()
@@ -95,7 +113,10 @@ class DataService:
             self.is_running = True
             
             # 启动WebSocket连接监控（检测重连事件）
-            self._last_connection_state = binance_ws_client.is_connected
+            if self.ws_client and hasattr(self.ws_client, 'is_connected'):
+                self._last_connection_state = self.ws_client.is_connected
+            else:
+                self._last_connection_state = False
             self._monitor_task = asyncio.create_task(self._monitor_websocket_connection())
             
             logger.info("数据获取服务启动完成")
@@ -120,7 +141,8 @@ class DataService:
                     pass
             
             # 停止WebSocket连接
-            binance_ws_client.stop_websocket()
+            if self.ws_client and hasattr(self.ws_client, 'stop_websocket'):
+                self.ws_client.stop_websocket()
             
             logger.info("数据获取服务已停止")
             
@@ -135,14 +157,14 @@ class DataService:
             
             # 尝试修改保证金模式为全仓（可能已经是全仓模式，失败不影响）
             try:
-                binance_client.change_margin_type(symbol, "CROSSED")
+                self.exchange_client.change_margin_type(symbol, "CROSSED")
                 logger.info(f"✓ 保证金模式设置成功: {symbol} CROSSED")
             except Exception as e:
                 logger.warning(f"⚠️ 保证金模式设置失败（可能已是全仓模式，可忽略）: {e}")
             
             # 设置杠杆倍数
             try:
-                result = binance_client.change_leverage(symbol, leverage)
+                result = self.exchange_client.change_leverage(symbol, leverage)
                 if result:
                     logger.info(f"✓ 杠杆设置成功: {symbol} {leverage}x")
                 else:
@@ -156,18 +178,28 @@ class DataService:
     async def _start_websocket(self):
         """启动WebSocket连接"""
         try:
+            if not self.ws_client:
+                logger.warning("⚠️ WebSocket客户端未初始化，跳过WebSocket连接")
+                return
+
             # 🔥 传递事件循环给WebSocket客户端（用于重连）
-            binance_ws_client.loop = asyncio.get_running_loop()
+            if hasattr(self.ws_client, 'loop'):
+                self.ws_client.loop = asyncio.get_running_loop()
             
-            binance_ws_client.start_websocket()
+            # 启动WebSocket连接
+            if hasattr(self.ws_client, 'start_websocket'):
+                self.ws_client.start_websocket()
+            else:
+                logger.warning("⚠️ WebSocket客户端不支持start_websocket方法")
+                return
             
             # 等待连接建立
             for i in range(10):
-                if binance_ws_client.is_connected:
+                if hasattr(self.ws_client, 'is_connected') and self.ws_client.is_connected:
                     break
                 await asyncio.sleep(1)
             
-            if not binance_ws_client.is_connected:
+            if hasattr(self.ws_client, 'is_connected') and not self.ws_client.is_connected:
                 raise Exception("WebSocket连接超时")
                 
         except Exception as e:
@@ -177,20 +209,28 @@ class DataService:
     async def _subscribe_data_streams(self):
         """订阅数据流"""
         try:
+            if not self.ws_client:
+                logger.warning("⚠️ WebSocket客户端未初始化，跳过数据流订阅")
+                return
+
             symbol = settings.SYMBOL
             timeframes = settings.TIMEFRAMES
             
             # 订阅K线数据
             for interval in timeframes:
-                binance_ws_client.subscribe_kline(
-                    symbol, 
-                    interval, 
-                    self._on_kline_data
-                )
-                self.subscriptions[f"{symbol}_{interval}"] = True
+                if hasattr(self.ws_client, 'subscribe_kline'):
+                    self.ws_client.subscribe_kline(
+                        symbol, 
+                        interval, 
+                        self._on_kline_data
+                    )
+                    self.subscriptions[f"{symbol}_{interval}"] = True
+                else:
+                    logger.warning(f"⚠️ WebSocket客户端不支持subscribe_kline方法")
             
             # 订阅价格变动数据
-            binance_ws_client.subscribe_ticker(symbol, self._on_ticker_data)
+            if hasattr(self.ws_client, 'subscribe_ticker'):
+                self.ws_client.subscribe_ticker(symbol, self._on_ticker_data)
             
             logger.info(f"数据流订阅完成: {symbol} {timeframes}")
             
@@ -199,7 +239,6 @@ class DataService:
             raise
     
     def _on_kline_data(self, data: Dict[str, Any]):
-        
         """
         处理K线数据
         {
@@ -227,7 +266,6 @@ class DataService:
             }
         }
         """
-
         try:
             kline_data = data.get('data', data)
             
@@ -317,8 +355,8 @@ class DataService:
                 volume=volume,
                 quote_volume=float(k['q']),
                 trades=int(k['n']),
-                taker_buy_base_volume=float(k.get('V', 0)),    # ✅ 主动买入量
-                taker_buy_quote_volume=float(k.get('Q', 0)),   # ✅ 主动买入额
+                taker_buy_base_volume=float(k.get('V', 0)),  # ✅ 主动买入量
+                taker_buy_quote_volume=float(k.get('Q', 0)),  # ✅ 主动买入额
                 is_closed=True  # 🔑 K线已完成（只处理已完成的K线）
             )
             
@@ -336,18 +374,111 @@ class DataService:
         except Exception as e:
             logger.error(f"❌ 处理K线数据失败: {e}", exc_info=True)
     
-    def _on_ticker_data(self, data: Dict[str, Any]):
-        """处理价格变动数据"""
+
+    def _on_ticker_data(self, data: Any):
+        """
+        处理价格变动数据（支持多交易所格式）
+        
+        Args:
+            data: WebSocket返回的数据，格式因交易所而异：
+                  - Binance: {"e":"24hrTicker", "s":"ETHUSDT", "c":"2000.5", ...} 或 {"stream":"...", "data":{...}}
+                  - OKX: [{"instId": "ETH-USDT-SWAP", "last": "2000.5", ...}] 或 {"data": [...]}
+        """
         try:
-            ticker_data = data.get('data', {})
-            if not ticker_data:
+            ticker_item = None
+            symbol = None
+            price = None
+            
+            # 🔧 步骤1: 提取ticker数据项（处理不同数据结构）
+            if isinstance(data, list):
+                # OKX格式：直接传递的列表
+                if not data:
+                    return
+                ticker_item = data[0]
+            elif isinstance(data, dict):
+                # 检查是否是Binance多流订阅格式: {"stream":"...", "data":{...}}
+                if 'data' in data and isinstance(data['data'], dict):
+                    # Binance多流格式：使用data字段
+                    ticker_item = data['data']
+                elif 'data' in data and isinstance(data['data'], list):
+                    # OKX格式：包含data数组的字典
+                    if not data['data']:
+                        return
+                    ticker_item = data['data'][0]
+                elif 'e' in data and data.get('e') == '24hrTicker':
+                    # Binance单流格式：直接是ticker消息
+                    ticker_item = data
+                elif 's' in data and 'c' in data:
+                    # Binance格式：有s和c字段
+                    ticker_item = data
+                elif 'instId' in data and 'last' in data:
+                    # OKX格式：直接是ticker对象
+                    ticker_item = data
+                else:
+                    logger.warning(f"⚠️ 无法识别的ticker数据格式: {list(data.keys())}")
+                    return
+            else:
+                logger.warning(f"⚠️ 未知的ticker数据格式: {type(data)}")
                 return
             
-            symbol = ticker_data.get('s')
-            price = float(ticker_data.get('c', 0))
+            if not ticker_item:
+                return
             
-            # 缓存最新价格
-            asyncio.create_task(
+            # 🔧 步骤2: 根据字段名自动识别交易所格式并提取数据
+            # 优先检查Binance格式（字段：s, c）
+            if 's' in ticker_item and 'c' in ticker_item:
+                # Binance格式
+                binance_symbol = ticker_item.get('s', '')
+                if not binance_symbol:
+                    logger.warning("⚠️ ticker数据中缺少symbol字段(s)")
+                    return
+                
+                # 转换为标准格式（ETHUSDT -> ETH/USDT）
+                symbol = SymbolMapper.to_standard_format(binance_symbol, "BINANCE")
+                
+                # 获取最新价格
+                price_str = ticker_item.get('c', '0')
+                try:
+                    price = float(price_str)
+                except (ValueError, TypeError):
+                    logger.warning(f"⚠️ 无法解析价格: {price_str}")
+                    return
+                    
+            # 检查OKX格式（字段：instId, last）
+            elif 'instId' in ticker_item and 'last' in ticker_item:
+                # OKX格式
+                okx_symbol = ticker_item.get('instId', '')
+                if not okx_symbol:
+                    logger.warning("⚠️ ticker数据中缺少instId字段")
+                    return
+                
+                # 转换为标准格式（ETH-USDT-SWAP -> ETH/USDT）
+                symbol = SymbolMapper.to_standard_format(okx_symbol, "OKX")
+                
+                # 获取最新价格
+                price_str = ticker_item.get('last', '0')
+                try:
+                    price = float(price_str)
+                except (ValueError, TypeError):
+                    logger.warning(f"⚠️ 无法解析价格: {price_str}")
+                    return
+            else:
+                # 无法识别的格式
+                logger.warning(f"⚠️ 无法识别的ticker数据格式，字段: {list(ticker_item.keys())}")
+                return
+            
+            # 🔧 步骤3: 验证数据有效性
+            if not symbol:
+                logger.warning("⚠️ 无法提取交易对符号")
+                return
+                
+            if price is None or price <= 0:
+                logger.warning(f"⚠️ 价格无效: {price}")
+                return
+            
+            # 🔧 缓存最新价格（使用run_coroutine_threadsafe，因为WebSocket回调不在异步上下文）
+            if self.loop:
+                asyncio.run_coroutine_threadsafe(
                 cache_manager.set_market_data(
                     symbol, 
                     "ticker", 
@@ -356,8 +487,11 @@ class DataService:
                         "timestamp": datetime.now().isoformat()
                     },
                     expire=30
+                    ),
+                    self.loop
                 )
-            )
+            else:
+                logger.warning("⚠️ 事件循环未初始化，跳过价格缓存")
             
             # 🆕 通知价格更新回调（用于虚拟仓位止损止盈检查）
             if self.loop and self.price_callbacks:
@@ -370,8 +504,9 @@ class DataService:
             logger.debug(f"价格更新: {symbol} {price}")
             
         except Exception as e:
-            logger.error(f"处理价格数据失败: {e}")
+            logger.error(f"处理价格数据失败: {e}", exc_info=True)
     
+
     # ✅ 已删除 _process_kline_data 方法
     # 理由：
     # 1. Redis缓存K线数据无实际用途（前端查数据库）
@@ -392,11 +527,12 @@ class DataService:
         except Exception as e:
             logger.error(f"获取历史数据失败: {e}")
     
+
     async def _fetch_historical_klines(self, symbol: str, interval: str, limit: int = 1000):
         """获取历史K线数据"""
         try:
             # ✅ 统一使用分页方法（自动处理超过1500的情况）
-            klines = binance_client.get_klines_paginated(symbol, interval, limit)
+            klines = self.exchange_client.get_klines_paginated(symbol, interval, limit)
             
             if not klines:
                 logger.warning(f"未获取到历史数据: {symbol} {interval}")
@@ -414,6 +550,7 @@ class DataService:
         except Exception as e:
             logger.error(f"获取历史K线数据失败: {e}")
     
+
     async def get_latest_klines(
         self, 
         symbol: str, 
@@ -437,7 +574,7 @@ class DataService:
                 # 如果数据库没有数据，从API获取
                 logger.debug(f"数据库无数据，从API获取: {symbol} {interval}")
                 # ✅ 统一使用分页方法（自动处理超过1500的情况）
-                klines = binance_client.get_klines_paginated(symbol, interval, limit)
+                klines = self.exchange_client.get_klines_paginated(symbol, interval, limit)
                 return klines
             
             # 转换为字典列表
@@ -460,6 +597,7 @@ class DataService:
             logger.error(f"获取最新K线数据失败: {e}")
             return []
     
+
     async def get_account_info(self) -> Dict[str, Any]:
         """获取账户信息"""
         try:
@@ -469,7 +607,7 @@ class DataService:
                 return cached_info
             
             # 从API获取
-            account_info = binance_client.get_account_info()
+            account_info = self.exchange_client.get_account_info()
             
             # 缓存结果
             if account_info:
@@ -481,6 +619,7 @@ class DataService:
             logger.error(f"获取账户信息失败: {e}")
             return {}
     
+
     async def get_position_info(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """获取持仓信息"""
         try:
@@ -492,7 +631,7 @@ class DataService:
                 return cached_positions
             
             # 从API获取
-            positions = binance_client.get_position_info(symbol)
+            positions = self.exchange_client.get_position_info(symbol)
             
             # 缓存结果
             if positions:
@@ -504,20 +643,24 @@ class DataService:
             logger.error(f"获取持仓信息失败: {e}")
             return []
     
+
     def add_data_callback(self, callback: Callable):
         """添加数据回调函数"""
         self.data_callbacks.append(callback)
     
+
     def add_price_callback(self, callback: Callable):
         """添加价格更新回调函数（用于虚拟仓位止损止盈监控）"""
         self.price_callbacks.append(callback)
         logger.debug(f"注册价格更新回调: {callback.__name__}")
     
+
     def add_reconnect_callback(self, callback: Callable):
         """添加WebSocket重连回调函数"""
         self.reconnect_callbacks.append(callback)
         logger.debug(f"注册WebSocket重连回调: {callback.__name__}")
     
+
     async def _notify_reconnect(self):
         """通知所有注册的重连回调"""
         try:
@@ -534,6 +677,7 @@ class DataService:
         except Exception as e:
             logger.error(f"通知重连回调失败: {e}")
     
+
     async def _monitor_websocket_connection(self):
         """监控WebSocket连接状态，检测重连事件"""
         try:
@@ -542,7 +686,10 @@ class DataService:
             while self.is_running:
                 try:
                     # 获取当前连接状态
-                    current_state = binance_ws_client.is_connected
+                    if self.ws_client and hasattr(self.ws_client, 'is_connected'):
+                        current_state = self.ws_client.is_connected
+                    else:
+                        current_state = False
                     
                     # 检测状态变化：从断开到连接（重连成功）
                     if not self._last_connection_state and current_state:
@@ -567,11 +714,13 @@ class DataService:
         except Exception as e:
             logger.error(f"WebSocket连接监控异常: {e}")
     
+
     def remove_data_callback(self, callback: Callable):
         """移除数据回调函数"""
         if callback in self.data_callbacks:
             self.data_callbacks.remove(callback)
     
+
     async def reconnect(self):
         """重连WebSocket"""
         try:
@@ -583,7 +732,8 @@ class DataService:
             logger.info(f"尝试重连WebSocket ({self.reconnect_attempts}/{self.max_reconnect_attempts})")
             
             # 停止当前连接
-            binance_ws_client.stop_websocket()
+            if self.ws_client and hasattr(self.ws_client, 'stop_websocket'):
+                self.ws_client.stop_websocket()
             
             # 等待一段时间后重连
             await asyncio.sleep(self.reconnect_delay)

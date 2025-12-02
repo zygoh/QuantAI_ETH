@@ -25,7 +25,7 @@ from app.core.cache import cache_manager
 from app.model.feature_engineering import feature_engineer
 from app.services.data_service import DataService
 from app.utils.helpers import format_signal_type
-from app.exchange.binance_client import binance_client
+from app.exchange.exchange_factory import ExchangeFactory
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,9 @@ class MLService:
         self.model_metrics = {}
         self.training_task = None
         self.is_first_training = True  # 标记是否首次训练（只有首次才写数据库）
+        
+        # 🔑 获取交易所客户端（使用工厂模式，支持多交易所）
+        self.exchange_client = ExchangeFactory.get_current_client()
         
         # 模型参数
         # LightGBM基础参数（所有时间框架共享）
@@ -438,10 +441,10 @@ class MLService:
             
             logger.info(f"📥 获取 {timeframe} 数据: {required_klines}条K线 ({training_days}天)")
             
-            # ✅ 统一使用分页方法（自动处理超过1500的情况）
-            all_klines = binance_client.get_klines_paginated(
-                    symbol=symbol,
-                    interval=timeframe,
+            # ✅ 统一使用分页方法（自动处理超过1500的情况，支持多交易所）
+            all_klines = self.exchange_client.get_klines_paginated(
+                symbol=symbol,
+                interval=timeframe,
                 limit=required_klines,
                 rate_limit_delay=0.1
             )
@@ -677,7 +680,6 @@ class MLService:
             
         except Exception as e:
             logger.error(f"创建标签失败: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             return df
     

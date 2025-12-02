@@ -18,6 +18,7 @@
 
 ### 核心功能
 
+- **多交易所支持** - 支持Binance和OKX交易所，可灵活切换 🆕
 - **多时间框架分析** - 支持3m/5m/15m多周期信号合成
 - **Stacking集成学习** - LightGBM + XGBoost + CatBoost + Informer2四模型融合
 - **实时信号生成** - WebSocket实时数据处理，毫秒级响应
@@ -110,8 +111,14 @@ QuantAI-ETH/
 │   │   ├── database.py           # 数据库连接
 │   │   └── cache.py              # 缓存管理
 │   │
-│   ├── exchange/                 # 交易所接口
-│   │   └── binance_client.py    # Binance客户端
+│   ├── exchange/                 # 交易所接口 🆕
+│   │   ├── base_exchange_client.py  # 统一接口定义
+│   │   ├── exchange_factory.py      # 工厂模式管理
+│   │   ├── binance_client.py        # Binance客户端
+│   │   ├── okx_client.py            # OKX客户端
+│   │   ├── mock_client.py           # Mock客户端（测试）
+│   │   ├── exceptions.py            # 统一异常类
+│   │   └── mappers.py               # 数据格式映射
 │   │
 │   ├── model/                    # ML模型模块 ⭐
 │   │   ├── ml_service.py         # 基础ML服务
@@ -217,10 +224,19 @@ CREATE EXTENSION IF NOT EXISTS timescaledb;
 创建 `.env` 文件：
 
 ```env
+# 交易所选择 🆕
+EXCHANGE_TYPE=BINANCE  # 支持: BINANCE, OKX, MOCK
+
 # Binance API配置
 BINANCE_API_KEY=your_api_key
 BINANCE_SECRET_KEY=your_secret_key
 BINANCE_TESTNET=True
+
+# OKX API配置 🆕
+OKX_API_KEY=your_okx_api_key
+OKX_SECRET_KEY=your_okx_secret_key
+OKX_PASSPHRASE=your_okx_passphrase
+OKX_TESTNET=False
 
 # 数据库配置
 DATABASE_URL=postgresql://user:password@localhost:5432/quantai_eth
@@ -557,7 +573,20 @@ A: 修改 `app/core/config.py` 中的 `TIMEFRAMES` 配置，然后重新训练�
 
 ### Q: 系统支持哪些交易所？
 
-A: 当前仅支持Binance Futures。添加新交易所需在 `app/exchange/` 目录创建对应的客户端文件。
+A: 当前支持以下交易所：
+- **Binance Futures** - 币安合约交易
+- **OKX Futures** - OKX合约交易 🆕
+- **Mock模式** - 用于测试的模拟交易所
+
+通过修改 `.env` 文件中的 `EXCHANGE_TYPE` 配置即可切换。详见 [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)。
+
+### Q: 如何切换交易所？
+
+A: 修改 `.env` 文件中的 `EXCHANGE_TYPE` 配置：
+```env
+EXCHANGE_TYPE=OKX  # 切换到OKX
+```
+然后重启系统。系统会自动使用新的交易所，无需修改代码。
 
 ### Q: 如何备份和恢复模型？
 

@@ -291,7 +291,6 @@ class HealthMonitor:
         """检查 WebSocket 数据接收状态（增强版：检查连接状态和数据新鲜度）"""
         try:
             # 检查WebSocket连接状态
-            from app.exchange.binance_client import binance_ws_client
             is_ws_connected = binance_ws_client.is_connected
             
             # 通过检查缓冲区更新判断 WebSocket 是否正常
@@ -359,8 +358,6 @@ class HealthMonitor:
     async def _check_model(self) -> Dict[str, Any]:
         """检查模型状态"""
         try:
-            import os
-            
             # 🔥 检查集成模型文件（新格式）
             all_files_exist = True
             missing_files = []

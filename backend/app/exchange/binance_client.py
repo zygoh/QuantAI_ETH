@@ -20,6 +20,12 @@ from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClie
 import websocket
 
 from app.core.config import settings
+from app.exchange.base_exchange_client import (
+    BaseExchangeClient,
+    UnifiedKlineData,
+    UnifiedTickerData,
+    UnifiedOrderData
+)
 
 logger = logging.getLogger(__name__)
 
@@ -353,10 +359,50 @@ class WebSocketHeartbeat:
         return time_since_pong <= self.pong_timeout
 
 
-class BinanceClient:
+class BinanceClient(BaseExchangeClient):
     """Binance API客户端"""
     
-    def __init__(self):
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        """
+        安全地将值转换为float
+        
+        Args:
+            value: 要转换的值
+            default: 默认值
+        
+        Returns:
+            转换后的float值，如果转换失败则返回默认值
+        """
+        if value is None or value == '' or value == 'None':
+            return default
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            logger.warning(f"⚠️ 无法转换为float: value={repr(value)}, 使用默认值={default}")
+            return default
+    
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        """
+        安全地将值转换为int
+        
+        Args:
+            value: 要转换的值
+            default: 默认值
+        
+        Returns:
+            转换后的int值，如果转换失败则返回默认值
+        """
+        if value is None or value == '' or value == 'None':
+            return default
+        try:
+            return int(float(value))
+        except (ValueError, TypeError):
+            logger.warning(f"⚠️ 无法转换为int: value={repr(value)}, 使用默认值={default}")
+            return default
+    
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.api_key = settings.BINANCE_API_KEY
         self.secret_key = settings.BINANCE_SECRET_KEY
         self.testnet = settings.BINANCE_TESTNET
@@ -482,7 +528,7 @@ class BinanceClient:
         limit: int = 500,
         start_time: Optional[int] = None,
         end_time: Optional[int] = None
-    ) -> List[Dict[str, Any]]:
+    ) -> List[UnifiedKlineData]:
         """获取K线数据"""
         try:
             # ✅ 关键修复：Binance API limit 最大值为 1500
@@ -515,7 +561,7 @@ class BinanceClient:
                     logger.warning(f"   数组内容: {first_kline}")
                     logger.warning(f"   可能原因: Binance API版本或代理过滤了某些字段")
             
-            # 转换为标准格式
+            # 转换为统一格式
             formatted_klines = []
             for idx, kline in enumerate(klines):
                 try:
@@ -528,19 +574,19 @@ class BinanceClient:
                         taker_buy_base = float(kline[9]) if kline[9] else 0.0
                         taker_buy_quote = float(kline[10]) if kline[10] else 0.0
                     
-                    formatted_kline = {
-                        'timestamp': kline[0],
-                        'open': float(kline[1]),
-                        'high': float(kline[2]),
-                        'low': float(kline[3]),
-                        'close': float(kline[4]),
-                        'volume': float(kline[5]),
-                        'close_time': kline[6],
-                        'quote_volume': float(kline[7]),
-                        'trades': int(kline[8]),
-                        'taker_buy_base_volume': taker_buy_base,
-                        'taker_buy_quote_volume': taker_buy_quote
-                    }
+                    formatted_kline = UnifiedKlineData(
+                        timestamp=kline[0],
+                        open=float(kline[1]),
+                        high=float(kline[2]),
+                        low=float(kline[3]),
+                        close=float(kline[4]),
+                        volume=float(kline[5]),
+                        close_time=kline[6],
+                        quote_volume=float(kline[7]),
+                        trades=int(kline[8]),
+                        taker_buy_base_volume=taker_buy_base,
+                        taker_buy_quote_volume=taker_buy_quote
+                    )
                     formatted_klines.append(formatted_kline)
                 except (IndexError, ValueError, TypeError) as e:
                     logger.error(f"❌ 解析K线数据失败 (索引{idx}): {e}")
@@ -562,7 +608,7 @@ class BinanceClient:
         start_time: Optional[int] = None,
         end_time: Optional[int] = None,
         rate_limit_delay: float = 0.1
-    ) -> List[Dict[str, Any]]:
+    ) -> List[UnifiedKlineData]:
         """
         分页获取K线数据（自动处理超过1500的情况）
         
@@ -624,20 +670,20 @@ class BinanceClient:
                     break
                 
                 # 设置下一批次的 end_time 为当前批次最早的时间 - 1ms
-                current_end_time = klines[0]['timestamp'] - 1
+                current_end_time = klines[0].timestamp - 1
                 
                 # API限流（最后一批不需要延迟）
                 if batch < batches_needed - 1:
                     time.sleep(rate_limit_delay)
             
             # 按时间戳排序（确保顺序正确）
-            all_klines.sort(key=lambda x: x['timestamp'])
+            all_klines.sort(key=lambda x: x.timestamp)
             
             # 去重（防止批次边界重复）
             seen_timestamps = set()
             unique_klines = []
             for kline in all_klines:
-                ts = kline['timestamp']
+                ts = kline.timestamp
                 if ts not in seen_timestamps:
                     seen_timestamps.add(ts)
                     unique_klines.append(kline)
@@ -649,17 +695,18 @@ class BinanceClient:
             logger.error(f"分页获取K线数据失败: {symbol} {interval} - {e}")
             return []
     
-    def get_ticker_price(self, symbol: str) -> Optional[Dict[str, Any]]:
+    def get_ticker_price(self, symbol: str) -> Optional[UnifiedTickerData]:
         """获取实时价格（24hr ticker）"""
         try:
             # ✅ 使用代理的 REST API
             ticker = self.client.ticker_price(symbol=symbol)
             
             if ticker:
-                return {
-                    'symbol': ticker.get('symbol', symbol),
-                    'price': float(ticker.get('price', 0))
-                }
+                return UnifiedTickerData(
+                    symbol=ticker.get('symbol', symbol),
+                    price=self._safe_float(ticker.get('price'), 0.0),
+                    timestamp=int(time.time() * 1000)
+                )
             return None
             
         except Exception as e:
@@ -675,15 +722,15 @@ class BinanceClient:
 
             account = self.client.account(recvWindow=self.recv_window)
             
-            # 格式化账户信息
+            # 格式化账户信息 - 使用安全转换
             formatted_account = {
-                'total_wallet_balance': float(account.get('totalWalletBalance', 0)),
-                'total_unrealized_pnl': float(account.get('totalUnrealizedPnL', 0)),
-                'total_margin_balance': float(account.get('totalMarginBalance', 0)),
-                'total_position_initial_margin': float(account.get('totalPositionInitialMargin', 0)),
-                'total_open_order_initial_margin': float(account.get('totalOpenOrderInitialMargin', 0)),
-                'available_balance': float(account.get('availableBalance', 0)),
-                'max_withdraw_amount': float(account.get('maxWithdrawAmount', 0)),
+                'total_wallet_balance': self._safe_float(account.get('totalWalletBalance'), 0.0),
+                'total_unrealized_pnl': self._safe_float(account.get('totalUnrealizedPnL'), 0.0),
+                'total_margin_balance': self._safe_float(account.get('totalMarginBalance'), 0.0),
+                'total_position_initial_margin': self._safe_float(account.get('totalPositionInitialMargin'), 0.0),
+                'total_open_order_initial_margin': self._safe_float(account.get('totalOpenOrderInitialMargin'), 0.0),
+                'available_balance': self._safe_float(account.get('availableBalance'), 0.0),
+                'max_withdraw_amount': self._safe_float(account.get('maxWithdrawAmount'), 0.0),
                 'can_trade': account.get('canTrade', False),
                 'can_deposit': account.get('canDeposit', False),
                 'can_withdraw': account.get('canWithdraw', False),
@@ -712,20 +759,20 @@ class BinanceClient:
             # 过滤有持仓的合约
             active_positions = []
             for position in positions:
-                position_amt = float(position.get('positionAmt', 0))
+                position_amt = self._safe_float(position.get('positionAmt'), 0.0)
                 if position_amt != 0:
                     formatted_position = {
-                        'symbol': position['symbol'],
+                        'symbol': position.get('symbol', ''),
                         'position_amt': position_amt,
-                        'entry_price': float(position.get('entryPrice', 0)),
-                        'mark_price': float(position.get('markPrice', 0)),
-                        'pnl': float(position.get('unRealizedProfit', 0)),
-                        'percentage': float(position.get('percentage', 0)),
+                        'entry_price': self._safe_float(position.get('entryPrice'), 0.0),
+                        'mark_price': self._safe_float(position.get('markPrice'), 0.0),
+                        'pnl': self._safe_float(position.get('unRealizedProfit'), 0.0),
+                        'percentage': self._safe_float(position.get('percentage'), 0.0),
                         'position_side': position.get('positionSide', 'BOTH'),
                         'isolated': position.get('isolated', False),
                         'margin_type': position.get('marginType', 'cross'),
-                        'leverage': int(position.get('leverage', 1)),
-                        'max_notional_value': float(position.get('maxNotionalValue', 0)),
+                        'leverage': self._safe_int(position.get('leverage'), 1),
+                        'max_notional_value': self._safe_float(position.get('maxNotionalValue'), 0.0),
                         'update_time': position.get('updateTime', 0)
                     }
                     active_positions.append(formatted_position)
@@ -788,16 +835,30 @@ class BinanceClient:
             logger.error(f"下单失败: {e}")
             return {}
     
-    def cancel_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
-        """撤销订单"""
+    def cancel_order(self, symbol: str, order_id: str) -> Dict[str, Any]:
+        """
+        撤销订单
+        
+        Args:
+            symbol: 交易对符号
+            order_id: 订单ID（字符串格式，内部转换为整数）
+        
+        Returns:
+            取消结果字典
+        """
         try:
             if not self.account_endpoints_enabled:
                 logger.warning("⏸️ 撤单接口已临时禁用，返回空结果")
                 return {}
 
-            result = self.client.cancel_order(symbol=symbol, orderId=order_id, recvWindow=self.recv_window)
+            # Binance API需要整数类型的orderId，但接口统一使用str
+            order_id_int = int(order_id)
+            result = self.client.cancel_order(symbol=symbol, orderId=order_id_int, recvWindow=self.recv_window)
             logger.info(f"撤销订单成功: {symbol} {order_id}")
             return result
+        except ValueError as e:
+            logger.error(f"撤销订单失败: 订单ID格式错误 '{order_id}': {e}")
+            return {}
         except Exception as e:
             logger.error(f"撤销订单失败: {e}")
             return {}

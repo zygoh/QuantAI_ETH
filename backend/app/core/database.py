@@ -291,10 +291,8 @@ class PostgreSQLManager:
                     # 处理时间戳（统一使用UTC）
                     timestamp_val = signal.get('timestamp')
                     if isinstance(timestamp_val, (int, float)):
-                        import pytz
                         timestamp_val = datetime.fromtimestamp(timestamp_val / 1000, tz=pytz.UTC)
                     elif not isinstance(timestamp_val, datetime):
-                        import pytz
                         timestamp_val = datetime.now(pytz.UTC)
                     
                     # 预测数据转为 JSON
@@ -340,10 +338,8 @@ class PostgreSQLManager:
                     # 处理时间戳（统一使用UTC）
                     timestamp_val = order.get('timestamp')
                     if isinstance(timestamp_val, (int, float)):
-                        import pytz
                         timestamp_val = datetime.fromtimestamp(timestamp_val / 1000, tz=pytz.UTC)
                     elif not isinstance(timestamp_val, datetime):
-                        import pytz
                         timestamp_val = datetime.now(pytz.UTC)
                     
                     await session.execute(stmt, {
@@ -383,7 +379,6 @@ class PostgreSQLManager:
         """查询K线数据"""
         try:
             if end_time is None:
-                import pytz
                 end_time = datetime.now(pytz.UTC)
             
             # 将 datetime 转换为毫秒时间戳（用于查询）
@@ -453,7 +448,6 @@ class PostgreSQLManager:
         """查询交易信号"""
         try:
             if end_time is None:
-                import pytz
                 end_time = datetime.now(pytz.UTC)
             
             async with self.SessionLocal() as session:
@@ -533,7 +527,6 @@ class PostgreSQLManager:
                     else:
                         # 清理指定天数前的数据
                         logger.info(f"🧹 开始清理{days}天前的旧数据（保留最近{days}天）...")
-                        import pytz
                         cutoff_time = datetime.now(pytz.UTC) - timedelta(days=days)
                         cutoff_ts = int(cutoff_time.timestamp() * 1000)  # ✅ 转为毫秒时间戳
                         
@@ -565,7 +558,6 @@ class PostgreSQLManager:
                     """)
                     
                     # 处理入场时间（统一使用UTC）
-                    import pytz
                     entry_time = position.get('entry_time', datetime.now(pytz.UTC))
                     if isinstance(entry_time, (int, float)):
                         entry_time = datetime.fromtimestamp(entry_time / 1000, tz=pytz.UTC)
@@ -594,7 +586,6 @@ class PostgreSQLManager:
         """平掉虚拟仓位"""
         try:
             if exit_time is None:
-                import pytz
                 exit_time = datetime.now(pytz.UTC)
             
             async with self.SessionLocal() as session:

@@ -5,6 +5,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from app.api.models import TradingResponse, TradeRequest, TradingModeRequest
 from app.api.dependencies import get_current_user
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -199,8 +200,6 @@ async def get_trading_limits(current_user: str = Depends(get_current_user)):
     """获取交易限制"""
     try:
         logger.info("获取交易限制")
-        
-        from app.core.config import settings
         
         # 从实际配置获取真实限制
         limits = {

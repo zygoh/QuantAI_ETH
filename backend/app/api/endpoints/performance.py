@@ -7,6 +7,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.api.models import PerformanceResponse, PerformanceMetrics
 from app.api.dependencies import get_current_user
 from app.core.config import settings
+from app.services.drawdown_monitor import drawdown_monitor
+import numpy as np
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -106,7 +108,6 @@ async def get_drawdown_metrics(
         max_dd, current_dd = await risk_service.calculate_max_drawdown(query_symbol)
         
         # 获取回撤监控状态
-        from app.services.drawdown_monitor import drawdown_monitor
         drawdown_status = await drawdown_monitor.get_current_drawdown_status()
         drawdown_stats = await drawdown_monitor.get_drawdown_statistics()
         
@@ -155,8 +156,6 @@ async def get_returns_analysis(
             }
         
         # 计算收益统计
-        import numpy as np
-        
         returns_stats = {
             'total_return': (returns + 1).prod() - 1,
             'annualized_return': returns.mean() * 252,

@@ -6,7 +6,8 @@ import json
 import logging
 from typing import Dict, Set
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from app.api.models import WSMessage, WSPriceUpdate, WSSignalUpdate, WSOrderUpdate, WSRiskAlert
+from app.api.models import WSMessage, WSPriceUpdate, WSSignalUpdate, WSOrderUpdate, WSRiskAlert, TradingSignal
+from app.core.cache import cache_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -270,7 +271,6 @@ async def price_push_task():
         try:
             if data_service and len(manager.active_connections) > 0:
                 # 获取最新价格
-                from app.core.cache import cache_manager
                 ticker_data = await cache_manager.get_market_data("ETHUSDT", "ticker")
                 
                 if ticker_data:
@@ -311,7 +311,6 @@ async def status_push_task():
 async def on_signal_generated(signal):
     """信号生成回调"""
     try:
-        from app.api.models import TradingSignal
         
         signal_update = WSSignalUpdate(
             signal=TradingSignal(

@@ -16,10 +16,19 @@ class Settings(BaseSettings):
     PORT: int = 8000
     DEBUG: bool = True
     
+    # 交易所选择配置
+    EXCHANGE_TYPE: str = "OKX"  # 支持: BINANCE, OKX, MOCK
+    
     # Binance API配置
     BINANCE_API_KEY: str = ""
     BINANCE_SECRET_KEY: str = ""
     BINANCE_TESTNET: bool = True  # 使用生产环境
+    
+    # OKX API配置
+    OKX_API_KEY: str = "ede47cb6-9250-4993-97ad-a251d47caf63"
+    OKX_SECRET_KEY: str = "8CEE9B57D73ADC49180AE6E962C50CC1"
+    OKX_PASSPHRASE: str = "Kuan@12345"
+    OKX_TESTNET: bool = False
     
     # 代理配置（可选）
     USE_PROXY: bool = True  # 是否使用代理（REST API）
@@ -29,7 +38,7 @@ class Settings(BaseSettings):
     PROXY_TYPE: str = "socks5"  # 代理类型：http, https, socks5（WebSocket推荐socks5）
     
     # 交易配置
-    SYMBOL: str = "ETHUSDT"
+    SYMBOL: str = "ETH/USDT"  # 使用标准格式，系统会自动转换为交易所格式
     LEVERAGE: int = 50  # 50x杠杆（1.5%止损 × 50x = 75%单次风险，风险回报1:2.67）
     CONFIDENCE_THRESHOLD: float = 0.35  # 降低到0.35以增加信号数量（81%准确率下合理阈值）
     
@@ -95,6 +104,35 @@ class Settings(BaseSettings):
         env_file = ".env"
         case_sensitive = True
     
+    def validate_exchange_config(self) -> bool:
+        """
+        验证交易所配置的完整性
+        
+        Returns:
+            配置是否有效
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        if self.EXCHANGE_TYPE == "BINANCE":
+            if not self.BINANCE_API_KEY or not self.BINANCE_SECRET_KEY:
+                logger.warning("⚠️ Binance API密钥未配置，部分功能可能不可用")
+                return False
+            logger.info("✅ Binance配置验证通过")
+        elif self.EXCHANGE_TYPE == "OKX":
+            if not self.OKX_API_KEY or not self.OKX_SECRET_KEY or not self.OKX_PASSPHRASE:
+                logger.warning("⚠️ OKX API密钥未配置，部分功能可能不可用")
+                return False
+            logger.info("✅ OKX配置验证通过")
+        elif self.EXCHANGE_TYPE == "MOCK":
+            logger.info("✅ Mock模式，无需验证API密钥")
+        else:
+            logger.warning(f"⚠️ 未知的交易所类型: {self.EXCHANGE_TYPE}，将使用默认值BINANCE")
+            self.EXCHANGE_TYPE = "BINANCE"
+            return False
+        
+        return True
+    
     def validate_config(self):
         """
         验证配置参数的合理性
@@ -103,6 +141,9 @@ class Settings(BaseSettings):
             ValueError: 配置参数不合法时抛出
         """
         errors = []
+        
+        # 验证交易所配置
+        self.validate_exchange_config()
         
         # WebSocket重连配置验证
         if self.WS_RECONNECT_INITIAL_DELAY <= 0:

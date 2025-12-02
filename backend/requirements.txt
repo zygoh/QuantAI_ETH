@@ -44,9 +44,9 @@ bitsandbytes #8-bit优化器
 
 # 深度学习框架（神经网络 - CUDA版本）
 # 注意：使用CUDA 12.1版本，与RTX 4060 Ti兼容
-torch>=2.5.1+cu121
-torchvision>=0.20.1+cu121
-torchaudio>=2.5.1+cu121
+torch>=2.5.1
+torchvision>=0.20.1
+torchaudio>=2.5.1
 # 安装命令：uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
 # ========================================
@@ -55,12 +55,14 @@ torchaudio>=2.5.1+cu121
 ta
 
 # ========================================
-# Binance API
+# 交易所API（支持Binance和OKX）
 # ========================================
-binance-connector
-websocket-client
+binance-connector  # Binance交易所API
+python-okx==0.4.0  # OKX官方SDK（用于OKX交易所集成）
+websocket-client  # WebSocket客户端（Binance和OKX共用）
+requests  # HTTP请求库
 PySocks  # SOCKS5代理支持
-
+socksio==1.0.0
 # ========================================
 # 工具库
 # ========================================

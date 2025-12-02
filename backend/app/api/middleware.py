@@ -5,6 +5,7 @@ import time
 import logging
 from typing import Callable
 from fastapi import Request, Response
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,6 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
             logger.error(f"请求处理异常: {request.method} {request.url} - {str(e)}")
             
             # 返回通用错误响应
-            from fastapi.responses import JSONResponse
             return JSONResponse(
                 status_code=500,
                 content={

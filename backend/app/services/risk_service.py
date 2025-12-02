@@ -14,6 +14,8 @@ from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
 from app.services.data_service import DataService
 from app.trading.position_manager import position_manager
+from app.exchange.exchange_factory import ExchangeFactory
+import ta
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,8 @@ class RiskService:
         self.data_service = data_service
         self.confidence_levels = [0.95, 0.99]
         self.var_methods = ['historical', 'parametric', 'monte_carlo']
+        # 🔑 获取交易所客户端（使用工厂模式，支持多交易所）
+        self.exchange_client = ExchangeFactory.get_current_client()
         
     async def calculate_var(
         self, 
@@ -612,11 +616,9 @@ class RiskService:
             包含止损止盈的字典
         """
         try:
-            from app.exchange.binance_client import binance_client
-            
             # 1. 获取最近的K线数据计算ATR（使用5m主时间框架）
-            # ✅ 统一使用分页方法（limit=100时自动调用单次获取，不影响性能）
-            klines = binance_client.get_klines_paginated(
+            # ✅ 统一使用分页方法（limit=100时自动调用单次获取，不影响性能，支持多交易所）
+            klines = self.exchange_client.get_klines_paginated(
                 symbol=symbol,
                 interval='5m',
                 limit=100  # 5m需要更多样本（100个=8.3小时）
@@ -627,7 +629,6 @@ class RiskService:
                 return RiskService._calculate_fixed_percentage_stop(entry_price, signal_type, confidence)
             
             # 2. 计算ATR（14周期）
-            import ta
             df = pd.DataFrame(klines)
             df['high'] = pd.to_numeric(df['high'])
             df['low'] = pd.to_numeric(df['low'])

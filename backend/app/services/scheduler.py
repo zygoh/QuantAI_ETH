@@ -8,11 +8,14 @@ from datetime import datetime, timedelta, time as dt_time
 import schedule
 from dataclasses import dataclass
 import pytz
+import os
 
 from app.core.config import settings
 from app.model.ml_service import MLService
 from app.services.data_service import DataService
 from app.services.historical_data import historical_data_manager
+from app.services.health_monitor import health_monitor
+from app.core.cache import cache_manager
 
 logger = logging.getLogger(__name__)
 
@@ -136,9 +139,6 @@ class TaskScheduler:
     async def _check_initial_model_training(self):
         """检查是否需要立即进行首次模型训练"""
         try:
-            import os
-            from app.core.config import settings
-            
             # 检查是否存在Stacking集成模型文件（4个模型：lgb, xgb, cat, meta）
             model_dir = "models"
             has_model = False
@@ -398,8 +398,6 @@ class TaskScheduler:
         try:
             logger.info("开始系统健康检查")
             
-            from app.services.health_monitor import health_monitor
-            
             # 执行健康检查
             health_status = await health_monitor.check_system_health()
             
@@ -423,7 +421,6 @@ class TaskScheduler:
             await historical_data_manager.cleanup_old_data(days=30)
             
             # 清理缓存
-            from app.core.cache import cache_manager
             await cache_manager.clear_cache_pattern("market_data:*")
             
             logger.info("数据清理完成")
