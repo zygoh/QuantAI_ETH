@@ -7,6 +7,7 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from enum import Enum
+from decimal import Decimal, ROUND_HALF_UP
 import uuid
 
 from app.core.config import settings
@@ -17,9 +18,9 @@ from app.trading.signal_generator import TradingSignal
 
 logger = logging.getLogger(__name__)
 
-# 🎯 虚拟交易手续费配置（模拟实际交易所费率）
-VIRTUAL_OPEN_FEE_RATE = 0.0002   # 开仓手续费：0.02% (Maker)
-VIRTUAL_CLOSE_FEE_RATE = 0.0005  # 平仓手续费：0.05% (Taker)
+# 🎯 虚拟交易手续费配置（模拟实际交易所费率）- 使用Decimal确保精度
+VIRTUAL_OPEN_FEE_RATE = Decimal('0.0002')   # 开仓手续费：0.02% (Maker)
+VIRTUAL_CLOSE_FEE_RATE = Decimal('0.0005')  # 平仓手续费：0.05% (Taker)
 
 class OrderSide(Enum):
     """订单方向"""
@@ -169,9 +170,14 @@ class TradingEngine:
             
             # 检查交易模式
             if self.trading_mode == TradingMode.SIGNAL_ONLY:
-                logger.info("📊 信号模式 - 执行虚拟交易")
+                logger.info(f"📊 信号模式 - 执行虚拟交易: {signal.signal_type} {signal.symbol} (置信度={signal.confidence:.4f})")
                 # 在信号模式下执行虚拟交易
-                return await self._execute_virtual_trade(signal)
+                result = await self._execute_virtual_trade(signal)
+                if result.get('success'):
+                    logger.info(f"✅ 虚拟交易执行成功: {result.get('message', '')}")
+                else:
+                    logger.warning(f"⚠️ 虚拟交易执行失败: {result.get('message', '')}")
+                return result
             
             # 风险检查
             risk_check = await self._check_trading_risks(signal)
@@ -645,24 +651,28 @@ class TradingEngine:
                 # 平仓
                 await postgresql_manager.close_virtual_position(pos['id'], current_price)
                 
-                # 🔑 计算价差盈亏（quantity现在是USDT价值，需要转换成币的数量）
-                coin_amount = pos['quantity'] / pos['entry_price']  # 币的数量
+                # 🔑 计算价差盈亏（quantity现在是USDT价值，需要转换成币的数量）- 使用Decimal确保精度
+                entry_price = Decimal(str(pos['entry_price']))
+                quantity = Decimal(str(pos['quantity']))
+                current_price_decimal = Decimal(str(current_price))
+                
+                coin_amount = quantity / entry_price  # 币的数量
                 if pos['side'] == 'LONG':
-                    price_pnl = (current_price - pos['entry_price']) * coin_amount
+                    price_pnl = (current_price_decimal - entry_price) * coin_amount
                 else:  # SHORT
-                    price_pnl = (pos['entry_price'] - current_price) * coin_amount
+                    price_pnl = (entry_price - current_price_decimal) * coin_amount
                 
                 # 🔑 计算手续费（quantity已经是USDT价值）
-                open_position_value = pos['quantity']  # 开仓时的USDT价值
+                open_position_value = quantity  # 开仓时的USDT价值
                 open_commission = open_position_value * VIRTUAL_OPEN_FEE_RATE
                 
-                close_position_value = coin_amount * current_price  # 平仓时的USDT价值
+                close_position_value = coin_amount * current_price_decimal  # 平仓时的USDT价值
                 close_commission = close_position_value * VIRTUAL_CLOSE_FEE_RATE
                 
                 # 净盈亏 = 价差盈亏 - 开仓手续费 - 平仓手续费
                 net_pnl = price_pnl - open_commission - close_commission
                 
-                total_pnl += net_pnl
+                total_pnl += float(net_pnl.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP))
                 
                 # 创建平仓虚拟订单
                 close_order = {
@@ -671,10 +681,10 @@ class TradingEngine:
                     'side': 'SELL' if pos['side'] == 'LONG' else 'BUY',
                     'type': 'MARKET',
                     'status': 'FILLED',
-                    'quantity': pos['quantity'],
-                    'price': current_price,
-                    'filled_quantity': pos['quantity'],
-                    'commission': close_commission,  # 平仓手续费 0.05%
+                    'quantity': float(quantity.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)),
+                    'price': float(current_price_decimal.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)),
+                    'filled_quantity': float(quantity.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)),
+                    'commission': float(close_commission.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)),  # 平仓手续费 0.05%
                     'timestamp': int(datetime.now().timestamp() * 1000),  # ✅ 毫秒时间戳
                     'is_virtual': True,
                     'signal_id': signal_id,
@@ -732,21 +742,29 @@ class TradingEngine:
             # 平仓
             await postgresql_manager.close_virtual_position(pos_id, current_price)
             
-            # 🔑 计算盈亏（quantity是USDT价值）
-            coin_amount = pos['quantity'] / pos['entry_price']  # 币的数量
+            # 🔑 计算盈亏（quantity是USDT价值）- 使用Decimal确保金融计算精度
+            entry_price = Decimal(str(pos['entry_price']))
+            quantity = Decimal(str(pos['quantity']))
+            current_price_decimal = Decimal(str(current_price))
+            
+            coin_amount = quantity / entry_price  # 币的数量
             
             if pos['side'] == 'LONG':
-                price_pnl = (current_price - pos['entry_price']) * coin_amount
+                price_pnl = (current_price_decimal - entry_price) * coin_amount
             else:  # SHORT
-                price_pnl = (pos['entry_price'] - current_price) * coin_amount
+                price_pnl = (entry_price - current_price_decimal) * coin_amount
             
             # 手续费
-            open_commission = pos['quantity'] * VIRTUAL_OPEN_FEE_RATE  # 0.02%
-            close_commission = coin_amount * current_price * VIRTUAL_CLOSE_FEE_RATE  # 0.05%
+            open_commission = quantity * VIRTUAL_OPEN_FEE_RATE  # 0.02%
+            close_commission = coin_amount * current_price_decimal * VIRTUAL_CLOSE_FEE_RATE  # 0.05%
             
             # 净盈亏
             net_pnl = price_pnl - open_commission - close_commission
-            pnl_percent = (net_pnl / pos['quantity']) * 100
+            pnl_percent = (net_pnl / quantity) * Decimal('100')
+            
+            # 转换为float用于日志和返回（保持API兼容性）
+            net_pnl_float = float(net_pnl.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP))
+            pnl_percent_float = float(pnl_percent.quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP))
             
             # 记录平仓订单
             order_data = {
@@ -755,10 +773,10 @@ class TradingEngine:
                 'side': 'SELL' if pos['side'] == 'LONG' else 'BUY',
                 'type': 'MARKET',
                 'status': 'FILLED',
-                'quantity': pos['quantity'],
-                'price': current_price,
-                'filled_quantity': pos['quantity'],
-                'commission': close_commission,
+                'quantity': float(quantity.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)),
+                'price': float(current_price_decimal.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)),
+                'filled_quantity': float(quantity.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)),
+                'commission': float(close_commission.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)),
                 'timestamp': int(datetime.now().timestamp() * 1000),
                 'is_virtual': True,
                 'signal_id': pos.get('signal_id', ''),

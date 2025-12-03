@@ -1450,7 +1450,16 @@ class HyperparameterOptimizer:
                             # 🎯 梯度累积
                             if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
                                 if use_amp:
-                                    scaler.unscale_(optimizer)
+                                    try:
+                                        scaler.unscale_(optimizer)
+                                    except RuntimeError as e:
+                                        if "unscale_() has already been called" in str(e):
+                                            # 如果已经调用过unscale_()，说明之前可能已经处理过，直接跳过
+                                            logger.warning(f"⚠️ Trial {trial.number} Fold {fold_idx+1} Epoch {epoch+1} Batch {i+1}: unscale_()已调用，跳过此次更新")
+                                            optimizer.zero_grad()
+                                            continue
+                                        else:
+                                            raise
                                 
                                 # ✅ 关键修复：更严格的梯度裁剪（防止梯度爆炸）
                                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1462,6 +1471,12 @@ class HyperparameterOptimizer:
                                 # ✅ 关键修复：检查梯度裁剪后的梯度范数
                                 if torch.isnan(grad_norm) or torch.isinf(grad_norm) or grad_norm > 10.0:
                                     logger.warning(f"⚠️ Trial {trial.number} Fold {fold_idx+1} Epoch {epoch+1} Batch {i+1}: 梯度异常 (grad_norm={grad_norm:.4f})，跳过此batch")
+                                    # ✅ 修复：如果使用了混合精度，需要清理scaler状态
+                                    if use_amp:
+                                        try:
+                                            scaler.update()  # 更新scaler状态，避免后续unscale_()报错
+                                        except:
+                                            pass
                                     optimizer.zero_grad()
                                     continue
                                 

@@ -6,6 +6,7 @@ import asyncio
 import logging
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 import pandas as pd
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy import text
@@ -604,17 +605,22 @@ class PostgreSQLManager:
                         logger.warning(f"虚拟仓位不存在或已关闭: {position_id}")
                         return
                     
-                    # 计算盈亏
-                    entry_price = float(row[3])
-                    quantity = float(row[4])
+                    # 计算盈亏 - 使用Decimal确保金融计算精度
+                    entry_price = Decimal(str(row[3]))
+                    quantity = Decimal(str(row[4]))
+                    exit_price_decimal = Decimal(str(exit_price))
                     side = row[2]
                     
                     if side == 'LONG':
-                        pnl = (exit_price - entry_price) * quantity
+                        pnl = (exit_price_decimal - entry_price) * quantity
                     else:  # SHORT
-                        pnl = (entry_price - exit_price) * quantity
+                        pnl = (entry_price - exit_price_decimal) * quantity
                     
-                    pnl_percent = (pnl / (entry_price * quantity)) * 100
+                    pnl_percent = (pnl / (entry_price * quantity)) * Decimal('100')
+                    
+                    # 转换为float用于数据库存储（NUMERIC类型会自动处理精度）
+                    pnl_float = float(pnl.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP))
+                    pnl_percent_float = float(pnl_percent.quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP))
                     
                     # 更新仓位
                     update_stmt = text("""
@@ -632,8 +638,8 @@ class PostgreSQLManager:
                         'position_id': position_id,
                         'exit_price': exit_price,
                         'exit_time': exit_time,
-                        'pnl': pnl,
-                        'pnl_percent': pnl_percent
+                        'pnl': pnl_float,
+                        'pnl_percent': pnl_percent_float
                     })
                     
                     logger.info(f"平掉虚拟仓位 #{position_id}: {row[1]} PnL={pnl:.2f} ({pnl_percent:+.2f}%)")

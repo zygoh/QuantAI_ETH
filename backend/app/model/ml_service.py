@@ -155,10 +155,13 @@ class MLService:
     
     def _get_model_paths(self, timeframe: str) -> Dict[str, str]:
         """获取指定时间框架的模型文件路径"""
+        # 🔧 修复：处理SYMBOL中的/字符（如"ETH/USDT"），替换为_避免路径问题
+        # 必须与ensemble_ml_service中的逻辑保持一致
+        safe_symbol = settings.SYMBOL.replace('/', '_')
         return {
-            'model': os.path.join(self.model_dir, f"{settings.SYMBOL}_{timeframe}_model.pkl"),
-            'scaler': os.path.join(self.model_dir, f"{settings.SYMBOL}_{timeframe}_scaler.pkl"),
-            'features': os.path.join(self.model_dir, f"{settings.SYMBOL}_{timeframe}_features.pkl")
+            'model': os.path.join(self.model_dir, f"{safe_symbol}_{timeframe}_model.pkl"),
+            'scaler': os.path.join(self.model_dir, f"{safe_symbol}_{timeframe}_scaler.pkl"),
+            'features': os.path.join(self.model_dir, f"{safe_symbol}_{timeframe}_features.pkl")
         }
     
     async def start(self):
@@ -910,11 +913,34 @@ class MLService:
                 logger.warning(f"⚠️ 特征缩放前处理了{nan_count}个缺失值（NaN）")
             
             # 每个时间框架独立的scaler
+            # 🔧 修复：支持字典结构的scaler（用于Informer-2）
             if fit or timeframe not in self.scalers or self.scalers[timeframe] is None:
-                self.scalers[timeframe] = StandardScaler()
-                X_scaled = self.scalers[timeframe].fit_transform(X)
+                # 创建新的scaler（如果是字典结构，需要创建'traditional'键）
+                if isinstance(self.scalers.get(timeframe), dict):
+                    # 如果已经是字典，创建新的traditional scaler
+                    if self.scalers[timeframe] is None:
+                        self.scalers[timeframe] = {}
+                    self.scalers[timeframe]['traditional'] = StandardScaler()
+                    X_scaled = self.scalers[timeframe]['traditional'].fit_transform(X)
+                else:
+                    # 直接创建StandardScaler对象
+                    self.scalers[timeframe] = StandardScaler()
+                    X_scaled = self.scalers[timeframe].fit_transform(X)
             else:
-                X_scaled = self.scalers[timeframe].transform(X)
+                # 检查scaler是字典还是StandardScaler对象
+                scaler = self.scalers[timeframe]
+                if isinstance(scaler, dict):
+                    # 字典结构：使用'traditional'键的scaler（传统模型）
+                    if 'traditional' in scaler:
+                        X_scaled = scaler['traditional'].transform(X)
+                    else:
+                        # 如果没有'traditional'键，创建新的scaler
+                        logger.warning(f"⚠️ {timeframe} scaler字典中缺少'traditional'键，创建新的scaler")
+                        self.scalers[timeframe]['traditional'] = StandardScaler()
+                        X_scaled = self.scalers[timeframe]['traditional'].fit_transform(X)
+                else:
+                    # StandardScaler对象：直接使用
+                    X_scaled = scaler.transform(X)
             
             return X_scaled
             

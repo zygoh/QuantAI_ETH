@@ -629,7 +629,21 @@ class RiskService:
                 return RiskService._calculate_fixed_percentage_stop(entry_price, signal_type, confidence)
             
             # 2. 计算ATR（14周期）
-            df = pd.DataFrame(klines)
+            # 🔧 修复：将UnifiedKlineData对象转换为字典
+            from dataclasses import asdict
+            from app.exchange.base_exchange_client import UnifiedKlineData
+            
+            klines_dict = []
+            for kline in klines:
+                if isinstance(kline, UnifiedKlineData):
+                    klines_dict.append(asdict(kline))
+                elif isinstance(kline, dict):
+                    klines_dict.append(kline)
+                else:
+                    logger.warning(f"⚠️ 未知的K线数据类型: {type(kline)}")
+                    continue
+            
+            df = pd.DataFrame(klines_dict)
             df['high'] = pd.to_numeric(df['high'])
             df['low'] = pd.to_numeric(df['low'])
             df['close'] = pd.to_numeric(df['close'])

@@ -119,11 +119,26 @@ class HistoricalDataManager:
     ):
         """批量写入K线数据（优化：一次性写入，避免循环调用）"""
         try:
-            # 🔥 优化：给所有数据添加metadata后一次性写入
-            klines_with_meta = [
-                {**kline, 'symbol': symbol, 'interval': interval}
-                for kline in klines
-            ]
+            # 🔧 修复：将UnifiedKlineData对象转换为字典
+            from dataclasses import asdict
+            from app.exchange.base_exchange_client import UnifiedKlineData
+            
+            klines_with_meta = []
+            for kline in klines:
+                if isinstance(kline, UnifiedKlineData):
+                    # 转换为字典
+                    kline_dict = asdict(kline)
+                elif isinstance(kline, dict):
+                    # 已经是字典
+                    kline_dict = kline
+                else:
+                    logger.warning(f"⚠️ 未知的K线数据类型: {type(kline)}")
+                    continue
+                
+                # 添加 symbol 和 interval
+                kline_dict['symbol'] = symbol
+                kline_dict['interval'] = interval
+                klines_with_meta.append(kline_dict)
             
             # 一次性写入（内部会自动分批）
             await postgresql_manager.write_kline_data(klines_with_meta)
@@ -214,12 +229,28 @@ class HistoricalDataManager:
             )
             
             if klines:
-                # 给每条数据添加 symbol 和 interval
-                klines_with_meta = [
-                    {**kline, 'symbol': symbol, 'interval': interval}
-                    for kline in klines
-                ]
-                await postgresql_manager.write_kline_data(klines_with_meta)
+                # 🔧 修复：将UnifiedKlineData对象转换为字典
+                from dataclasses import asdict
+                from app.exchange.base_exchange_client import UnifiedKlineData
+                
+                klines_dict = []
+                for kline in klines:
+                    if isinstance(kline, UnifiedKlineData):
+                        # 转换为字典
+                        kline_dict = asdict(kline)
+                    elif isinstance(kline, dict):
+                        # 已经是字典
+                        kline_dict = kline
+                    else:
+                        logger.warning(f"⚠️ 未知的K线数据类型: {type(kline)}")
+                        continue
+                    
+                    # 添加 symbol 和 interval
+                    kline_dict['symbol'] = symbol
+                    kline_dict['interval'] = interval
+                    klines_dict.append(kline_dict)
+                
+                await postgresql_manager.write_kline_data(klines_dict)
                 logger.debug(f"更新K线数据: {symbol} {interval} {len(klines)}条")
             
         except Exception as e:

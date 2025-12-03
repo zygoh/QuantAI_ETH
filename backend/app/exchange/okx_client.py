@@ -825,10 +825,11 @@ class OKXWebSocketClient:
         self.health_check_task = None
         
         # WebSocket URL
+        # 🔥 根据OKX文档，K线频道需要使用business地址
         if settings.OKX_TESTNET:
-            self.ws_url = "wss://wspap.okx.com:8443/ws/v5/public"  # 模拟盘
+            self.ws_url = "wss://wspap.okx.com:8443/ws/v5/business"  # 模拟盘
         else:
-            self.ws_url = "wss://ws.okx.com:8443/ws/v5/public"  # 实盘
+            self.ws_url = "wss://ws.okx.com:8443/ws/v5/business"  # 实盘（K线频道使用business地址）
         
         logger.info(f"✅ OKX WebSocket客户端初始化完成")
         logger.info(f"   - WebSocket URL: {self.ws_url}")
@@ -938,14 +939,23 @@ class OKXWebSocketClient:
             'inst_id': okx_symbol
         })
         
+        # 🔥 创建包装回调，传递symbol和interval信息
+        def wrapped_callback(data):
+            logger.debug(f"📞 wrapped_callback被调用: {symbol} {interval}, 数据长度={len(data) if isinstance(data, list) else 'N/A'}")
+            callback(data, symbol, interval)
+        
         # 保存回调
         callback_key = f"{channel}:{okx_symbol}"
-        self.callbacks[callback_key] = callback
+        self.callbacks[callback_key] = wrapped_callback
+        logger.info(f"✅ 注册OKX K线回调: {callback_key}, 回调函数: {callback.__name__ if hasattr(callback, '__name__') else type(callback).__name__}, 已注册回调数: {len(self.callbacks)}")
         
         # 发送订阅消息
         if self.ws and self.is_connected:
-            self.ws.send(json.dumps(sub_msg))
-            logger.info(f"✅ 订阅OKX K线: {okx_symbol} {okx_interval}")
+            sub_msg_str = json.dumps(sub_msg)
+            self.ws.send(sub_msg_str)
+            logger.info(f"✅ 发送订阅消息: {okx_symbol} {okx_interval}, channel={channel}, 消息={sub_msg_str}")
+        else:
+            logger.warning(f"⚠️ WebSocket未连接，订阅将在连接建立后自动恢复: {okx_symbol} {okx_interval}")
     
     def subscribe_ticker(self, symbol: str, callback: Callable):
         """订阅价格数据"""
@@ -991,9 +1001,28 @@ class OKXWebSocketClient:
             self.last_message_time = datetime.now()
             data = json.loads(message)
             
-            # 处理订阅确认
+            # 🔥 记录所有收到的WebSocket消息（用于调试）
+            logger.debug(f"📥 收到WebSocket原始消息: {message[:200]}...")  # 只记录前200字符
+            
+            # 处理订阅确认（OKX可能返回多种格式）
             if data.get('event') == 'subscribe':
-                logger.info(f"✅ 订阅确认: {data.get('arg', {})}")
+                arg = data.get('arg', {})
+                channel = arg.get('channel', '')
+                inst_id = arg.get('instId', '')
+                code = data.get('code', '')
+                msg = data.get('msg', '')
+                # 🔥 OKX订阅成功时code为空字符串或'0'，失败时code不为空
+                if code and code != '0' and code != 0:
+                    logger.error(f"❌ 订阅失败: channel={channel}, instId={inst_id}, code={code}, msg={msg}")
+                else:
+                    logger.info(f"✅ 订阅成功: channel={channel}, instId={inst_id}")
+                return
+            
+            # 处理错误消息（可能包含订阅失败信息）
+            if data.get('event') == 'error':
+                code = data.get('code', '')
+                msg = data.get('msg', '')
+                logger.error(f"❌ WebSocket错误: code={code}, msg={msg}")
                 return
             
             # 处理数据推送
@@ -1003,11 +1032,50 @@ class OKXWebSocketClient:
                 inst_id = arg.get('instId', '')
                 
                 callback_key = f"{channel}:{inst_id}"
+                
+                # 🔥 记录所有收到的数据推送（用于诊断）
+                logger.debug(f"📥 收到数据推送: channel={channel}, instId={inst_id}, 数据长度={len(data['data']) if isinstance(data['data'], list) else 'N/A'}")
+                
+                # 🔥 区分日志级别：只记录已完成的K线，tickers用DEBUG
+                if channel.startswith('candle'):
+                    # K线数据：只记录已完成的K线
+                    data_list = data['data'] if isinstance(data['data'], list) else []
+                    if isinstance(data_list, list) and len(data_list) > 0:
+                        first_item = data_list[0]
+                        if isinstance(first_item, list) and len(first_item) >= 8:
+                            # 🔥 OKX文档：第8个字段是confirm（不是is_closed）
+                            # confirm=1表示K线已完成，confirm=0表示K线未完成
+                            confirm = first_item[7]
+                            is_closed = (str(confirm) == "1" or confirm == 1)
+                            close_price = first_item[4]
+                            # 🔥 只记录已完成的K线
+                            if is_closed:
+                                logger.info(f"📊 收到已完成K线: {channel} {inst_id}, close={close_price}, confirm={confirm}")
+                            else:
+                                logger.debug(f"📥 收到进行中K线: {channel} {inst_id}, close={close_price}, confirm={confirm}")
+                        else:
+                            logger.debug(f"📥 收到K线数据: {channel} {inst_id}, 数据长度={len(data_list)}")
+                    else:
+                        logger.debug(f"📥 收到K线数据: {channel} {inst_id}, 数据为空")
+                else:
+                    # tickers等其他数据：只记录DEBUG级别
+                    logger.debug(f"📥 收到WebSocket数据: channel={channel}, instId={inst_id}, 数据长度={len(data['data']) if isinstance(data['data'], list) else 'N/A'}")
+                
                 if callback_key in self.callbacks:
+                    if channel.startswith('candle'):
+                        logger.debug(f"✅ 调用K线回调: {callback_key}")
+                    else:
+                        logger.debug(f"✅ 调用回调: {callback_key}")
                     self.callbacks[callback_key](data['data'])
+                else:
+                    logger.warning(f"⚠️ 未找到回调函数: {callback_key}, 已注册的回调: {list(self.callbacks.keys())}")
+            else:
+                # 记录其他类型的消息（用于调试）
+                logger.debug(f"📥 收到其他类型WebSocket消息: {list(data.keys())}")
             
         except Exception as e:
             logger.error(f"❌ 处理WebSocket消息失败: {e}")
+            logger.error(f"   原始消息: {message[:500] if len(message) > 500 else message}")
     
     def _on_error(self, ws, error):
         """WebSocket错误回调"""
@@ -1023,6 +1091,11 @@ class OKXWebSocketClient:
     
     def _restore_subscriptions(self):
         """恢复所有订阅"""
+        if not self.ws or not self.is_connected:
+            logger.warning("⚠️ WebSocket未连接，无法恢复订阅")
+            return
+        
+        logger.info(f"📋 开始恢复 {len(self.subscriptions)} 个订阅...")
         for sub in self.subscriptions:
             try:
                 sub_msg = {
@@ -1032,10 +1105,11 @@ class OKXWebSocketClient:
                         "instId": sub['inst_id']
                     }]
                 }
-                self.ws.send(json.dumps(sub_msg))
-                logger.info(f"✅ 恢复订阅: {sub['channel']} {sub['inst_id']}")
+                sub_msg_str = json.dumps(sub_msg)
+                self.ws.send(sub_msg_str)
+                logger.info(f"✅ 恢复订阅: {sub['channel']} {sub['inst_id']}, 消息={sub_msg_str}")
             except Exception as e:
-                logger.error(f"❌ 恢复订阅失败: {e}")
+                logger.error(f"❌ 恢复订阅失败: {sub}, 错误={e}")
     
     def _schedule_reconnect(self):
         """安排重连"""

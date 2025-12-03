@@ -244,6 +244,93 @@ class EnsembleMLService(MLService):
             elif self.use_gradient_checkpointing:
                 logger.info(f"      💾 预期GPU内存节省: ~40-50% (6.3GB → 3.5GB)")
     
+    def _predict_xgboost(self, model: xgb.XGBClassifier, X: np.ndarray, return_single: bool = False) -> tuple:
+        """
+        XGBoost预测辅助方法（修复设备不匹配问题）
+        
+        Args:
+            model: XGBoost模型
+            X: 特征数据（numpy数组或DataFrame）
+            return_single: 是否返回单个值（True=单样本预测，False=批量预测）
+        
+        Returns:
+            tuple: 
+                - return_single=True: (预测类别标量, 预测概率1D数组)
+                - return_single=False: (预测类别数组, 预测概率2D数组)
+        """
+        try:
+            # 确保数据格式正确
+            if isinstance(X, pd.DataFrame):
+                X_pred = X.values.astype(np.float32)
+            elif isinstance(X, np.ndarray):
+                X_pred = X.astype(np.float32)
+            else:
+                X_pred = np.asarray(X, dtype=np.float32)
+            
+            # 确保数据是2D数组
+            if len(X_pred.shape) == 1:
+                X_pred = X_pred.reshape(1, -1)
+            
+            # 确保数据是连续的
+            if not X_pred.flags['C_CONTIGUOUS']:
+                X_pred = np.ascontiguousarray(X_pred, dtype=np.float32)
+            
+            # 检查XGBoost模型是否在GPU上训练
+            booster = model.get_booster()
+            
+            try:
+                # 获取booster的配置信息
+                config = booster.save_config()
+                import json
+                config_dict = json.loads(config)
+                device = config_dict.get('learner', {}).get('learner_train_param', {}).get('device', '')
+                
+                # 如果模型在GPU上训练，使用inplace_predict避免设备不匹配
+                if device and 'cuda' in device.lower():
+                    # 使用inplace_predict（推荐，避免设备不匹配警告）
+                    xgb_proba_raw = booster.inplace_predict(X_pred, iteration_range=(0, booster.num_boosted_rounds()))
+                    
+                    # 转换为概率格式
+                    if len(xgb_proba_raw.shape) == 1:
+                        # 单样本情况：reshape为(1, n_classes)
+                        n_classes = len(xgb_proba_raw)
+                        xgb_proba = xgb_proba_raw.reshape(1, n_classes)
+                    else:
+                        # 多样本情况
+                        xgb_proba = xgb_proba_raw
+                    
+                    # 预测类别
+                    xgb_pred = np.argmax(xgb_proba, axis=1)
+                    
+                    # 根据return_single决定返回格式
+                    if return_single and len(xgb_pred) == 1:
+                        return xgb_pred[0], xgb_proba[0]
+                    else:
+                        return xgb_pred, xgb_proba
+                else:
+                    # CPU模式，使用标准方式
+                    xgb_proba = model.predict_proba(X_pred)
+                    xgb_pred = model.predict(X_pred)
+                    
+                    if return_single and len(xgb_pred) == 1:
+                        return xgb_pred[0], xgb_proba[0]
+                    else:
+                        return xgb_pred, xgb_proba
+            except Exception as e:
+                # 如果配置解析失败，使用标准方式
+                logger.debug(f"XGBoost设备检测失败，使用标准方式: {e}")
+                xgb_proba = model.predict_proba(X_pred)
+                xgb_pred = model.predict(X_pred)
+                
+                if return_single and len(xgb_pred) == 1:
+                    return xgb_pred[0], xgb_proba[0]
+                else:
+                    return xgb_pred, xgb_proba
+                    
+        except Exception as e:
+            logger.error(f"XGBoost预测失败: {e}")
+            raise
+    
     def clear_gpu_memory(self):
         """
         清理GPU内存
@@ -467,8 +554,10 @@ class EnsembleMLService(MLService):
                 try:
                     memmap_dir = self.model_dir if hasattr(self, 'model_dir') and self.model_dir else 'models'
                     os.makedirs(memmap_dir, exist_ok=True)
-                    seq_path = os.path.join(memmap_dir, f"{settings.SYMBOL}_{timeframe}_Xseq.npy")
-                    y_path = os.path.join(memmap_dir, f"{settings.SYMBOL}_{timeframe}_Yseq.npy")
+                    # 🔧 修复：处理SYMBOL中的/字符（如"ETH/USDT"），替换为_避免路径问题
+                    safe_symbol = settings.SYMBOL.replace('/', '_')
+                    seq_path = os.path.join(memmap_dir, f"{safe_symbol}_{timeframe}_Xseq.npy")
+                    y_path = os.path.join(memmap_dir, f"{safe_symbol}_{timeframe}_Yseq.npy")
 
                     # 写入为.npy（内含shape与dtype），再以只读内存映射方式打开
                     mm_x = open_memmap(seq_path, mode='w+', dtype=np.float32, shape=X_seq.shape)
@@ -881,12 +970,14 @@ class EnsembleMLService(MLService):
             
             # 使用验证集生成预测（用于训练元学习器）
             lgb_pred_proba_val = lgb_model.predict_proba(X_lgb_val)
-            xgb_pred_proba_val = xgb_model.predict_proba(X_xgb_val)
+            # ✅ 使用统一的XGBoost预测方法（修复设备不匹配问题，批量预测）
+            _, xgb_pred_proba_val = self._predict_xgboost(xgb_model, X_xgb_val, return_single=False)
             cat_pred_proba_val = cat_model.predict_proba(X_cat_val)
             
             # 使用测试集生成预测（用于评估元学习器）
             lgb_pred_proba_test = lgb_model.predict_proba(X_lgb_test)
-            xgb_pred_proba_test = xgb_model.predict_proba(X_xgb_test)
+            # ✅ 使用统一的XGBoost预测方法（修复设备不匹配问题，批量预测）
+            _, xgb_pred_proba_test = self._predict_xgboost(xgb_model, X_xgb_test, return_single=False)
             cat_pred_proba_test = cat_model.predict_proba(X_cat_test)
             
             # Informer-2预测（如果启用，使用序列验证和测试数据）
@@ -911,11 +1002,13 @@ class EnsembleMLService(MLService):
             
             # 获取预测类别（验证集和测试集）
             lgb_pred_raw_val = lgb_model.predict(X_lgb_val)
-            xgb_pred_raw_val = xgb_model.predict(X_xgb_val)
+            # ✅ 使用统一的XGBoost预测方法（修复设备不匹配问题，批量预测）
+            xgb_pred_raw_val, _ = self._predict_xgboost(xgb_model, X_xgb_val, return_single=False)
             cat_pred_raw_val = cat_model.predict(X_cat_val)
             
             lgb_pred_raw_test = lgb_model.predict(X_lgb_test)
-            xgb_pred_raw_test = xgb_model.predict(X_xgb_test)
+            # ✅ 使用统一的XGBoost预测方法（修复设备不匹配问题，批量预测）
+            xgb_pred_raw_test, _ = self._predict_xgboost(xgb_model, X_xgb_test, return_single=False)
             cat_pred_raw_test = cat_model.predict(X_cat_test)
             
             # 🔑 统一转换为1D数组（CatBoost返回2D，需要ravel）
@@ -1196,10 +1289,14 @@ class EnsembleMLService(MLService):
                 (xgb_pred_val == cat_pred_val).mean()
             ]))
             
-            # 🆕 交易经济性指标
-            trade_efficiency = float(signal_accuracy / signal_frequency if signal_frequency > 0 else 0)
-            fee_impact = float(signal_frequency * 0.0007 * 100)  # 预估日手续费损耗%
-            required_winrate = float(0.5 + (0.0007 / 0.02))  # 盈亏比1:1时的盈亏平衡胜率
+            # 🆕 交易经济性指标 - 使用Decimal确保金融计算精度
+            from decimal import Decimal, ROUND_HALF_UP
+            signal_frequency_decimal = Decimal(str(signal_frequency))
+            signal_accuracy_decimal = Decimal(str(signal_accuracy))
+            
+            trade_efficiency = float((signal_accuracy_decimal / signal_frequency_decimal).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)) if signal_frequency > 0 else 0.0
+            fee_impact = float((signal_frequency_decimal * Decimal('0.0007') * Decimal('100')).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP))  # 预估日手续费损耗%
+            required_winrate = float((Decimal('0.5') + (Decimal('0.0007') / Decimal('0.02'))).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP))  # 盈亏比1:1时的盈亏平衡胜率
             
             # 🆕 预测置信度分布
             try:
@@ -1268,7 +1365,8 @@ class EnsembleMLService(MLService):
             
             # 6️⃣ 评估各基础模型
             lgb_pred = lgb_model.predict(X_lgb_val)
-            xgb_pred = xgb_model.predict(X_xgb_val)
+            # ✅ 使用统一的XGBoost预测方法（修复设备不匹配问题，批量预测）
+            xgb_pred, _ = self._predict_xgboost(xgb_model, X_xgb_val, return_single=False)
             cat_pred = cat_model.predict(X_cat_val)
             
             lgb_acc = accuracy_score(y_lgb_val, lgb_pred)
@@ -1765,8 +1863,13 @@ class EnsembleMLService(MLService):
             logger.info(f"   归一化后统计: 范围=[{X_seq_train.min():.4f}, {X_seq_train.max():.4f}], 均值={X_seq_train.mean():.4f}, 标准差={X_seq_train.std():.4f}")
             
             # 保存scaler用于预测时使用
+            # 🔧 修复：如果self.scalers[timeframe]是StandardScaler对象，需要转换为字典结构
             if timeframe not in self.scalers:
                 self.scalers[timeframe] = {}
+            elif not isinstance(self.scalers[timeframe], dict):
+                # 如果已经是StandardScaler对象，转换为字典结构
+                old_scaler = self.scalers[timeframe]
+                self.scalers[timeframe] = {'traditional': old_scaler}
             self.scalers[timeframe]['informer2'] = scaler
             
             X_tensor = torch.from_numpy(X_seq_train)  # (n_samples, seq_len, n_features) - 避免复制
@@ -2155,17 +2258,18 @@ class EnsembleMLService(MLService):
                                     f"mean={logits.mean().item():.4f}")
                         logger.error(f"   Target分布: {torch.bincount(batch_y.long()).tolist()}")
                         
-                        # ✅ 修复A - 诊断4: 检查梯度
-                        loss.backward()
-                        max_grad_norm = 0.0
-                        for name, param in model.named_parameters():
-                            if param.grad is not None:
-                                grad_norm = param.grad.norm().item()
-                                max_grad_norm = max(max_grad_norm, grad_norm)
-                                if grad_norm > 1000 or grad_norm != grad_norm:  # 梯度爆炸或NaN
-                                    logger.error(f"   {name}: 梯度异常 norm={grad_norm:.4f}")
-                        
-                        logger.error(f"   最大梯度范数: {max_grad_norm:.4f}")
+                        # ✅ 修复A - 诊断4: 检查梯度（仅在非混合精度模式下）
+                        if not use_amp:
+                            loss.backward()
+                            max_grad_norm = 0.0
+                            for name, param in model.named_parameters():
+                                if param.grad is not None:
+                                    grad_norm = param.grad.norm().item()
+                                    max_grad_norm = max(max_grad_norm, grad_norm)
+                                    if grad_norm > 1000 or grad_norm != grad_norm:  # 梯度爆炸或NaN
+                                        logger.error(f"   {name}: 梯度异常 norm={grad_norm:.4f}")
+                            
+                            logger.error(f"   最大梯度范数: {max_grad_norm:.4f}")
                         
                         # 仅在前5次或每50次打印警告，避免日志刷屏
                         if nan_inf_count <= 5 or nan_inf_count % 50 == 0:
@@ -2181,6 +2285,14 @@ class EnsembleMLService(MLService):
                         if nan_inf_count >= max_nan_inf_tolerance:
                             logger.error(f"❌ 累计{nan_inf_count}个batch出现nan/inf损失（超过阈值{max_nan_inf_tolerance}），训练终止！")
                             raise ValueError(f"训练过程数值不稳定：累计{nan_inf_count}个batch出现nan/inf损失")
+                        
+                        # ✅ 修复：如果使用了混合精度，需要清理scaler状态
+                        if use_amp:
+                            try:
+                                # 检查scaler是否处于unscaled状态
+                                scaler.update()  # 更新scaler状态，避免后续unscale_()报错
+                            except:
+                                pass
                         
                         optimizer.zero_grad()
                         continue
@@ -2199,7 +2311,16 @@ class EnsembleMLService(MLService):
                     if (i + 1) % accumulation_steps == 0 or (i + 1) == len(dataloader):
                         # ⚠️ 重要：混合精度训练时必须先unscale_()再裁剪
                         if use_amp:
-                            scaler.unscale_(optimizer)  # 先反缩放梯度，否则裁剪无效
+                            try:
+                                scaler.unscale_(optimizer)  # 先反缩放梯度，否则裁剪无效
+                            except RuntimeError as e:
+                                if "unscale_() has already been called" in str(e):
+                                    # 如果已经调用过unscale_()，说明之前可能已经处理过，直接跳过
+                                    logger.warning(f"⚠️ Batch {i+1}: unscale_()已调用，跳过此次更新")
+                                    optimizer.zero_grad()
+                                    continue
+                                else:
+                                    raise
                         
                         # ⭐ 核心修复：梯度裁剪（防止梯度爆炸）
                         torch.nn.utils.clip_grad_norm_(
@@ -2382,11 +2503,13 @@ class EnsembleMLService(MLService):
             
             # 🔑 基础模型预测（使用短键名）
             lgb_proba = models['lgb'].predict_proba(X_pred)[0]
-            xgb_proba = models['xgb'].predict_proba(X_pred)[0]
+            
+            # ✅ 修复XGBoost设备不匹配问题：使用统一的预测方法（单样本预测）
+            xgb_pred, xgb_proba = self._predict_xgboost(models['xgb'], X_pred, return_single=True)
+            
             cat_proba = models['cat'].predict_proba(X_pred)[0]
             
             lgb_pred = models['lgb'].predict(X_pred)[0]
-            xgb_pred = models['xgb'].predict(X_pred)[0]
             cat_pred = models['cat'].predict(X_pred)[0]
             
             # 🤖 Informer-2预测（如果存在，需要序列输入）
@@ -2551,6 +2674,9 @@ class EnsembleMLService(MLService):
             model_dir.mkdir(parents=True, exist_ok=True)
             
             # 🔥 使用临时目录进行原子性保存
+            # 🔧 修复：处理SYMBOL中的/字符（如"ETH/USDT"），替换为_避免路径问题
+            safe_symbol = settings.SYMBOL.replace('/', '_')
+            
             with tempfile.TemporaryDirectory(dir=model_dir) as temp_dir:
                 temp_path = Path(temp_dir)
                 saved_count = 0
@@ -2565,35 +2691,40 @@ class EnsembleMLService(MLService):
                 
                 for short_name in model_mapping:
                     if short_name in models:
-                        temp_file = temp_path / f"{settings.SYMBOL}_{timeframe}_{short_name}_model.pkl"
+                        temp_file = temp_path / f"{safe_symbol}_{timeframe}_{short_name}_model.pkl"
+                        temp_file.parent.mkdir(parents=True, exist_ok=True)  # 🔧 确保目录存在
                         with open(temp_file, 'wb') as f:
                             pickle.dump(models[short_name], f)
                         saved_count += 1
                 
                 # 保存Informer-2
                 if 'inf' in models and TORCH_AVAILABLE:
-                    temp_file = temp_path / f"{settings.SYMBOL}_{timeframe}_inf_model.pt"
+                    temp_file = temp_path / f"{safe_symbol}_{timeframe}_inf_model.pt"
+                    temp_file.parent.mkdir(parents=True, exist_ok=True)  # 🔧 确保目录存在
                     with open(temp_file, 'wb') as f:
                         pickle.dump(models['inf'], f)
                     saved_count += 1
                 
                 # 保存scaler和特征列表
                 if timeframe in self.scalers:
-                    temp_file = temp_path / f"{settings.SYMBOL}_{timeframe}_scaler.pkl"
+                    temp_file = temp_path / f"{safe_symbol}_{timeframe}_scaler.pkl"
+                    temp_file.parent.mkdir(parents=True, exist_ok=True)  # 🔧 确保目录存在
                     with open(temp_file, 'wb') as f:
                         pickle.dump(self.scalers[timeframe], f)
                     saved_count += 1
                 
                 if timeframe in self.feature_columns_dict:
-                    temp_file = temp_path / f"{settings.SYMBOL}_{timeframe}_features.pkl"
+                    temp_file = temp_path / f"{safe_symbol}_{timeframe}_features.pkl"
+                    temp_file.parent.mkdir(parents=True, exist_ok=True)  # 🔧 确保目录存在
                     with open(temp_file, 'wb') as f:
                         pickle.dump(self.feature_columns_dict[timeframe], f)
                     saved_count += 1
                 
                 # 🔥 原子性移动：一次性替换所有文件
-                for temp_file in temp_path.glob(f"{settings.SYMBOL}_{timeframe}_*"):
+                for temp_file in temp_path.glob(f"{safe_symbol}_{timeframe}_*"):
                     target_file = model_dir / temp_file.name
                     # Windows下使用replace实现原子性替换
+                    target_file.parent.mkdir(parents=True, exist_ok=True)  # 🔧 确保目标目录存在
                     shutil.move(str(temp_file), str(target_file))
                 
                 logger.info(f"✅ {timeframe} 集成模型保存完成（{saved_count}个文件，原子性更新）")
@@ -2608,6 +2739,10 @@ class EnsembleMLService(MLService):
             model_dir = Path(self.model_dir)  # 使用父类的model_dir
             models = {}
             
+            # 🔧 修复：处理SYMBOL中的/字符（如"ETH/USDT"），替换为_避免路径问题
+            # 必须与_save_ensemble_models中的逻辑保持一致
+            safe_symbol = settings.SYMBOL.replace('/', '_')
+            
             # 🔑 加载传统模型（必需）
             model_mapping = {
                 'lgb': 'lgb',
@@ -2618,20 +2753,24 @@ class EnsembleMLService(MLService):
             
             # 检查必需模型文件是否存在
             for short_name in model_mapping:
-                filepath = model_dir / f"{settings.SYMBOL}_{timeframe}_{short_name}_model.pkl"
+                filepath = model_dir / f"{safe_symbol}_{timeframe}_{short_name}_model.pkl"
                 if not filepath.exists():
                     logger.warning(f"⚠️ {timeframe} {short_name}模型文件不存在: {filepath}")
+                    # 🔧 增强诊断：列出实际存在的文件
+                    existing_files = list(model_dir.glob(f"*_{timeframe}_{short_name}_model.pkl"))
+                    if existing_files:
+                        logger.info(f"   发现类似文件: {existing_files}")
                     return False
             
             # 加载所有传统模型
             for short_name in model_mapping:
-                filepath = model_dir / f"{settings.SYMBOL}_{timeframe}_{short_name}_model.pkl"
+                filepath = model_dir / f"{safe_symbol}_{timeframe}_{short_name}_model.pkl"
                 with open(filepath, 'rb') as f:
                     models[short_name] = pickle.load(f)
             
             # 🤖 加载Informer-2模型（可选，如果存在）
             if TORCH_AVAILABLE:
-                inf_filepath = model_dir / f"{settings.SYMBOL}_{timeframe}_inf_model.pt"
+                inf_filepath = model_dir / f"{safe_symbol}_{timeframe}_inf_model.pt"
                 if inf_filepath.exists():
                     with open(inf_filepath, 'rb') as f:
                         models['inf'] = pickle.load(f)
@@ -2640,12 +2779,12 @@ class EnsembleMLService(MLService):
             self.ensemble_models[timeframe] = models
             
             # 🔥 加载scaler和features（关键！预测时需要）
-            scaler_path = model_dir / f"{settings.SYMBOL}_{timeframe}_scaler.pkl"
+            scaler_path = model_dir / f"{safe_symbol}_{timeframe}_scaler.pkl"
             if scaler_path.exists():
                 with open(scaler_path, 'rb') as f:
                     self.scalers[timeframe] = pickle.load(f)
             
-            features_path = model_dir / f"{settings.SYMBOL}_{timeframe}_features.pkl"
+            features_path = model_dir / f"{safe_symbol}_{timeframe}_features.pkl"
             if features_path.exists():
                 with open(features_path, 'rb') as f:
                     self.feature_columns_dict[timeframe] = pickle.load(f)
@@ -2726,7 +2865,8 @@ class EnsembleMLService(MLService):
                     
                     # 基础模型预测
                     lgb_pred = models['lgb'].predict(X_pred)
-                    xgb_pred = models['xgb'].predict(X_pred)
+                    # ✅ 使用统一的XGBoost预测方法（修复设备不匹配问题，批量预测）
+                    xgb_pred, _ = self._predict_xgboost(models['xgb'], X_pred, return_single=False)
                     cat_pred = models['cat'].predict(X_pred)
                     
                     # 元学习器预测
@@ -2819,12 +2959,13 @@ class EnsembleMLService(MLService):
         try:
             # 基础模型预测概率
             lgb_proba = models['lgb'].predict_proba(X_pred)[0]
-            xgb_proba = models['xgb'].predict_proba(X_pred)[0]
+            # ✅ 使用统一的XGBoost预测方法（修复设备不匹配问题，单样本预测）
+            xgb_pred, xgb_proba = self._predict_xgboost(models['xgb'], X_pred, return_single=True)
             cat_proba = models['cat'].predict_proba(X_pred)[0]
             
             # 基础模型预测结果
             lgb_pred = models['lgb'].predict(X_pred)[0]
-            xgb_pred = models['xgb'].predict(X_pred)[0]
+            # xgb_pred 已在上面获取
             cat_pred = models['cat'].predict(X_pred)[0]
             
             # Informer-2预测（如果存在）

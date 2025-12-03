@@ -11,6 +11,8 @@ import pandas as pd
 from app.core.config import settings
 from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
+from app.exchange.exchange_factory import ExchangeFactory
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +107,8 @@ class HealthMonitor:
             websocket_status = await self._check_websocket_data()
             model_status = await self._check_model()
             cache_status = await self._check_cache()
+            exchange_status = await self._check_exchange_connection()
+            ml_service_status = await self._check_ml_service()
             
             # 汇总状态
             services = {
@@ -112,17 +116,19 @@ class HealthMonitor:
                 'websocket': websocket_status['healthy'],
                 'model': model_status['healthy'],
                 'cache': cache_status['healthy'],
+                'exchange': exchange_status['healthy'],
+                'ml_service': ml_service_status['healthy'],
                 'postgresql': db_status['connected'],
                 'redis': cache_status['connected']
             }
             
-            # 判断整体状态（🔥 优化：以WebSocket缓冲区为核心）
-            # 关键服务：WebSocket缓冲区（预测数据源）、缓存（系统通信）
-            critical_services = ['websocket', 'cache']
+            # 判断整体状态（🔥 优化：以WebSocket缓冲区和交易所连接为核心）
+            # 关键服务：WebSocket缓冲区（预测数据源）、缓存（系统通信）、交易所连接（数据源）
+            critical_services = ['websocket', 'cache', 'exchange']
             all_critical_ok = all(services[s] for s in critical_services)
             
-            # 数据库和模型是辅助服务，不影响核心功能
-            auxiliary_ok = services['database'] and services['model']
+            # 数据库、模型和ML服务是辅助服务，不影响核心功能
+            auxiliary_ok = services['database'] and services['model'] and services['ml_service']
             
             if all_critical_ok and auxiliary_ok:
                 overall = 'HEALTHY'
@@ -140,7 +146,9 @@ class HealthMonitor:
                     'database': db_status,
                     'websocket': websocket_status,
                     'model': model_status,
-                    'cache': cache_status
+                    'cache': cache_status,
+                    'exchange': exchange_status,
+                    'ml_service': ml_service_status
                 },
                 'last_check': check_time.isoformat(),
                 'next_check': (check_time + timedelta(seconds=self.check_interval)).isoformat()
@@ -151,6 +159,29 @@ class HealthMonitor:
             
             # 🔥 优化日志：只在状态变化时输出详细信息
             status_changed = (overall != self.last_overall_status)
+            
+            # 🆕 触发告警（状态变化或关键服务异常）
+            if status_changed or overall == 'UNHEALTHY':
+                if overall == 'UNHEALTHY':
+                    await self._send_alert('SYSTEM_UNHEALTHY', 'system', 
+                                         f'系统健康状态异常: {overall}', 'CRITICAL')
+                elif overall == 'DEGRADED':
+                    await self._send_alert('SYSTEM_DEGRADED', 'system',
+                                         f'系统性能降级: {overall}', 'WARNING')
+            
+            # 检查关键服务并触发告警
+            if not exchange_status['healthy']:
+                await self._send_alert('EXCHANGE_DISCONNECTED', 'exchange',
+                                     f'交易所连接异常: {exchange_status.get("message", "未知错误")}', 'CRITICAL')
+            if not ml_service_status['healthy']:
+                await self._send_alert('ML_SERVICE_ERROR', 'ml_service',
+                                     f'ML服务异常: {ml_service_status.get("message", "未知错误")}', 'WARNING')
+            if not websocket_status['healthy']:
+                await self._send_alert('WEBSOCKET_ERROR', 'websocket',
+                                     f'WebSocket异常: {websocket_status.get("message", "未知错误")}', 'CRITICAL')
+            if not db_status['healthy']:
+                await self._send_alert('DATABASE_ERROR', 'database',
+                                     f'数据库异常: {db_status.get("message", "未知错误")}', 'WARNING')
             
             if status_changed:
                 # 状态变化，输出详细信息
@@ -182,6 +213,8 @@ class HealthMonitor:
                 accuracy_str = f"{accuracy:.4f}" if accuracy is not None else "N/A"
                 logger.info(f"   模型: {'✅' if model_status['healthy'] else '❌'} (准确率: {accuracy_str})")
                 logger.info(f"   缓存: {'✅' if cache_status['healthy'] else '❌'}")
+                logger.info(f"   交易所: {'✅' if exchange_status['healthy'] else '❌'} ({exchange_status.get('exchange_type', 'N/A')})")
+                logger.info(f"   ML服务: {'✅' if ml_service_status['healthy'] else '❌'} (运行: {'✅' if ml_service_status.get('service_running') else '❌'}, 模型: {'✅' if ml_service_status.get('model_loaded') else '❌'})")
                 
                 # 更新上次状态
                 self.last_overall_status = overall
@@ -362,14 +395,18 @@ class HealthMonitor:
             all_files_exist = True
             missing_files = []
             
+            # 🔧 修复：处理SYMBOL中的/字符（如"ETH/USDT"），替换为_避免路径问题
+            # 必须与ensemble_ml_service中的逻辑保持一致
+            safe_symbol = settings.SYMBOL.replace('/', '_')
+            
             for timeframe in settings.TIMEFRAMES:
                 # 🔧 检查Stacking集成模型的6个文件（4个模型 + scaler + features）
-                lgb_path = f"models/{settings.SYMBOL}_{timeframe}_lgb_model.pkl"
-                xgb_path = f"models/{settings.SYMBOL}_{timeframe}_xgb_model.pkl"
-                cat_path = f"models/{settings.SYMBOL}_{timeframe}_cat_model.pkl"
-                meta_path = f"models/{settings.SYMBOL}_{timeframe}_meta_model.pkl"
-                scaler_path = f"models/{settings.SYMBOL}_{timeframe}_scaler.pkl"
-                features_path = f"models/{settings.SYMBOL}_{timeframe}_features.pkl"
+                lgb_path = f"models/{safe_symbol}_{timeframe}_lgb_model.pkl"
+                xgb_path = f"models/{safe_symbol}_{timeframe}_xgb_model.pkl"
+                cat_path = f"models/{safe_symbol}_{timeframe}_cat_model.pkl"
+                meta_path = f"models/{safe_symbol}_{timeframe}_meta_model.pkl"
+                scaler_path = f"models/{safe_symbol}_{timeframe}_scaler.pkl"
+                features_path = f"models/{safe_symbol}_{timeframe}_features.pkl"
                 
                 required_files = [
                     (lgb_path, f"{timeframe}_lgb"),
@@ -461,9 +498,132 @@ class HealthMonitor:
                 'message': 'Redis 连接失败'
             }
     
+    async def _check_exchange_connection(self) -> Dict[str, Any]:
+        """检查交易所连接状态"""
+        try:
+            exchange_client = ExchangeFactory.get_current_client()
+            
+            # 检查WebSocket连接状态
+            ws_connected = False
+            if hasattr(exchange_client, 'ws_client') and exchange_client.ws_client:
+                if hasattr(exchange_client.ws_client, 'is_connected'):
+                    ws_connected = exchange_client.ws_client.is_connected
+            
+            # 检查REST API连接（通过检查market_api是否存在）
+            rest_connected = False
+            try:
+                if hasattr(exchange_client, 'market_api') and exchange_client.market_api:
+                    rest_connected = True
+                elif hasattr(exchange_client, 'get_server_time'):
+                    # 同步方法，直接调用
+                    server_time = exchange_client.get_server_time()
+                    rest_connected = server_time is not None
+            except Exception as e:
+                logger.debug(f"交易所REST API检查失败: {e}")
+                rest_connected = False
+            
+            healthy = ws_connected and rest_connected
+            
+            return {
+                'healthy': healthy,
+                'ws_connected': ws_connected,
+                'rest_connected': rest_connected,
+                'exchange_type': settings.EXCHANGE_TYPE,
+                'message': 'OK' if healthy else f'WebSocket: {"✅" if ws_connected else "❌"}, REST: {"✅" if rest_connected else "❌"}'
+            }
+            
+        except Exception as e:
+            logger.error(f"交易所连接检查失败: {e}")
+            return {
+                'healthy': False,
+                'error': str(e),
+                'message': '交易所连接检查失败'
+            }
+    
+    async def _check_ml_service(self) -> Dict[str, Any]:
+        """检查机器学习服务状态"""
+        try:
+            # 检查模型服务是否运行
+            ml_service_running = False
+            training_in_progress = False
+            model_loaded = False
+            
+            # 通过信号生成器检查（如果可用）
+            if self.signal_generator:
+                if hasattr(self.signal_generator, 'ml_service'):
+                    ml_service = self.signal_generator.ml_service
+                    if ml_service:
+                        ml_service_running = getattr(ml_service, 'is_running', False)
+                        if hasattr(ml_service, 'models'):
+                            model_loaded = len(ml_service.models) > 0
+                        if hasattr(ml_service, 'training_task'):
+                            training_in_progress = ml_service.training_task is not None and not ml_service.training_task.done()
+            
+            # 检查模型文件是否存在
+            model_files_exist = True
+            # 🔧 修复：处理SYMBOL中的/字符（如"ETH/USDT"），替换为_避免路径问题
+            safe_symbol = settings.SYMBOL.replace('/', '_')
+            for timeframe in settings.TIMEFRAMES:
+                meta_path = f"models/{safe_symbol}_{timeframe}_meta_model.pkl"
+                if not os.path.exists(meta_path):
+                    model_files_exist = False
+                    break
+            
+            healthy = ml_service_running and model_loaded and model_files_exist
+            
+            return {
+                'healthy': healthy,
+                'service_running': ml_service_running,
+                'model_loaded': model_loaded,
+                'model_files_exist': model_files_exist,
+                'training_in_progress': training_in_progress,
+                'message': 'OK' if healthy else f'服务: {"✅" if ml_service_running else "❌"}, 模型: {"✅" if model_loaded else "❌"}, 文件: {"✅" if model_files_exist else "❌"}'
+            }
+            
+        except Exception as e:
+            logger.error(f"ML服务检查失败: {e}")
+            return {
+                'healthy': False,
+                'error': str(e),
+                'message': 'ML服务检查失败'
+            }
+    
     def get_health_status(self) -> Dict[str, Any]:
         """获取当前健康状态"""
         return self.health_status
+    
+    async def _send_alert(self, alert_type: str, component: str, message: str, severity: str = 'WARNING'):
+        """
+        发送告警通知
+        
+        Args:
+            alert_type: 告警类型 (SYSTEM_UNHEALTHY, EXCHANGE_DISCONNECTED, etc.)
+            component: 组件名称
+            message: 告警消息
+            severity: 严重程度 (CRITICAL, WARNING, INFO)
+        """
+        try:
+            alert_data = {
+                'type': alert_type,
+                'component': component,
+                'message': message,
+                'severity': severity,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            # 记录告警日志
+            if severity == 'CRITICAL':
+                logger.critical(f"🚨 [CRITICAL] {component}: {message}")
+            elif severity == 'WARNING':
+                logger.warning(f"⚠️ [WARNING] {component}: {message}")
+            else:
+                logger.info(f"ℹ️ [INFO] {component}: {message}")
+            
+            # 缓存告警（供前端查询，保留1小时）
+            await cache_manager.set(f"alert:{component}:{alert_type}", alert_data, expire=3600)
+            
+        except Exception as e:
+            logger.error(f"发送告警失败: {e}")
 
 # 全局健康监控器实例
 health_monitor = HealthMonitor()

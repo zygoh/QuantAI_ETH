@@ -64,7 +64,9 @@ class SignalGenerator:
         # 信号生成参数
         self.confidence_threshold = settings.CONFIDENCE_THRESHOLD
         self.min_signal_interval = 180  # 短线策略：3分钟最小信号间隔（180秒，与3m K线周期一致）
-        self.min_prediction_interval = 30  # 预测频率防抖：同一时间框架至少间隔30秒
+        # 🔥 移除预测间隔限制：K线完成时立即预测（实时响应）
+        # 原设计：min_prediction_interval = 30秒（防抖）
+        # 新设计：K线完成是明确事件，应该立即响应，不需要防抖
         
         # 🔑 预测频率控制（新增）
         self.last_prediction_time: Dict[str, float] = {}  # {timeframe: timestamp}
@@ -211,7 +213,7 @@ class SignalGenerator:
     async def _on_new_data(self, kline_data: KlineData):
         """处理新的K线数据 - 更新缓冲区并预测该时间框架"""
         try:
-            logger.debug(f"📊 信号生成器收到新K线: {kline_data.symbol} {kline_data.interval}")
+            logger.info(f"📊 信号生成器收到新K线: {kline_data.symbol} {kline_data.interval} is_closed={kline_data.is_closed}")
             
             if not self.is_running:
                 logger.warning("⚠️ 信号生成器未运行，跳过处理")
@@ -220,17 +222,9 @@ class SignalGenerator:
             # 1. 将WebSocket数据添加到缓冲区
             await self._update_kline_buffer(kline_data)
             
-            # 2. 🔑 检查预测间隔（新增频率控制）
+            # 2. 🔥 实时预测：K线完成时立即预测（移除时间间隔限制）
             timeframe = kline_data.interval
-            current_time = time.time()
-            last_time = self.last_prediction_time.get(timeframe, 0)
-            time_diff = current_time - last_time
-            
-            if time_diff < self.min_prediction_interval:
-                logger.debug(f"⏸️ {timeframe} 预测间隔不足: {time_diff:.1f}s < {self.min_prediction_interval}s，跳过预测")
-                return
-            
-            logger.info(f"🎯 {timeframe} 触发预测: 距离上次预测 {time_diff:.1f}s")
+            logger.info(f"🎯 {timeframe} K线完成，立即触发预测")
             
             # 3. 对该时间框架进行预测并缓存（每个时间框架独立预测）
             prediction = await self._predict_single_timeframe(kline_data.symbol, timeframe)
@@ -239,21 +233,21 @@ class SignalGenerator:
                 # 缓存该时间框架的预测结果
                 self.cached_predictions[timeframe] = prediction
                 
-                # 🔑 更新最后预测时间（新增）
-                self.last_prediction_time[timeframe] = current_time
+                # 更新最后预测时间（用于统计）
+                self.last_prediction_time[timeframe] = time.time()
                 
-                logger.debug(f"✅ {timeframe} 预测完成并缓存: {prediction.get('signal_type')} (置信度={prediction.get('confidence'):.4f})")
+                logger.info(f"✅ {timeframe} 预测完成并缓存: {prediction.get('signal_type')} (置信度={prediction.get('confidence'):.4f})")
             else:
                 # 预测失败或模型训练中（详细信息已在ml_service层记录）
-                logger.debug(f"⏸️ {timeframe} 预测暂不可用")
+                logger.warning(f"⏸️ {timeframe} 预测暂不可用（模型可能正在训练中）")
                 return
             
-            # 3. 🔥 只有5m信号更新时才触发合成（5m作为主时间框架）
+            # 4. 🔥 只有5m信号更新时才触发合成（5m作为主时间框架）
             if timeframe != '5m':
                 logger.debug(f"⏭️ {timeframe} 信号已缓存，等待5m触发合成")
                 return
             
-            logger.debug(f"🔄 5m信号更新，触发合成 (当前已缓存: {list(self.cached_predictions.keys())})")
+            logger.info(f"🔄 5m信号更新，触发合成 (当前已缓存: {list(self.cached_predictions.keys())})")
             
             # 🔥 预热计数应该在尝试合成前就+1（不管是否HOLD）
             self.signal_counter += 1
@@ -263,11 +257,11 @@ class SignalGenerator:
             signal = await self._try_synthesize_cached_signals(kline_data.symbol)
             
             if signal:
-                logger.info(f"✅ 生成合成信号: {format_signal_type(signal.signal_type)} 置信度={signal.confidence:.4f}")
+                logger.info(f"✅ 生成合成信号: {format_signal_type(signal.signal_type)} 置信度={signal.confidence:.4f} 入场={signal.entry_price:.2f}")
                 await self._process_signal(signal)
             else:
                 # HOLD或置信度不足
-                logger.debug(f"⏸️ 未生成交易信号（可能是HOLD或置信度不足）")
+                logger.info(f"⏸️ 未生成交易信号（可能是HOLD或置信度不足）")
                 
                 # 如果在预热期，也应该记录
                 if self.signal_counter <= self.warmup_signals:
@@ -845,11 +839,18 @@ class SignalGenerator:
             )
             
             # 通知回调函数（发送给交易引擎）
-            for callback in self.signal_callbacks:
-                try:
-                    await callback(signal)
-                except Exception as e:
-                    logger.error(f"信号回调失败: {e}")
+            if not self.signal_callbacks:
+                logger.warning(f"⚠️ 没有注册的信号回调函数，信号将不会被执行！")
+                logger.warning(f"   请检查trading_controller是否正确注册了回调")
+            else:
+                logger.info(f"📤 准备发送信号到{len(self.signal_callbacks)}个回调函数")
+                for idx, callback in enumerate(self.signal_callbacks):
+                    try:
+                        logger.debug(f"   调用回调函数 {idx+1}/{len(self.signal_callbacks)}: {callback.__name__ if hasattr(callback, '__name__') else type(callback).__name__}")
+                        await callback(signal)
+                        logger.debug(f"   ✅ 回调函数 {idx+1} 执行成功")
+                    except Exception as e:
+                        logger.error(f"   ❌ 回调函数 {idx+1} 执行失败: {e}", exc_info=True)
             
             logger.info(f"✅ 交易信号已发送: {signal.symbol} {signal.signal_type}")
             

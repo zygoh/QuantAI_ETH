@@ -19,7 +19,7 @@ import asyncio
 from app.core.config import settings
 from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
-from app.exchange.binance_client import binance_client
+from app.exchange.exchange_factory import ExchangeFactory
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,8 @@ class PositionManager:
         self.leverage = settings.LEVERAGE
         self.max_position_value = 500000  # 最大持仓价值（USDT）- 全仓模式需要较大值
         self.min_position_value = 20  # ✅ U本位最小仓位价值（币安要求）
+        # 🔑 获取交易所客户端（使用工厂模式，支持多交易所）
+        self.exchange_client = ExchangeFactory.get_current_client()
         
     async def initialize(self):
         """初始化仓位管理器"""
@@ -86,14 +88,14 @@ class PositionManager:
             
             # 尝试设置保证金模式为全仓（可能已经是全仓模式，失败不影响）
             try:
-                result = binance_client.change_margin_type(symbol, "CROSSED")
+                result = self.exchange_client.change_margin_type(symbol, "CROSSED")
                 logger.info(f"✓ 保证金模式设置成功: {symbol} CROSSED")
             except Exception as e:
                 logger.warning(f"⚠️ 保证金模式设置失败（可能已是全仓模式，可忽略）: {e}")
             
             # 设置杠杆倍数
             try:
-                result = binance_client.change_leverage(symbol, self.leverage)
+                result = self.exchange_client.change_leverage(symbol, self.leverage)
                 logger.info(f"✓ 杠杆设置成功: {symbol} {self.leverage}x")
             except Exception as e:
                 logger.warning(f"⚠️ 杠杆设置失败（可能已设置，可忽略）: {e}")
@@ -104,7 +106,7 @@ class PositionManager:
     async def _load_positions(self):
         """加载当前持仓"""
         try:
-            positions = binance_client.get_position_info()
+            positions = self.exchange_client.get_position_info()
             
             for pos_data in positions:
                 position_amt = float(pos_data.get('positionAmt', 0))
@@ -173,7 +175,7 @@ class PositionManager:
                 available_balance = VIRTUAL_ACCOUNT_BALANCE
                 logger.debug(f"📊 使用虚拟余额: {available_balance} USDT")
             else:
-                account_info = binance_client.get_account_info()
+                account_info = self.exchange_client.get_account_info()
                 if not account_info:
                     logger.warning("❌ 无法获取账户信息")
                     return 0.0
@@ -237,12 +239,19 @@ class PositionManager:
     async def _get_volatility_adjustment(self, symbol: str) -> float:
         """获取波动率调整系数（波动大→降仓位）"""
         try:
-            # 从Binance API获取最近24小时价格变化
-            ticker = binance_client.get_ticker_24h(symbol)
+            # 从交易所API获取最近24小时价格变化
+            # 注意：如果交易所不支持24h ticker，可以使用get_ticker_price
+            ticker = self.exchange_client.get_ticker_price(symbol)
             if not ticker:
                 return 1.0
             
-            price_change_percent = abs(float(ticker.get('priceChangePercent', 0)))
+            # 如果交易所不支持24h ticker，使用默认值
+            # 这里需要根据实际交易所API调整
+            price_change_percent = 0.0
+            if hasattr(ticker, 'price_change_percent'):
+                price_change_percent = abs(float(ticker.price_change_percent))
+            elif isinstance(ticker, dict):
+                price_change_percent = abs(float(ticker.get('priceChangePercent', 0)))
             
             # 波动率映射到调整系数
             if price_change_percent > 8.0:  # 日波动>8%
@@ -262,7 +271,7 @@ class PositionManager:
         """获取持仓暴露调整系数（持仓多→降仓位）"""
         try:
             # 获取当前持仓
-            positions = binance_client.get_position_info(symbol)
+            positions = self.exchange_client.get_position_info(symbol)
             if not positions:
                 return 1.0
             
@@ -338,7 +347,7 @@ class PositionManager:
                 return position
             
             # 从API获取
-            positions = binance_client.get_position_info(symbol)
+            positions = self.exchange_client.get_position_info(symbol)
             
             if positions:
                 pos_data = positions[0]
@@ -374,7 +383,7 @@ class PositionManager:
         """更新持仓信息"""
         try:
             # 从API获取最新信息
-            positions = binance_client.get_position_info(position.symbol)
+            positions = self.exchange_client.get_position_info(position.symbol)
             
             if positions:
                 pos_data = positions[0]
@@ -401,7 +410,7 @@ class PositionManager:
     async def calculate_risk_metrics(self) -> RiskMetrics:
         """计算风险指标"""
         try:
-            account_info = binance_client.get_account_info()
+            account_info = self.exchange_client.get_account_info()
             
             if not account_info:
                 return RiskMetrics(0, 0, 0, 0, 0, 0)

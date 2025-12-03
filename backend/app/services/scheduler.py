@@ -143,6 +143,10 @@ class TaskScheduler:
             model_dir = "models"
             has_model = False
             
+            # 🔧 修复：处理SYMBOL中的/字符（如"ETH/USDT"），替换为_避免路径问题
+            # 必须与ensemble_ml_service中的逻辑保持一致
+            safe_symbol = settings.SYMBOL.replace('/', '_')
+            
             if os.path.exists(model_dir):
                 for timeframe in settings.TIMEFRAMES:
                     # 🔧 检查Stacking集成的4个模型文件
@@ -150,7 +154,7 @@ class TaskScheduler:
                     timeframe_has_all_models = True
                     
                     for model_name in required_models:
-                        model_file = os.path.join(model_dir, f"{settings.SYMBOL}_{timeframe}_{model_name}_model.pkl")
+                        model_file = os.path.join(model_dir, f"{safe_symbol}_{timeframe}_{model_name}_model.pkl")
                         if not os.path.exists(model_file):
                             timeframe_has_all_models = False
                             break
