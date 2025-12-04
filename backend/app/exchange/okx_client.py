@@ -379,9 +379,17 @@ class OKXClient(BaseExchangeClient):
             logger.debug(f"  收到 {len(klines)} 条原始K线数据")
             
             # 转换为统一格式
+            # 🔥 OKX K线数组格式：[timestamp, open, high, low, close, volume, volCcyQuote, volCcy, confirm]
+            # 索引：            [0,       1,    2,    3,    4,     5,      6,           7,       8]
             formatted_klines = []
             for idx, kline in enumerate(klines):
                 try:
+                    # 检查数组长度
+                    if len(kline) < 7:
+                        logger.error(f"❌ 第 {idx} 条K线数据长度不足: {len(kline)} < 7")
+                        logger.error(f"   原始数据: {kline}")
+                        continue
+                    
                     # 使用安全转换处理K线数据
                     formatted_kline = UnifiedKlineData(
                         timestamp=self._safe_int(kline[0]),
@@ -391,7 +399,7 @@ class OKXClient(BaseExchangeClient):
                         close=self._safe_float(kline[4]),
                         volume=self._safe_float(kline[5]),
                         close_time=self._safe_int(kline[0]) + self._interval_to_ms(interval) - 1,
-                        quote_volume=self._safe_float(kline[6]),
+                        quote_volume=self._safe_float(kline[6]),  # volCcyQuote
                         trades=0,  # OKX不提供此字段
                         taker_buy_base_volume=0.0,  # OKX不提供此字段
                         taker_buy_quote_volume=0.0  # OKX不提供此字段
@@ -399,7 +407,7 @@ class OKXClient(BaseExchangeClient):
                     formatted_klines.append(formatted_kline)
                 except (IndexError, ValueError, TypeError) as e:
                     logger.error(f"❌ 解析第 {idx} 条K线数据失败: {e}")
-                    logger.error(f"   原始数据: {kline}")
+                    logger.error(f"   原始数据: {kline}, 长度={len(kline) if isinstance(kline, list) else 'N/A'}")
                     continue
             
             # OKX返回的数据是倒序的，需要反转
@@ -825,11 +833,17 @@ class OKXWebSocketClient:
         self.health_check_task = None
         
         # WebSocket URL
-        # 🔥 根据OKX文档，K线频道需要使用business地址
+        # 🔥 根据OKX文档：
+        # - K线频道（candle）需要使用 /ws/v5/business
+        # - Tickers频道需要使用 /ws/v5/public
+        # 当前统一使用business地址（主要用于K线），tickers订阅会失败但系统主要使用K线
         if settings.OKX_TESTNET:
             self.ws_url = "wss://wspap.okx.com:8443/ws/v5/business"  # 模拟盘
         else:
             self.ws_url = "wss://ws.okx.com:8443/ws/v5/business"  # 实盘（K线频道使用business地址）
+        
+        # ⚠️ 注意：tickers频道需要使用 /ws/v5/public，但当前系统主要使用K线数据
+        # 如果需要tickers，需要创建单独的WebSocket连接或使用不同的URL
         
         logger.info(f"✅ OKX WebSocket客户端初始化完成")
         logger.info(f"   - WebSocket URL: {self.ws_url}")
@@ -999,10 +1013,14 @@ class OKXWebSocketClient:
         """WebSocket消息接收回调"""
         try:
             self.last_message_time = datetime.now()
-            data = json.loads(message)
             
-            # 🔥 记录所有收到的WebSocket消息（用于调试）
-            logger.debug(f"📥 收到WebSocket原始消息: {message[:200]}...")  # 只记录前200字符
+            # 🔥 记录所有收到的WebSocket消息（用于调试）- 改为INFO级别以便观察
+
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ WebSocket消息JSON解析失败: {e}, 消息: {message[:200]}")
+                return
             
             # 处理订阅确认（OKX可能返回多种格式）
             if data.get('event') == 'subscribe':
@@ -1042,30 +1060,31 @@ class OKXWebSocketClient:
                     data_list = data['data'] if isinstance(data['data'], list) else []
                     if isinstance(data_list, list) and len(data_list) > 0:
                         first_item = data_list[0]
-                        if isinstance(first_item, list) and len(first_item) >= 8:
-                            # 🔥 OKX文档：第8个字段是confirm（不是is_closed）
+                        if isinstance(first_item, list) and len(first_item) >= 9:
+                            # 🔥 OKX文档：数组有9个元素，confirm是最后一个（索引8）
+                            # [timestamp, open, high, low, close, volume, volCcyQuote, volCcy, confirm]
                             # confirm=1表示K线已完成，confirm=0表示K线未完成
-                            confirm = first_item[7]
-                            is_closed = (str(confirm) == "1" or confirm == 1)
+                            confirm = first_item[8]
+                            # 🔥 检查confirm字段类型和值（OKX可能返回字符串"1"或数字1）
+                            # JSON解析后，confirm可能是字符串"1"或数字1
+                            confirm_str = str(confirm).strip()
+                            is_closed = (confirm_str == "1" or confirm == 1)
                             close_price = first_item[4]
+                            # 🔥 记录所有K线的confirm值（用于诊断）
                             # 🔥 只记录已完成的K线
                             if is_closed:
                                 logger.info(f"📊 收到已完成K线: {channel} {inst_id}, close={close_price}, confirm={confirm}")
                             else:
                                 logger.debug(f"📥 收到进行中K线: {channel} {inst_id}, close={close_price}, confirm={confirm}")
                         else:
-                            logger.debug(f"📥 收到K线数据: {channel} {inst_id}, 数据长度={len(data_list)}")
+                            logger.warning(f"⚠️ K线数据格式异常: {channel} {inst_id}, first_item类型={type(first_item).__name__}, 长度={len(first_item) if isinstance(first_item, list) else 'N/A'}")
                     else:
-                        logger.debug(f"📥 收到K线数据: {channel} {inst_id}, 数据为空")
+                        logger.warning(f"⚠️ K线数据为空或格式错误: {channel} {inst_id}, data_list类型={type(data_list).__name__}, 长度={len(data_list) if isinstance(data_list, list) else 'N/A'}")
                 else:
                     # tickers等其他数据：只记录DEBUG级别
                     logger.debug(f"📥 收到WebSocket数据: channel={channel}, instId={inst_id}, 数据长度={len(data['data']) if isinstance(data['data'], list) else 'N/A'}")
                 
                 if callback_key in self.callbacks:
-                    if channel.startswith('candle'):
-                        logger.debug(f"✅ 调用K线回调: {callback_key}")
-                    else:
-                        logger.debug(f"✅ 调用回调: {callback_key}")
                     self.callbacks[callback_key](data['data'])
                 else:
                     logger.warning(f"⚠️ 未找到回调函数: {callback_key}, 已注册的回调: {list(self.callbacks.keys())}")

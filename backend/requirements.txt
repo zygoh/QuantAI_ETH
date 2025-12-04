@@ -42,6 +42,10 @@ scipy
 optuna  # 超参数优化（支持所有4个模型）
 bitsandbytes #8-bit优化器
 
+# GPU加速库（可选，用于XGBoost GPU预测避免设备不匹配警告）
+# 安装命令：pip install cupy-cuda12x  # 根据CUDA版本选择（cuda11x, cuda12x等）
+# cupy-cuda12x  # XGBoost GPU预测时使用，将输入数据转换到GPU
+cupy-cuda12x
 # 深度学习框架（神经网络 - CUDA版本）
 # 注意：使用CUDA 12.1版本，与RTX 4060 Ti兼容
 torch>=2.5.1

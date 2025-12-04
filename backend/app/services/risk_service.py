@@ -618,7 +618,10 @@ class RiskService:
         try:
             # 1. 获取最近的K线数据计算ATR（使用5m主时间框架）
             # ✅ 统一使用分页方法（limit=100时自动调用单次获取，不影响性能，支持多交易所）
-            klines = self.exchange_client.get_klines_paginated(
+            # 🔥 静态方法中不能使用self，使用ExchangeFactory获取客户端
+            from app.exchange.exchange_factory import ExchangeFactory
+            exchange_client = ExchangeFactory.get_current_client()
+            klines = exchange_client.get_klines_paginated(
                 symbol=symbol,
                 interval='5m',
                 limit=100  # 5m需要更多样本（100个=8.3小时）

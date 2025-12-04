@@ -756,7 +756,12 @@ class SignalGenerator:
             klines = self.exchange_client.get_klines_paginated(symbol, '1m', limit=1)
             
             if klines and len(klines) > 0:
-                price = float(klines[0]['close'])
+                # 🔥 UnifiedKlineData是对象，使用属性访问而不是索引
+                kline = klines[0]
+                if isinstance(kline, dict):
+                    price = float(kline.get('close', 0))
+                else:
+                    price = float(kline.close)
                 logger.debug(f"✓ API价格: {price}")
                 return price
             
@@ -784,7 +789,7 @@ class SignalGenerator:
             # 获取上一次的信号类型
             last_signal_type = last_signal.get('signal_type')
             
-            # 如果信号类型相同，拒绝（去重）
+            # 如果信号类型相同，拒绝（去重）- 相同方向不需要重复开仓
             if last_signal_type == signal_type:
                 logger.warning(f"✗ 信号重复: 上次={last_signal_type}, 本次={signal_type}")
                 return False

@@ -422,7 +422,12 @@ class TradingController:
             latest_klines = await self.data_service.get_latest_klines(symbol, '1m', limit=1)
             
             if latest_klines:
-                return float(latest_klines[0]['close'])
+                # 🔥 UnifiedKlineData是对象，使用属性访问而不是索引
+                kline = latest_klines[0]
+                if isinstance(kline, dict):
+                    return float(kline.get('close', 0))
+                else:
+                    return float(kline.close)
             
             return None
             

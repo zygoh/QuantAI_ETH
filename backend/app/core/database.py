@@ -116,7 +116,23 @@ class PostgreSQLManager:
                         ON klines (symbol, interval, time DESC)
                 """))
                 
-                # 5. 创建交易信号表
+                # 5. 添加表和字段注释（klines表）- 每个COMMENT语句单独执行
+                await conn.execute(text("COMMENT ON TABLE klines IS 'K线数据表：存储历史K线数据，用于模型训练和特征工程。使用BIGINT存储毫秒时间戳（不使用hypertable）'"))
+                await conn.execute(text("COMMENT ON COLUMN klines.time IS '开盘时间（毫秒时间戳）'"))
+                await conn.execute(text("COMMENT ON COLUMN klines.symbol IS '交易对（如：ETH/USDT）'"))
+                await conn.execute(text("COMMENT ON COLUMN klines.interval IS '时间周期（3m, 5m, 15m等）'"))
+                await conn.execute(text("COMMENT ON COLUMN klines.open IS '开盘价'"))
+                await conn.execute(text("COMMENT ON COLUMN klines.high IS '最高价'"))
+                await conn.execute(text("COMMENT ON COLUMN klines.low IS '最低价'"))
+                await conn.execute(text("COMMENT ON COLUMN klines.close IS '收盘价'"))
+                await conn.execute(text("COMMENT ON COLUMN klines.volume IS '成交量（基础货币）'"))
+                await conn.execute(text("COMMENT ON COLUMN klines.close_time IS '收盘时间（毫秒时间戳）'"))
+                await conn.execute(text("COMMENT ON COLUMN klines.quote_volume IS '成交额（计价货币）'"))
+                await conn.execute(text("COMMENT ON COLUMN klines.trades IS '成交笔数'"))
+                await conn.execute(text("COMMENT ON COLUMN klines.taker_buy_base_volume IS '主动买入成交量'"))
+                await conn.execute(text("COMMENT ON COLUMN klines.taker_buy_quote_volume IS '主动买入成交额'"))
+                
+                # 6. 创建交易信号表
                 await conn.execute(text("""
                     CREATE TABLE IF NOT EXISTS trading_signals (
                         id BIGSERIAL PRIMARY KEY,
@@ -129,7 +145,7 @@ class PostgreSQLManager:
                         position_size NUMERIC(20, 8) DEFAULT 0,
                         timestamp TIMESTAMPTZ NOT NULL,
                         predictions JSONB,
-                        created_at TIMESTAMPTZ DEFAULT NOW()
+                        created_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai')::TIMESTAMPTZ
                     )
                 """))
                 
@@ -138,36 +154,21 @@ class PostgreSQLManager:
                         ON trading_signals (symbol, timestamp DESC)
                 """))
                 
-                # 6. 创建订单表
-                await conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS orders (
-                        id BIGSERIAL PRIMARY KEY,
-                        order_id BIGINT,
-                        symbol TEXT NOT NULL,
-                        side TEXT NOT NULL,
-                        order_type TEXT NOT NULL,
-                        status TEXT NOT NULL,
-                        quantity NUMERIC(20, 8) NOT NULL,
-                        price NUMERIC(20, 8) DEFAULT 0,
-                        filled_quantity NUMERIC(20, 8) DEFAULT 0,
-                        commission NUMERIC(20, 8) DEFAULT 0,
-                        timestamp TIMESTAMPTZ NOT NULL,
-                        created_at TIMESTAMPTZ DEFAULT NOW(),
-                        is_virtual BOOLEAN DEFAULT FALSE,
-                        signal_id TEXT,
-                        entry_price NUMERIC(20, 8),
-                        exit_price NUMERIC(20, 8),
-                        pnl NUMERIC(20, 8),
-                        pnl_percent NUMERIC(10, 4)
-                    )
-                """))
+                # 7. 添加表和字段注释（trading_signals表）- 每个COMMENT语句单独执行
+                await conn.execute(text("COMMENT ON TABLE trading_signals IS '交易信号表：存储生成的交易信号，包含多时间框架预测结果（JSONB格式）'"))
+                await conn.execute(text("COMMENT ON COLUMN trading_signals.id IS '主键ID'"))
+                await conn.execute(text("COMMENT ON COLUMN trading_signals.symbol IS '交易对'"))
+                await conn.execute(text("COMMENT ON COLUMN trading_signals.signal_type IS '信号类型：LONG, SHORT, HOLD, CLOSE'"))
+                await conn.execute(text("COMMENT ON COLUMN trading_signals.confidence IS '置信度（0.0000-1.0000）'"))
+                await conn.execute(text("COMMENT ON COLUMN trading_signals.entry_price IS '入场价格'"))
+                await conn.execute(text("COMMENT ON COLUMN trading_signals.stop_loss IS '止损价格'"))
+                await conn.execute(text("COMMENT ON COLUMN trading_signals.take_profit IS '止盈价格'"))
+                await conn.execute(text("COMMENT ON COLUMN trading_signals.position_size IS '仓位大小（USDT价值）'"))
+                await conn.execute(text("COMMENT ON COLUMN trading_signals.timestamp IS '信号生成时间'"))
+                await conn.execute(text("COMMENT ON COLUMN trading_signals.predictions IS '多时间框架预测详情（3m/5m/15m），JSONB格式'"))
+                await conn.execute(text("COMMENT ON COLUMN trading_signals.created_at IS '记录创建时间'"))
                 
-                await conn.execute(text("""
-                    CREATE INDEX IF NOT EXISTS idx_orders_symbol_time 
-                        ON orders (symbol, timestamp DESC)
-                """))
-                
-                # 7. 创建虚拟仓位表（用于信号模式）
+                # 8. 创建虚拟仓位表（必须在orders表之前创建，因为orders表有外键引用）
                 await conn.execute(text("""
                     CREATE TABLE IF NOT EXISTS virtual_positions (
                         id BIGSERIAL PRIMARY KEY,
@@ -184,8 +185,8 @@ class PostgreSQLManager:
                         pnl_percent NUMERIC(10, 4) DEFAULT 0,
                         status TEXT NOT NULL DEFAULT 'OPEN',
                         signal_id TEXT,
-                        created_at TIMESTAMPTZ DEFAULT NOW(),
-                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                        created_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai')::TIMESTAMPTZ,
+                        updated_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai')::TIMESTAMPTZ
                     )
                 """))
                 
@@ -194,10 +195,96 @@ class PostgreSQLManager:
                         ON virtual_positions (symbol, status)
                 """))
                 
+                # 9. 添加表和字段注释（virtual_positions表）- 每个COMMENT语句单独执行
+                await conn.execute(text("COMMENT ON TABLE virtual_positions IS '虚拟仓位表：存储SIGNAL_ONLY模式下的虚拟仓位，支持止损止盈监控、盈亏计算'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.id IS '主键ID'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.symbol IS '交易对'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.side IS '仓位方向：LONG, SHORT'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.entry_price IS '开仓价格'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.quantity IS '仓位数量（USDT价值）'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.entry_time IS '开仓时间'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.exit_price IS '平仓价格'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.exit_time IS '平仓时间'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.stop_loss IS '止损价格'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.take_profit IS '止盈价格'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.pnl IS '盈亏金额'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.pnl_percent IS '盈亏百分比'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.status IS '仓位状态：OPEN, CLOSED'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.signal_id IS '关联的信号ID'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.created_at IS '记录创建时间'"))
+                await conn.execute(text("COMMENT ON COLUMN virtual_positions.updated_at IS '记录更新时间'"))
+                
+                # 10. 创建订单表（在virtual_positions之后，因为orders表有外键引用virtual_positions）
+                await conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS orders (
+                        id BIGSERIAL PRIMARY KEY,
+                        order_id BIGINT,
+                        symbol TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        order_type TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        quantity NUMERIC(20, 8) NOT NULL,
+                        price NUMERIC(20, 8) DEFAULT 0,
+                        filled_quantity NUMERIC(20, 8) DEFAULT 0,
+                        commission NUMERIC(20, 8) DEFAULT 0,
+                        timestamp TIMESTAMPTZ NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai')::TIMESTAMPTZ,
+                        is_virtual BOOLEAN DEFAULT FALSE,
+                        signal_id TEXT,
+                        position_id BIGINT,
+                        order_action TEXT,
+                        entry_price NUMERIC(20, 8),
+                        exit_price NUMERIC(20, 8),
+                        pnl NUMERIC(20, 8),
+                        pnl_percent NUMERIC(10, 4),
+                        FOREIGN KEY (position_id) REFERENCES virtual_positions(id) ON DELETE SET NULL
+                    )
+                """))
+                
+                await conn.execute(text("""
+                    CREATE INDEX IF NOT EXISTS idx_orders_symbol_time 
+                        ON orders (symbol, timestamp DESC)
+                """))
+                
+                await conn.execute(text("""
+                    CREATE INDEX IF NOT EXISTS idx_orders_position_id 
+                        ON orders (position_id)
+                """))
+                
+                await conn.execute(text("""
+                    CREATE INDEX IF NOT EXISTS idx_orders_order_action 
+                        ON orders (order_action)
+                """))
+                
+                # 11. 添加表和字段注释（orders表）- 每个COMMENT语句单独执行
+                await conn.execute(text("COMMENT ON TABLE orders IS '订单表：存储所有订单（包括虚拟订单和实盘订单），支持虚拟交易模式（SIGNAL_ONLY）和实盘交易模式（AUTO）'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.id IS '主键ID'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.order_id IS '交易所订单ID（实盘订单）'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.symbol IS '交易对'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.side IS '订单方向：BUY, SELL'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.order_type IS '订单类型：MARKET, LIMIT, STOP_MARKET等'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.status IS '订单状态：NEW, FILLED, PARTIALLY_FILLED, CANCELED等'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.quantity IS '订单数量（虚拟订单：USDT价值；实盘订单：币的数量）'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.price IS '订单价格（限价单）'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.filled_quantity IS '已成交数量（虚拟订单：USDT价值；实盘订单：币的数量）'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.commission IS '手续费'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.timestamp IS '订单时间'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.created_at IS '记录创建时间'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.is_virtual IS '是否为虚拟订单（SIGNAL_ONLY模式）'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.signal_id IS '关联的信号ID'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.position_id IS '关联的虚拟仓位ID（用于关联同一仓位的开仓和平仓订单）'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.order_action IS '订单动作：OPEN（开仓）, CLOSE（平仓）'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.entry_price IS '开仓价格（虚拟订单）'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.exit_price IS '平仓价格（虚拟订单）'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.pnl IS '盈亏金额（虚拟订单）'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.pnl_percent IS '盈亏百分比（虚拟订单）'"))
+                
                 logger.info("数据库表结构初始化完成")
                 
         except Exception as e:
-            logger.warning(f"初始化数据库结构失败（可能已存在）: {e}")
+            logger.error(f"初始化数据库结构失败: {e}")
+            logger.error(f"错误详情: {type(e).__name__}: {str(e)}")
+            raise  # 🔥 重新抛出异常，确保问题被发现
     
     async def write_kline_data(self, data: List[Dict[str, Any]]):
         """批量写入K线数据（🚀 一条 VALUES 列表 SQL，最快速度）"""
@@ -328,11 +415,13 @@ class PostgreSQLManager:
                         INSERT INTO orders (
                             order_id, symbol, side, order_type, status,
                             quantity, price, filled_quantity, commission, timestamp,
-                            is_virtual, signal_id, entry_price, exit_price, pnl, pnl_percent
+                            is_virtual, signal_id, position_id, order_action,
+                            entry_price, exit_price, pnl, pnl_percent
                         ) VALUES (
                             :order_id, :symbol, :side, :order_type, :status,
                             :quantity, :price, :filled_quantity, :commission, :timestamp,
-                            :is_virtual, :signal_id, :entry_price, :exit_price, :pnl, :pnl_percent
+                            :is_virtual, :signal_id, :position_id, :order_action,
+                            :entry_price, :exit_price, :pnl, :pnl_percent
                         )
                     """)
                     
@@ -356,6 +445,8 @@ class PostgreSQLManager:
                         'timestamp': timestamp_val,
                         'is_virtual': order.get('is_virtual', False),
                         'signal_id': order.get('signal_id'),
+                        'position_id': order.get('position_id'),
+                        'order_action': order.get('order_action'),
                         'entry_price': float(order.get('entry_price', 0)) if order.get('entry_price') else None,
                         'exit_price': float(order.get('exit_price', 0)) if order.get('exit_price') else None,
                         'pnl': float(order.get('pnl', 0)) if order.get('pnl') else None,
@@ -607,16 +698,34 @@ class PostgreSQLManager:
                     
                     # 计算盈亏 - 使用Decimal确保金融计算精度
                     entry_price = Decimal(str(row[3]))
-                    quantity = Decimal(str(row[4]))
+                    quantity = Decimal(str(row[4]))  # quantity是USDT价值
                     exit_price_decimal = Decimal(str(exit_price))
                     side = row[2]
                     
-                    if side == 'LONG':
-                        pnl = (exit_price_decimal - entry_price) * quantity
-                    else:  # SHORT
-                        pnl = (entry_price - exit_price_decimal) * quantity
+                    # 🔑 先计算币的数量（quantity是USDT价值，需要转换成币的数量）
+                    coin_amount = quantity / entry_price
                     
-                    pnl_percent = (pnl / (entry_price * quantity)) * Decimal('100')
+                    # 计算价差盈亏
+                    if side == 'LONG':
+                        price_pnl = (exit_price_decimal - entry_price) * coin_amount
+                    else:  # SHORT
+                        price_pnl = (entry_price - exit_price_decimal) * coin_amount
+                    
+                    # 🔑 计算手续费（模拟实际交易所费率）
+                    VIRTUAL_OPEN_FEE_RATE = Decimal('0.0002')   # 开仓手续费：0.02% (Maker)
+                    VIRTUAL_CLOSE_FEE_RATE = Decimal('0.0005')  # 平仓手续费：0.05% (Taker)
+                    
+                    open_position_value = quantity  # 开仓时的USDT价值
+                    open_commission = open_position_value * VIRTUAL_OPEN_FEE_RATE
+                    
+                    close_position_value = coin_amount * exit_price_decimal  # 平仓时的USDT价值
+                    close_commission = close_position_value * VIRTUAL_CLOSE_FEE_RATE
+                    
+                    # 净盈亏 = 价差盈亏 - 开仓手续费 - 平仓手续费
+                    pnl = price_pnl - open_commission - close_commission
+                    
+                    # 盈亏百分比 = 净盈亏 / 开仓价值 * 100
+                    pnl_percent = (pnl / open_position_value) * Decimal('100')
                     
                     # 转换为float用于数据库存储（NUMERIC类型会自动处理精度）
                     pnl_float = float(pnl.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP))

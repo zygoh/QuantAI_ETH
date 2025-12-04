@@ -266,20 +266,21 @@ class DataService:
                 # 取最新的一条K线（数组第一个元素）
                 kline_array = data[0] if isinstance(data[0], list) else data
                 
-                if len(kline_array) < 8:
-                    logger.error(f"❌ OKX K线数组长度不足: {len(kline_array)} < 8")
+                if len(kline_array) < 9:
+                    logger.error(f"❌ OKX K线数组长度不足: {len(kline_array)} < 9")
                     return
                 
-                # 🔥 OKX格式：[timestamp, open, high, low, close, volume, quote_volume, confirm]
-                # 注意：第8个字段是confirm（不是is_closed），confirm=1表示K线已完成
+                # 🔥 OKX格式：[timestamp, open, high, low, close, volume, volCcyQuote, volCcy, confirm]
+                # 注意：数组有9个元素，confirm是最后一个（索引8），confirm=1表示K线已完成
                 timestamp = int(kline_array[0])
                 open_price = float(kline_array[1])
                 high_price = float(kline_array[2])
                 low_price = float(kline_array[3])
                 close_price = float(kline_array[4])
                 volume = float(kline_array[5])
-                quote_volume = float(kline_array[6])
-                confirm = kline_array[7]  # OKX使用confirm字段
+                quote_volume = float(kline_array[6])  # volCcyQuote
+                # kline_array[7] 是 volCcy（另一个字段，我们不需要）
+                confirm = kline_array[8]  # OKX使用confirm字段（索引8）
                 is_closed = (str(confirm) == "1" or confirm == 1)  # confirm=1表示已完成
                 
                 # 计算close_time（OKX不提供，需要根据interval计算）
@@ -640,7 +641,27 @@ class DataService:
                 logger.debug(f"数据库无数据，从API获取: {symbol} {interval}")
                 # ✅ 统一使用分页方法（自动处理超过1500的情况）
                 klines = self.exchange_client.get_klines_paginated(symbol, interval, limit)
-                return klines
+                # 🔥 转换为字典列表（UnifiedKlineData对象转换为字典）
+                klines_dict = []
+                for kline in klines:
+                    if isinstance(kline, dict):
+                        klines_dict.append(kline)
+                    else:
+                        # UnifiedKlineData对象转换为字典
+                        klines_dict.append({
+                            'timestamp': kline.timestamp,
+                            'open': kline.open,
+                            'high': kline.high,
+                            'low': kline.low,
+                            'close': kline.close,
+                            'volume': kline.volume,
+                            'close_time': kline.close_time,
+                            'quote_volume': kline.quote_volume,
+                            'trades': kline.trades,
+                            'taker_buy_base_volume': kline.taker_buy_base_volume,
+                            'taker_buy_quote_volume': kline.taker_buy_quote_volume
+                        })
+                return klines_dict
             
             # 转换为字典列表
             klines = []

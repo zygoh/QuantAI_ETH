@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 # 🎯 虚拟账户配置（用于 SIGNAL_ONLY 模式）
 VIRTUAL_ACCOUNT_BALANCE = 100.0  # 虚拟账户初始余额（USDT）
+VIRTUAL_BALANCE_KEY = "virtual_account:balance"  # Redis键名
 
 @dataclass
 class PositionInfo:
@@ -135,6 +136,67 @@ class PositionManager:
         except Exception as e:
             logger.error(f"加载持仓失败: {e}")
     
+    async def get_virtual_balance(self) -> float:
+        """
+        获取虚拟账户余额
+        
+        Returns:
+            当前虚拟账户余额（USDT）
+        """
+        try:
+            cached_balance = await cache_manager.get(VIRTUAL_BALANCE_KEY)
+            if cached_balance is not None:
+                try:
+                    balance = float(cached_balance)
+                    return max(0.0, balance)  # 确保不为负
+                except (ValueError, TypeError):
+                    pass
+            
+            # 如果不存在或格式错误，返回初始值
+            balance = VIRTUAL_ACCOUNT_BALANCE
+            await cache_manager.set(VIRTUAL_BALANCE_KEY, balance)
+            return balance
+        except Exception as e:
+            logger.error(f"获取虚拟账户余额失败: {e}")
+            return VIRTUAL_ACCOUNT_BALANCE
+    
+    async def update_virtual_balance(self, pnl: float) -> float:
+        """
+        更新虚拟账户余额（平仓后调用）
+        
+        Args:
+            pnl: 净盈亏（USDT，已扣除手续费）
+            
+        Returns:
+            更新后的余额
+        """
+        try:
+            current_balance = await self.get_virtual_balance()
+            new_balance = current_balance + pnl
+            new_balance = max(0.0, new_balance)  # 确保不为负
+            
+            await cache_manager.set(VIRTUAL_BALANCE_KEY, new_balance)
+            logger.info(f"💰 虚拟账户余额更新: {current_balance:.2f} → {new_balance:.2f} USDT (盈亏: {pnl:+.2f})")
+            return new_balance
+        except Exception as e:
+            logger.error(f"更新虚拟账户余额失败: {e}")
+            return await self.get_virtual_balance()
+    
+    async def reset_virtual_balance(self) -> float:
+        """
+        重置虚拟账户余额为初始值
+        
+        Returns:
+            重置后的余额
+        """
+        try:
+            await cache_manager.set(VIRTUAL_BALANCE_KEY, VIRTUAL_ACCOUNT_BALANCE)
+            logger.info(f"🔄 虚拟账户余额已重置: {VIRTUAL_ACCOUNT_BALANCE} USDT")
+            return VIRTUAL_ACCOUNT_BALANCE
+        except Exception as e:
+            logger.error(f"重置虚拟账户余额失败: {e}")
+            return VIRTUAL_ACCOUNT_BALANCE
+    
     async def calculate_position_size(
         self, 
         symbol: str, 
@@ -172,7 +234,25 @@ class PositionManager:
         try:
             # 1. 获取可用余额
             if is_virtual:
-                available_balance = VIRTUAL_ACCOUNT_BALANCE
+                # 🔑 从Redis获取实际虚拟账户余额（如果不存在则使用初始值）
+                cached_balance = await cache_manager.get(VIRTUAL_BALANCE_KEY)
+                if cached_balance is not None:
+                    try:
+                        available_balance = float(cached_balance)
+                        if available_balance <= 0:
+                            logger.warning(f"⚠️ 虚拟账户余额不足: {available_balance}，重置为初始值")
+                            available_balance = VIRTUAL_ACCOUNT_BALANCE
+                            await cache_manager.set(VIRTUAL_BALANCE_KEY, available_balance)
+                    except (ValueError, TypeError):
+                        logger.warning(f"⚠️ 虚拟账户余额格式错误: {cached_balance}，重置为初始值")
+                        available_balance = VIRTUAL_ACCOUNT_BALANCE
+                        await cache_manager.set(VIRTUAL_BALANCE_KEY, available_balance)
+                else:
+                    # 首次使用，设置初始余额
+                    available_balance = VIRTUAL_ACCOUNT_BALANCE
+                    await cache_manager.set(VIRTUAL_BALANCE_KEY, available_balance)
+                    logger.info(f"💰 初始化虚拟账户余额: {available_balance} USDT")
+                
                 logger.debug(f"📊 使用虚拟余额: {available_balance} USDT")
             else:
                 account_info = self.exchange_client.get_account_info()
