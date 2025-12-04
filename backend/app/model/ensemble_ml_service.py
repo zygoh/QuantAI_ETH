@@ -9,6 +9,8 @@ import traceback
 import os
 import tempfile
 import shutil
+import json
+import warnings
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +42,14 @@ from app.utils.helpers import format_signal_type
 from app.exchange.exchange_factory import ExchangeFactory
 
 logger = logging.getLogger(__name__)
+
+# 可选依赖：cupy（GPU加速，用于XGBoost GPU预测）
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+except ImportError:
+    CUPY_AVAILABLE = False
+    cp = None
 
 # 可选依赖：bitsandbytes（8-bit优化器）
 try:
@@ -258,94 +268,121 @@ class EnsembleMLService(MLService):
                 - return_single=True: (预测类别标量, 预测概率1D数组)
                 - return_single=False: (预测类别数组, 预测概率2D数组)
         """
-        try:
-            # 确保数据格式正确
-            if isinstance(X, pd.DataFrame):
-                X_pred = X.values.astype(np.float32)
-            elif isinstance(X, np.ndarray):
-                X_pred = X.astype(np.float32)
-            else:
-                X_pred = np.asarray(X, dtype=np.float32)
-            
-            # 确保数据是2D数组
-            if len(X_pred.shape) == 1:
-                X_pred = X_pred.reshape(1, -1)
-            
-            # 确保数据是连续的
-            if not X_pred.flags['C_CONTIGUOUS']:
-                X_pred = np.ascontiguousarray(X_pred, dtype=np.float32)
-            
-            # 检查XGBoost模型是否在GPU上训练
-            booster = model.get_booster()
-            
+        # 🔥 临时抑制XGBoost设备不匹配警告（如果cupy未安装或GPU预测失败）
+        with warnings.catch_warnings():
+            # 抑制XGBoost设备不匹配相关的所有警告
+            warnings.filterwarnings('ignore', category=UserWarning, message='.*Falling back to prediction using DMatrix.*')
+            warnings.filterwarnings('ignore', category=UserWarning, message='.*mismatched devices.*')
+            warnings.filterwarnings('ignore', category=UserWarning, message='.*XGBoost is running on.*while the input data is on.*')
+            warnings.filterwarnings('ignore', category=UserWarning, module='xgboost')
             try:
-                # 获取booster的配置信息
-                config = booster.save_config()
-                import json
-                config_dict = json.loads(config)
-                device = config_dict.get('learner', {}).get('learner_train_param', {}).get('device', '')
+                # 确保数据格式正确
+                if isinstance(X, pd.DataFrame):
+                    X_pred = X.values.astype(np.float32)
+                elif isinstance(X, np.ndarray):
+                    X_pred = X.astype(np.float32)
+                else:
+                    X_pred = np.asarray(X, dtype=np.float32)
                 
-                # 🔥 如果模型在GPU上训练，将输入数据也转换到GPU（使用cupy）
-                if device and 'cuda' in device.lower():
-                    try:
-                        # 尝试导入cupy
-                        import cupy as cp
-                        
-                        # 将numpy数组转换为cupy数组（GPU）
-                        X_pred_gpu = cp.asarray(X_pred)
-                        
-                        # 🔥 使用DMatrix + cupy数组进行GPU预测（XGBoost支持cupy数组的DMatrix）
-                        # 这样可以避免设备不匹配警告，并充分利用GPU性能
-                        dmatrix_gpu = xgb.DMatrix(X_pred_gpu)
-                        
-                        # 使用booster的predict方法（通过GPU DMatrix，XGBoost会在GPU上执行预测）
-                        xgb_proba_raw = booster.predict(dmatrix_gpu, output_margin=False)
-                        
-                        # 将结果从GPU转回CPU（cupy数组转numpy）
-                        if hasattr(xgb_proba_raw, 'get'):  # cupy数组
-                            xgb_proba_raw = xgb_proba_raw.get()
-                        elif isinstance(xgb_proba_raw, cp.ndarray):
-                            xgb_proba_raw = cp.asnumpy(xgb_proba_raw)
-                        
-                        # 转换为概率格式
-                        if len(xgb_proba_raw.shape) == 1:
-                            # 单样本情况：reshape为(1, n_classes)
-                            n_classes = len(xgb_proba_raw)
-                            xgb_proba = xgb_proba_raw.reshape(1, n_classes)
+                # 确保数据是2D数组
+                if len(X_pred.shape) == 1:
+                    X_pred = X_pred.reshape(1, -1)
+                
+                # 确保数据是连续的
+                if not X_pred.flags['C_CONTIGUOUS']:
+                    X_pred = np.ascontiguousarray(X_pred, dtype=np.float32)
+                
+                # 检查XGBoost模型是否在GPU上训练
+                booster = model.get_booster()
+                
+                try:
+                    # 获取booster的配置信息
+                    config = booster.save_config()
+                    config_dict = json.loads(config)
+                    device = config_dict.get('learner', {}).get('learner_train_param', {}).get('device', '')
+                    
+                    # 🔥 如果模型在GPU上训练，将输入数据也转换到GPU（使用cupy）
+                    if device and 'cuda' in device.lower():
+                        if CUPY_AVAILABLE and cp is not None:
+                            try:
+                                # 将numpy数组转换为cupy数组（GPU）
+                                X_pred_gpu = cp.asarray(X_pred)
+                                
+                                # 🔥 使用DMatrix + cupy数组进行GPU预测
+                                # 注意：即使使用cupy数组，如果XGBoost版本较旧，仍可能产生警告
+                                # 这是XGBoost的内部限制，无法完全避免
+                                try:
+                                    # 创建GPU DMatrix（使用cupy数组）
+                                    dmatrix_gpu = xgb.DMatrix(X_pred_gpu)
+                                    
+                                    # 使用booster的predict方法（通过GPU DMatrix，XGBoost会在GPU上执行预测）
+                                    xgb_proba_raw = booster.predict(dmatrix_gpu, output_margin=False)
+                                    
+                                    # 将结果从GPU转回CPU（cupy数组转numpy）
+                                    if hasattr(xgb_proba_raw, 'get'):  # cupy数组
+                                        xgb_proba_raw = xgb_proba_raw.get()
+                                    elif isinstance(xgb_proba_raw, cp.ndarray):
+                                        xgb_proba_raw = cp.asnumpy(xgb_proba_raw)
+                                    
+                                    # 转换为概率格式
+                                    if len(xgb_proba_raw.shape) == 1:
+                                        # 单样本情况：reshape为(1, n_classes)
+                                        n_classes = len(xgb_proba_raw)
+                                        xgb_proba = xgb_proba_raw.reshape(1, n_classes)
+                                    else:
+                                        # 多样本情况
+                                        xgb_proba = xgb_proba_raw
+                                    
+                                    # 预测类别
+                                    xgb_pred = np.argmax(xgb_proba, axis=1)
+                                    
+                                    # 根据return_single决定返回格式
+                                    if return_single and len(xgb_pred) == 1:
+                                        return xgb_pred[0], xgb_proba[0]
+                                    else:
+                                        return xgb_pred, xgb_proba
+                                        
+                                except Exception as e:
+                                    # GPU DMatrix预测失败，回退到标准方式（会产生警告）
+                                    logger.warning(f"⚠️ XGBoost GPU DMatrix预测失败，回退到标准方式（可能产生设备不匹配警告）: {e}")
+                                    xgb_proba = model.predict_proba(X_pred)
+                                    xgb_pred = model.predict(X_pred)
+                                    
+                                    if return_single and len(xgb_pred) == 1:
+                                        return xgb_pred[0], xgb_proba[0]
+                                    else:
+                                        return xgb_pred, xgb_proba
+                                    
+                            except Exception as e:
+                                # GPU预测失败，回退到标准方式
+                                logger.warning(f"⚠️ XGBoost GPU预测失败，回退到标准方式（可能产生警告）: {e}")
+                                xgb_proba = model.predict_proba(X_pred)
+                                xgb_pred = model.predict(X_pred)
+                                
+                                if return_single and len(xgb_pred) == 1:
+                                    return xgb_pred[0], xgb_proba[0]
+                                else:
+                                    return xgb_pred, xgb_proba
                         else:
-                            # 多样本情况
-                            xgb_proba = xgb_proba_raw
-                        
-                        # 预测类别
-                        xgb_pred = np.argmax(xgb_proba, axis=1)
-                        
-                        # 根据return_single决定返回格式
-                        if return_single and len(xgb_pred) == 1:
-                            return xgb_pred[0], xgb_proba[0]
-                        else:
-                            return xgb_pred, xgb_proba
+                            # cupy未安装，回退到DMatrix方式（会产生警告但功能正常）
+                            logger.warning("⚠️ cupy未安装，XGBoost GPU预测将产生设备不匹配警告。建议安装: pip install cupy-cuda12x")
+                            dmatrix = xgb.DMatrix(X_pred)
+                            xgb_proba_raw = booster.predict(dmatrix, output_margin=False)
                             
-                    except ImportError:
-                        # cupy未安装，回退到DMatrix方式（会产生警告但功能正常）
-                        logger.debug("cupy未安装，使用DMatrix方式（可能产生设备不匹配警告）")
-                        dmatrix = xgb.DMatrix(X_pred)
-                        xgb_proba_raw = booster.predict(dmatrix, output_margin=False)
-                        
-                        if len(xgb_proba_raw.shape) == 1:
-                            n_classes = len(xgb_proba_raw)
-                            xgb_proba = xgb_proba_raw.reshape(1, n_classes)
-                        else:
-                            xgb_proba = xgb_proba_raw
-                        
-                        xgb_pred = np.argmax(xgb_proba, axis=1)
-                        
-                        if return_single and len(xgb_pred) == 1:
-                            return xgb_pred[0], xgb_proba[0]
-                        else:
-                            return xgb_pred, xgb_proba
-                    except Exception as e:
-                        # GPU预测失败，回退到标准方式
-                        logger.debug(f"XGBoost GPU预测失败，回退到标准方式: {e}")
+                            if len(xgb_proba_raw.shape) == 1:
+                                n_classes = len(xgb_proba_raw)
+                                xgb_proba = xgb_proba_raw.reshape(1, n_classes)
+                            else:
+                                xgb_proba = xgb_proba_raw
+                            
+                            xgb_pred = np.argmax(xgb_proba, axis=1)
+                            
+                            if return_single and len(xgb_pred) == 1:
+                                return xgb_pred[0], xgb_proba[0]
+                            else:
+                                return xgb_pred, xgb_proba
+                    else:
+                        # CPU模式，使用标准方式
                         xgb_proba = model.predict_proba(X_pred)
                         xgb_pred = model.predict(X_pred)
                         
@@ -353,8 +390,9 @@ class EnsembleMLService(MLService):
                             return xgb_pred[0], xgb_proba[0]
                         else:
                             return xgb_pred, xgb_proba
-                else:
-                    # CPU模式，使用标准方式
+                except Exception as e:
+                    # 如果配置解析失败，使用标准方式
+                    logger.debug(f"XGBoost设备检测失败，使用标准方式: {e}")
                     xgb_proba = model.predict_proba(X_pred)
                     xgb_pred = model.predict(X_pred)
                     
@@ -363,19 +401,8 @@ class EnsembleMLService(MLService):
                     else:
                         return xgb_pred, xgb_proba
             except Exception as e:
-                # 如果配置解析失败，使用标准方式
-                logger.debug(f"XGBoost设备检测失败，使用标准方式: {e}")
-                xgb_proba = model.predict_proba(X_pred)
-                xgb_pred = model.predict(X_pred)
-                
-                if return_single and len(xgb_pred) == 1:
-                    return xgb_pred[0], xgb_proba[0]
-                else:
-                    return xgb_pred, xgb_proba
-                    
-        except Exception as e:
-            logger.error(f"XGBoost预测失败: {e}")
-            raise
+                logger.error(f"XGBoost预测失败: {e}")
+                raise
     
     def clear_gpu_memory(self):
         """

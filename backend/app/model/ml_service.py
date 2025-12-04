@@ -464,10 +464,18 @@ class MLService:
                 # ✅ 去重（防止批次边界重复）
                 df = df.drop_duplicates(subset=['timestamp'], keep='last')
                 
+                # 🔥 过滤未完成的K线（volume=0表示K线未完成）
+                rows_before_filter = len(df)
+                if 'volume' in df.columns:
+                    df = df[df['volume'] > 0]
+                    filtered_count = rows_before_filter - len(df)
+                    if filtered_count > 0:
+                        logger.warning(f"⚠️ 过滤掉{filtered_count}条未完成K线（volume=0）")
+                
                 # 设置索引
                 df = df.set_index('timestamp')
                 
-                logger.info(f"✅ {timeframe} 数据获取成功: {len(df)}条")
+                logger.info(f"✅ {timeframe} 数据获取成功: {len(df)}条（已过滤未完成K线）")
             else:
                 logger.warning(f"⚠️ {timeframe} 数据为空")
             

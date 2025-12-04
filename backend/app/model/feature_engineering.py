@@ -105,9 +105,13 @@ class FeatureEngineer:
             if 'volume' in df.columns:
                 zero_volume_count = (df['volume'] == 0).sum()
                 if zero_volume_count > 0:
-                    logger.warning(f"⚠️ 检测到{zero_volume_count}个volume为0（可能是异常数据或极低流动性）")
-                    # 注意：volume为0在现实中可能存在（极低流动性），但为了计算稳定性，我们标记为NaN
-                    # 可以根据业务需求决定是否替换
+                    logger.warning(f"⚠️ 检测到{zero_volume_count}个volume为0的K线（未完成的K线）")
+                    # 🔥 过滤掉未完成的K线（volume=0表示K线未完成，不应用于训练）
+                    rows_before_filter = len(df)
+                    df = df[df['volume'] > 0]
+                    filtered_count = rows_before_filter - len(df)
+                    if filtered_count > 0:
+                        logger.warning(f"   ✅ 已过滤{filtered_count}条未完成K线（volume=0），剩余{len(df)}条")
             
             # 处理 timestamp：如果是 index，重置为列
             if df.index.name == 'timestamp' or 'timestamp' not in df.columns:
@@ -319,6 +323,15 @@ class FeatureEngineer:
             # 🔥 第三步：处理NaN值（训练用dropna，预测用fillna）
             rows_before = len(df)
             
+            # 统计NaN原因（用于更精确的日志）
+            # 检查哪些列有NaN（用于分析）
+            nan_by_column = {}
+            for col in df.columns:
+                if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]):
+                    nan_count = df[col].isna().sum()
+                    if nan_count > 0:
+                        nan_by_column[col] = nan_count
+            
             # 先尝试删除NaN
             df_clean = df.dropna()
             
@@ -363,7 +376,15 @@ class FeatureEngineer:
                 df = df_clean
                 rows_dropped = rows_before - len(df)
                 if rows_dropped > 0:
-                    logger.info(f"✅ 特征工程完成: {len(df)}行（因NaN/Inf丢弃{rows_dropped}行），特征数: {len(df.columns)}")
+                    # 🔥 分析NaN原因：主要是技术指标窗口导致的（正常现象）
+                    # 找出NaN最多的列（通常是窗口最大的指标）
+                    if nan_by_column:
+                        top_nan_cols = sorted(nan_by_column.items(), key=lambda x: x[1], reverse=True)[:5]
+                        nan_reason = f"（主要因技术指标窗口导致，NaN最多的列: {', '.join([f'{col}({count})' for col, count in top_nan_cols])}）"
+                    else:
+                        nan_reason = "（因NaN/Inf导致）"
+                    
+                    logger.info(f"✅ 特征工程完成: {len(df)}行（丢弃{rows_dropped}行{nan_reason}），特征数: {len(df.columns)}")
                 else:
                     logger.info(f"✅ 特征工程完成: {len(df)}行，特征数: {len(df.columns)}")
 

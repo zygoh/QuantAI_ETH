@@ -530,9 +530,18 @@ class TradingEngine:
             # 🔑 先平掉现有虚拟仓位（使用缓存，避免查询数据库）
             existing_positions = self.virtual_positions_cache.get(symbol, [])
             if existing_positions:
-                logger.info(f"检测到现有虚拟仓位，先平仓...")
-                for pos in existing_positions:
-                    await postgresql_manager.close_virtual_position(pos['id'], current_price)
+                # 🔥 过滤掉已经关闭的仓位（可能已被止损/止盈触发）
+                open_positions = [pos for pos in existing_positions if pos.get('status') == 'OPEN']
+                if open_positions:
+                    logger.info(f"检测到{len(open_positions)}个现有虚拟仓位，先平仓...")
+                    for pos in open_positions:
+                        # 🔥 再次验证仓位状态（防止重复平仓）
+                        pos_check = await postgresql_manager.get_virtual_position_by_id(pos['id'])
+                        if not pos_check or pos_check['status'] != 'OPEN':
+                            logger.debug(f"⚠️ 仓位{pos['id']}已被关闭，跳过（可能已被止损/止盈触发）")
+                            continue
+                        
+                        await postgresql_manager.close_virtual_position(pos['id'], current_price)
                     
                     # 🔑 计算价差盈亏（quantity现在是USDT价值，需要转换成币的数量）
                     # 🔥 转换为Decimal确保精度，避免float和Decimal混用
@@ -753,7 +762,8 @@ class TradingEngine:
         self,
         pos_id: int,
         current_price: float,
-        reason: str
+        reason: str,
+        trigger_type: str = None
     ):
         """
         因止损止盈触发而平仓（WebSocket实时监控触发）
@@ -762,12 +772,24 @@ class TradingEngine:
             pos_id: 仓位ID
             current_price: 当前价格
             reason: 平仓原因
+            trigger_type: 触发类型 ('STOP_LOSS' 或 'TAKE_PROFIT')
         """
         try:
             # 获取仓位信息
             pos = await postgresql_manager.get_virtual_position_by_id(pos_id)
-            if not pos or pos['status'] != 'OPEN':
-                return
+            if not pos:
+                logger.warning(f"⚠️ 仓位不存在: {pos_id}")
+                return {
+                    'success': False,
+                    'message': f'仓位不存在: {pos_id}'
+                }
+            
+            if pos['status'] != 'OPEN':
+                logger.debug(f"⚠️ 仓位已关闭，跳过: {pos_id} (状态: {pos['status']})")
+                return {
+                    'success': False,
+                    'message': f'仓位已关闭: {pos_id}'
+                }
             
             symbol = pos['symbol']
             
@@ -828,7 +850,10 @@ class TradingEngine:
             
             logger.info(f"✅ 虚拟平仓: {symbol} {pos['side']} {pos['quantity']:.2f} USDT @{current_price:.2f}")
             logger.info(f"   {reason}")
+            logger.info(f"   触发类型: {trigger_type or 'UNKNOWN'}")
+            logger.info(f"   开仓价: {pos['entry_price']:.2f} → 平仓价: {current_price:.2f}")
             logger.info(f"   净盈亏: ${net_pnl:+.2f} ({pnl_percent:+.2f}%)")
+            logger.info(f"   订单已记录: position_id={pos_id}, order_action=CLOSE")
             
             # 🔑 缓存刷新由调用方统一处理（避免多次刷新）
             
@@ -993,48 +1018,67 @@ class TradingEngine:
             if not positions:
                 return
             
+            # 🔥 添加调试日志（每100次价格更新记录一次，避免日志过多）
+            import random
+            if random.random() < 0.01:  # 1%的概率记录调试日志
+                logger.debug(f"📊 价格更新检查: {symbol} @{price:.2f}, 虚拟仓位数: {len(positions)}")
+            
             # 记录触发平仓的仓位ID
             closed_position_ids = []
             
             # 检查每个仓位的止损止盈
             for pos in positions:
+                # 🔥 验证仓位状态（防止重复平仓）
+                if pos.get('status') != 'OPEN':
+                    continue
+                
                 should_close = False
                 reason = ""
+                trigger_type = None  # STOP_LOSS 或 TAKE_PROFIT
                 
                 # 检查止损
-                if pos['side'] == 'LONG' and price <= pos['stop_loss']:
-                    should_close = True
-                    reason = f"止损触发 ({price:.2f} <= {pos['stop_loss']:.2f})"
-                elif pos['side'] == 'SHORT' and price >= pos['stop_loss']:
-                    should_close = True
-                    reason = f"止损触发 ({price:.2f} >= {pos['stop_loss']:.2f})"
-                
-                # 检查止盈
-                if not should_close:
-                    if pos['side'] == 'LONG' and price >= pos['take_profit']:
+                if pos['side'] == 'LONG':
+                    if price <= pos['stop_loss']:
                         should_close = True
+                        trigger_type = 'STOP_LOSS'
+                        reason = f"止损触发 ({price:.2f} <= {pos['stop_loss']:.2f})"
+                    elif price >= pos['take_profit']:
+                        should_close = True
+                        trigger_type = 'TAKE_PROFIT'
                         reason = f"止盈触发 ({price:.2f} >= {pos['take_profit']:.2f})"
-                    elif pos['side'] == 'SHORT' and price <= pos['take_profit']:
+                else:  # SHORT
+                    if price >= pos['stop_loss']:
                         should_close = True
+                        trigger_type = 'STOP_LOSS'
+                        reason = f"止损触发 ({price:.2f} >= {pos['stop_loss']:.2f})"
+                    elif price <= pos['take_profit']:
+                        should_close = True
+                        trigger_type = 'TAKE_PROFIT'
                         reason = f"止盈触发 ({price:.2f} <= {pos['take_profit']:.2f})"
                 
                 # 触发平仓
                 if should_close:
                     logger.info(f"🎯 {symbol} {pos['side']} {reason}")
-                    await self._close_virtual_position_by_trigger(
+                    logger.info(f"   仓位ID: {pos['id']}, 开仓价: {pos['entry_price']:.2f}, 触发价: {price:.2f}")
+                    result = await self._close_virtual_position_by_trigger(
                         pos_id=pos['id'],
                         current_price=price,
-                        reason=reason
+                        reason=reason,
+                        trigger_type=trigger_type
                     )
-                    closed_position_ids.append(pos['id'])
+                    if result.get('success'):
+                        closed_position_ids.append(pos['id'])
+                        logger.info(f"✅ 止损/止盈平仓成功: {symbol} {pos['side']} 仓位ID={pos['id']}")
+                    else:
+                        logger.error(f"❌ 止损/止盈平仓失败: {result.get('message', 'Unknown error')}")
             
             # 🔑 如果有仓位被平掉，统一刷新缓存（避免循环中多次刷新）
             if closed_position_ids:
                 await self._refresh_virtual_positions_cache(symbol)
-                logger.debug(f"🔄 已平仓{len(closed_position_ids)}个仓位，缓存已刷新")
+                logger.info(f"🔄 已平仓{len(closed_position_ids)}个仓位，缓存已刷新")
             
         except Exception as e:
-            logger.error(f"处理价格更新失败: {e}")
+            logger.error(f"处理价格更新失败: {e}", exc_info=True)
     
     async def _load_virtual_positions_cache(self):
         """加载虚拟仓位到内存缓存"""

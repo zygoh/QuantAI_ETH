@@ -3,6 +3,7 @@
 """
 import asyncio
 import logging
+import random
 from typing import Dict, List, Any, Optional, Callable
 from datetime import datetime, timedelta
 import json
@@ -562,12 +563,17 @@ class DataService:
             # 🆕 通知价格更新回调（用于虚拟仓位止损止盈检查）
             if self.loop and self.price_callbacks:
                 for callback in self.price_callbacks:
-                    asyncio.run_coroutine_threadsafe(
-                        callback(symbol, price),
-                        self.loop
-                    )
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            callback(symbol, price),
+                            self.loop
+                        )
+                    except Exception as e:
+                        logger.error(f"执行价格更新回调失败: {e}", exc_info=True)
             
-            logger.debug(f"价格更新: {symbol} {price}")
+            # 🔥 添加调试日志（每100次记录一次，避免日志过多）
+            if random.random() < 0.01:  # 1%的概率记录调试日志
+                logger.debug(f"📊 价格更新: {symbol} @{price:.2f}, 回调数: {len(self.price_callbacks)}")
             
         except Exception as e:
             logger.error(f"处理价格数据失败: {e}", exc_info=True)

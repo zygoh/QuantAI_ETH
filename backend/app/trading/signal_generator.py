@@ -378,20 +378,9 @@ class SignalGenerator:
             
             logger.info(f"✅ 首次预测完成，已缓存 {len(self.cached_predictions)}/{len(settings.TIMEFRAMES)} 个时间框架")
             
-            # 尝试立即生成一个信号（如果所有时间框架都预测成功）
-            if len(self.cached_predictions) == len(settings.TIMEFRAMES):
-                logger.info("🔄 尝试基于首次预测生成初始信号...")
-                
-                # 🔥 首次预测不计入预热信号（只是初始化缓存）
-                # 预热信号应该从实时WebSocket信号开始计数
-                signal = await self._try_synthesize_cached_signals(symbol)
-                if signal:
-                    logger.info(f"✅ 生成初始信号: {format_signal_type(signal.signal_type)} 置信度={signal.confidence:.4f}")
-                    logger.info(f"💡 首次信号不计入预热（预热从实时WebSocket信号开始）")
-                else:
-                    logger.info(f"ℹ️ 初始信号为HOLD或低置信度，等待实时信号")
-            else:
-                logger.info(f"⏸️ 首次预测未完全成功，等待WebSocket数据触发预测")
+            # 🔥 首次预测只填充缓存，不生成信号
+            # 首次信号应该等待实时K线完成后再生成（由5m K线完成触发）
+            logger.info("💡 首次预测仅用于初始化缓存，等待实时K线完成后再生成信号")
             
         except Exception as e:
             logger.warning(f"⚠️ 首次预测失败（不影响系统运行）: {e}")
