@@ -4,3 +4,7 @@
 __pycache__/
 .vscode
 .idea
+/.agent/
+/.cursor/
+/.idea/
+/.kiro/
