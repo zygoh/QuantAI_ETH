@@ -39,6 +39,8 @@ try:
     import okx.MarketData as MarketDataModule
     import okx.Trade as TradeModule
     import okx.PublicData as PublicDataModule
+    # ✅ 新增：导入交易大数据模块 (Rubik)
+    import okx.TradingData as TradingDataModule
     
     # 尝试导入异常类
     try:
@@ -70,6 +72,7 @@ except ImportError as e:
     MarketDataModule = None
     TradeModule = None
     PublicDataModule = None
+    TradingDataModule = None
 
 
 
@@ -230,6 +233,28 @@ class OKXClient(BaseExchangeClient):
             )
             logger.debug("  ✅ PublicData API 初始化成功")
             
+            # ✅ 新增：初始化 TradingDataAPI (Rubik)
+            logger.debug("  初始化 TradingData API...")
+            if TradingDataModule is None:
+                logger.warning("  ⚠️ TradingDataModule 未导入，跳过初始化")
+                self.trading_data_api = None
+            else:
+                if hasattr(TradingDataModule, 'TradingDataAPI'):
+                    TradingDataAPIClass = TradingDataModule.TradingDataAPI
+                elif hasattr(TradingDataModule, 'TradingData'):
+                    TradingDataAPIClass = TradingDataModule.TradingData
+                else:
+                    TradingDataAPIClass = TradingDataModule
+                
+                self.trading_data_api = TradingDataAPIClass(
+                    api_key=self.api_key,
+                    api_secret_key=self.secret_key,
+                    passphrase=self.passphrase,
+                    flag=flag,
+                    proxy=proxy if proxy else {}
+                )
+                logger.debug("  ✅ TradingData API 初始化成功")
+            
             logger.info("✅ OKX SDK 所有 API 客户端初始化完成")
             
         except Exception as e:
@@ -381,13 +406,40 @@ class OKXClient(BaseExchangeClient):
             # 转换为统一格式
             # 🔥 OKX K线数组格式：[timestamp, open, high, low, close, volume, volCcyQuote, volCcy, confirm]
             # 索引：            [0,       1,    2,    3,    4,     5,      6,           7,       8]
+            # 根据OKX文档：https://www.okx.com/docs-v5/zh/#order-book-trading-market-data-get-candlesticks-history
             formatted_klines = []
+            skipped_incomplete = 0
+            skipped_invalid = 0
+            
             for idx, kline in enumerate(klines):
                 try:
-                    # 检查数组长度
-                    if len(kline) < 7:
-                        logger.error(f"❌ 第 {idx} 条K线数据长度不足: {len(kline)} < 7")
-                        logger.error(f"   原始数据: {kline}")
+                    # ✅ 修复：检查数组长度应为9（包含confirm字段）
+                    if len(kline) < 9:
+                        logger.warning(f"⚠️ 第 {idx} 条K线数据长度不足: {len(kline)} < 9（期望9个元素）")
+                        logger.warning(f"   原始数据: {kline}")
+                        skipped_invalid += 1
+                        continue
+                    
+                    # ✅ 修复：提取confirm字段（索引8）判断K线是否完成
+                    confirm = kline[8]
+                    # OKX可能返回字符串"1"或数字1，统一处理
+                    confirm_str = str(confirm).strip()
+                    is_closed = (confirm_str == "1" or confirm == 1)
+                    
+                    # ✅ 修复：只处理已完成的K线（confirm=1）
+                    if not is_closed:
+                        skipped_incomplete += 1
+                        logger.debug(f"⏸️ 跳过未完成K线: 索引={idx}, confirm={confirm}")
+                        continue
+                    
+                    # ✅ 验证关键字段有效性
+                    close_price = self._safe_float(kline[4])
+                    volume = self._safe_float(kline[5])
+                    
+                    # 过滤无效数据（close<=0或volume<0）
+                    if close_price <= 0:
+                        logger.warning(f"⚠️ 跳过无效K线（close<=0）: 索引={idx}, close={close_price}")
+                        skipped_invalid += 1
                         continue
                     
                     # 使用安全转换处理K线数据
@@ -396,8 +448,8 @@ class OKXClient(BaseExchangeClient):
                         open=self._safe_float(kline[1]),
                         high=self._safe_float(kline[2]),
                         low=self._safe_float(kline[3]),
-                        close=self._safe_float(kline[4]),
-                        volume=self._safe_float(kline[5]),
+                        close=close_price,
+                        volume=volume,
                         close_time=self._safe_int(kline[0]) + self._interval_to_ms(interval) - 1,
                         quote_volume=self._safe_float(kline[6]),  # volCcyQuote
                         trades=0,  # OKX不提供此字段
@@ -408,7 +460,14 @@ class OKXClient(BaseExchangeClient):
                 except (IndexError, ValueError, TypeError) as e:
                     logger.error(f"❌ 解析第 {idx} 条K线数据失败: {e}")
                     logger.error(f"   原始数据: {kline}, 长度={len(kline) if isinstance(kline, list) else 'N/A'}")
+                    skipped_invalid += 1
                     continue
+            
+            # ✅ 记录过滤统计
+            if skipped_incomplete > 0:
+                logger.info(f"📊 已过滤 {skipped_incomplete} 条未完成K线（confirm!=1）")
+            if skipped_invalid > 0:
+                logger.warning(f"⚠️ 已跳过 {skipped_invalid} 条无效K线（格式错误或数据无效）")
             
             # OKX返回的数据是倒序的，需要反转
             formatted_klines.reverse()
@@ -808,6 +867,647 @@ class OKXClient(BaseExchangeClient):
             self._handle_sdk_exception(e)
             logger.error(f"❌ 获取OKX交易对信息失败: {e}")
             return None
+    
+    def get_funding_rate(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        获取资金费率
+        
+        Args:
+            symbol: 交易对符号
+        
+        Returns:
+            资金费率数据字典，包含：
+            - funding_rate: 当前资金费率
+            - next_funding_time: 下次资金费率时间
+            - funding_rate_8h: 8小时资金费率
+        """
+        try:
+            okx_symbol = SymbolMapper.to_exchange_format(symbol, "OKX")
+            
+            # 使用SDK的公共API获取资金费率
+            # OKX API: GET /api/v5/public/funding-rate
+            response = self.public_api.get_funding_rate(instId=okx_symbol)
+            
+            if response['code'] != '0':
+                logger.error(f"获取资金费率失败: {response['msg']}")
+                return None
+            
+            data_list = response.get('data', [])
+            if not data_list:
+                logger.warning(f"资金费率数据为空: {okx_symbol}")
+                return None
+            
+            # 取最新的一条
+            data = data_list[0]
+            
+            return {
+                'funding_rate': self._safe_float(data.get('fundingRate'), 0.0),
+                'next_funding_time': int(data.get('nextFundingTime', 0)),
+                'funding_rate_8h': self._safe_float(data.get('fundingRate'), 0.0),  # 8小时资金费率
+                'timestamp': int(data.get('ts', time.time() * 1000))
+            }
+            
+        except Exception as e:
+            self._handle_sdk_exception(e)
+            logger.error(f"❌ 获取OKX资金费率失败: {e}")
+            return None
+    
+    def get_open_interest(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        获取持仓量（Open Interest）
+        
+        Args:
+            symbol: 交易对符号
+        
+        Returns:
+            持仓量数据字典，包含：
+            - open_interest: 持仓量（张数）
+            - open_interest_usd: 持仓量（USDT价值）
+            - timestamp: 时间戳
+        """
+        try:
+            okx_symbol = SymbolMapper.to_exchange_format(symbol, "OKX")
+            
+            # 使用SDK的公共API获取持仓量
+            # OKX API: GET /api/v5/public/open-interest
+            response = self.public_api.get_open_interest(instId=okx_symbol)
+            
+            if response['code'] != '0':
+                logger.error(f"获取持仓量失败: {response['msg']}")
+                return None
+            
+            data_list = response.get('data', [])
+            if not data_list:
+                logger.warning(f"持仓量数据为空: {okx_symbol}")
+                return None
+            
+            # 取最新的一条
+            data = data_list[0]
+            
+            return {
+                'open_interest': self._safe_float(data.get('oi', 0.0)),  # 持仓量（张数）
+                'open_interest_usd': self._safe_float(data.get('oiCcy', 0.0)),  # 持仓量（USDT价值）
+                'timestamp': int(data.get('ts', time.time() * 1000))
+            }
+            
+        except Exception as e:
+            self._handle_sdk_exception(e)
+            logger.error(f"❌ 获取OKX持仓量失败: {e}")
+            return None
+    
+    def get_long_short_ratio(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        获取多空持仓人数比
+        
+        Args:
+            symbol: 交易对符号
+        
+        Returns:
+            多空比数据字典，包含：
+            - long_short_ratio: 多空持仓人数比
+            - long_account: 多头账户数
+            - short_account: 空头账户数
+            - timestamp: 时间戳
+        """
+        try:
+            okx_symbol = SymbolMapper.to_exchange_format(symbol, "OKX")
+            
+            # 使用SDK的公共API获取多空持仓人数比
+            # OKX API: GET /api/v5/public/retail-margin
+            response = self.public_api.get_retail_margin(instId=okx_symbol)
+            
+            if response['code'] != '0':
+                logger.error(f"获取多空比失败: {response['msg']}")
+                return None
+            
+            data_list = response.get('data', [])
+            if not data_list:
+                logger.warning(f"多空比数据为空: {okx_symbol}")
+                return None
+            
+            # 取最新的一条
+            data = data_list[0]
+            
+            long_account = self._safe_float(data.get('longRatio', 0.0))
+            short_account = self._safe_float(data.get('shortRatio', 0.0))
+            
+            # 计算多空比（避免除零）
+            long_short_ratio = long_account / (short_account + 1e-10) if short_account > 0 else 0.0
+            
+            return {
+                'long_short_ratio': long_short_ratio,
+                'long_account': long_account,
+                'short_account': short_account,
+                'timestamp': int(data.get('ts', time.time() * 1000))
+            }
+            
+        except Exception as e:
+            self._handle_sdk_exception(e)
+            logger.error(f"❌ 获取OKX多空比失败: {e}")
+            return None
+    
+    def get_order_book(self, symbol: str, depth: int = 5) -> Optional[Dict[str, Any]]:
+        """
+        获取订单簿数据
+        
+        Args:
+            symbol: 交易对符号
+            depth: 深度（默认5档）
+        
+        Returns:
+            订单簿数据字典，包含：
+            - bids: 买单列表 [[price, size], ...]
+            - asks: 卖单列表 [[price, size], ...]
+            - bid_volume_top5: 前5档买单总量
+            - ask_volume_top5: 前5档卖单总量
+            - order_book_imbalance: 订单簿不平衡度
+            - timestamp: 时间戳
+        """
+        try:
+            okx_symbol = SymbolMapper.to_exchange_format(symbol, "OKX")
+            
+            # 使用SDK的市场数据API获取订单簿
+            # OKX API: GET /api/v5/market/books
+            response = self.market_api.get_books(instId=okx_symbol, sz=str(depth))
+            
+            if response['code'] != '0':
+                logger.error(f"获取订单簿失败: {response['msg']}")
+                return None
+            
+            data_list = response.get('data', [])
+            if not data_list:
+                logger.warning(f"订单簿数据为空: {okx_symbol}")
+                return None
+            
+            # 取最新的一条
+            data = data_list[0]
+            
+            bids = data.get('bids', [])  # [[price, size, ...], ...]
+            asks = data.get('asks', [])  # [[price, size, ...], ...]
+            
+            # 计算前5档买卖总量
+            bid_volume_top5 = sum(float(bid[1]) for bid in bids[:5])
+            ask_volume_top5 = sum(float(ask[1]) for ask in asks[:5])
+            
+            # 计算订单簿不平衡度
+            total_volume = bid_volume_top5 + ask_volume_top5
+            order_book_imbalance = (bid_volume_top5 - ask_volume_top5) / (total_volume + 1e-10) if total_volume > 0 else 0.0
+            
+            return {
+                'bids': bids,
+                'asks': asks,
+                'bid_volume_top5': bid_volume_top5,
+                'ask_volume_top5': ask_volume_top5,
+                'order_book_imbalance': order_book_imbalance,
+                'timestamp': int(data.get('ts', time.time() * 1000))
+            }
+            
+        except Exception as e:
+            self._handle_sdk_exception(e)
+            logger.error(f"❌ 获取OKX订单簿失败: {e}")
+            return None
+    
+    def get_large_trades(self, symbol: str, min_amount: float = 100000.0, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        获取大单交易数据（过滤小额成交）
+        
+        Args:
+            symbol: 交易对符号
+            min_amount: 最小金额阈值（USDT，默认10万）
+            limit: 返回数量限制
+        
+        Returns:
+            大单交易列表，每个元素包含：
+            - price: 成交价格
+            - size: 成交数量
+            - side: 方向（buy/sell）
+            - amount: 成交金额（USDT）
+            - timestamp: 时间戳
+        """
+        try:
+            okx_symbol = SymbolMapper.to_exchange_format(symbol, "OKX")
+            
+            # 使用SDK的市场数据API获取成交数据
+            # OKX API: GET /api/v5/market/trades
+            response = self.market_api.get_trades(instId=okx_symbol, limit=str(limit))
+            
+            if response['code'] != '0':
+                logger.error(f"获取成交数据失败: {response['msg']}")
+                return []
+            
+            trades = response.get('data', [])
+            
+            # 过滤大单
+            large_trades = []
+            for trade in trades:
+                price = self._safe_float(trade.get('px', 0.0))
+                size = self._safe_float(trade.get('sz', 0.0))
+                amount = price * size  # 成交金额
+                
+                if amount >= min_amount:
+                    large_trades.append({
+                        'price': price,
+                        'size': size,
+                        'side': trade.get('side', 'buy'),  # 'buy' 或 'sell'
+                        'amount': amount,
+                        'timestamp': int(trade.get('ts', time.time() * 1000))
+                    })
+            
+            return large_trades
+            
+        except Exception as e:
+            self._handle_sdk_exception(e)
+            logger.error(f"❌ 获取OKX大单数据失败: {e}")
+            return []
+    
+    def get_historical_funding_rate(
+        self, 
+        symbol: str, 
+        start_time: Optional[int] = None, 
+        end_time: Optional[int] = None,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        获取历史资金费率数据（SDK版，带自动分页）
+        
+        OKX API: GET /api/v5/public/funding-rate-history
+        对应接口: PublicDataAPI.get_funding_rate_history
+        
+        Args:
+            symbol: 交易对符号
+            start_time: 开始时间戳（毫秒），可选
+            end_time: 结束时间戳（毫秒），可选
+            limit: API单次限制（默认100，最大100）
+        
+        Returns:
+            历史资金费率列表，每个元素包含：
+            - funding_rate: 资金费率
+            - timestamp: 时间戳（毫秒）
+        """
+        try:
+            okx_symbol = SymbolMapper.to_exchange_format(symbol, "OKX")
+            all_data = []
+            
+            # 时间处理
+            current_end = end_time  # 如果为None，API默认返回最新数据
+            target_start = start_time or (int(time.time() * 1000) - 90 * 24 * 60 * 60 * 1000)  # 默认90天
+            
+            logger.info(f"🔄 [SDK] 开始分页获取资金费率: {symbol}")
+            
+            # 分页游标 (after 参数用于获取更旧的数据)
+            cursor_after = None
+            max_iterations = 100  # 防止无限循环
+            iteration = 0
+            
+            while iteration < max_iterations:
+                # 构造参数
+                # 注意：PublicData API 的分页参数通常是 'after' (请求此时间戳之前/更旧的数据)
+                kwargs = {
+                    'instId': okx_symbol,
+                    'limit': str(limit)
+                }
+                
+                # 如果有游标，传入 after
+                if cursor_after:
+                    kwargs['after'] = str(cursor_after)
+                # 如果没有游标但有指定的结束时间，也可以作为起始点
+                elif current_end:
+                    kwargs['after'] = str(current_end)
+                    # 注意：OKX API对于第一次请求，如果不传after默认返回最新。
+                    # 如果我们想从特定的 end_time 开始往前查，应该把 end_time 传给 after
+                    # 但需要注意 end_time 数据本身可能不包含在内，视具体API行为微调
+                
+                # ✅ SDK 调用
+                # 检查方法名，通常是 get_funding_rate_history
+                try:
+                    if hasattr(self.public_api, 'get_funding_rate_history'):
+                        response = self.public_api.get_funding_rate_history(**kwargs)
+                    elif hasattr(self.public_api, 'funding_rate_history'):
+                        response = self.public_api.funding_rate_history(**kwargs)
+                    else:
+                        logger.error("❌ SDK中未找到资金费率历史方法")
+                        logger.error(f"   可用方法: {[m for m in dir(self.public_api) if not m.startswith('_')]}")
+                        break
+                except AttributeError as e:
+                    logger.error(f"❌ SDK方法不存在: {e}")
+                    logger.error(f"   可用方法: {[m for m in dir(self.public_api) if not m.startswith('_')]}")
+                    break
+                except Exception as e:
+                    logger.error(f"❌ 调用SDK API失败: {e}")
+                    break
+                
+                if response.get('code') != '0':
+                    logger.warning(f"SDK API错误: {response.get('msg')}")
+                    break
+                
+                data_list = response.get('data', [])
+                if not data_list:
+                    break
+                
+                # 数据转换
+                batch_data = []
+                min_ts_in_batch = float('inf')
+                
+                for item in data_list:
+                    # OKX返回的字段: fundingRate, fundingTime (或 ts)
+                    ts = int(item.get('ts') or item.get('fundingTime') or time.time() * 1000)
+                    min_ts_in_batch = min(min_ts_in_batch, ts)
+                    
+                    if ts < target_start:
+                        continue
+                    
+                    batch_data.append({
+                        'funding_rate': self._safe_float(item.get('fundingRate'), 0.0),
+                        'timestamp': ts
+                    })
+                
+                all_data.extend(batch_data)
+                logger.debug(f"   SDK已获取 {len(batch_data)} 条, 当前最早时间: {datetime.fromtimestamp(min_ts_in_batch/1000)}")
+                
+                # 分页终止条件
+                if min_ts_in_batch <= target_start or len(data_list) < limit:
+                    break
+                
+                # 更新游标：使用本批次最后一条数据的时间戳作为下一次请求的 'after'
+                cursor_after = data_list[-1].get('ts') or data_list[-1].get('fundingTime')
+                if not cursor_after:
+                    break
+                
+                iteration += 1
+                time.sleep(0.1)  # 限流保护
+            
+            # 去重并排序
+            unique_data = {x['timestamp']: x for x in all_data}.values()
+            sorted_data = sorted(unique_data, key=lambda x: x['timestamp'])
+            
+            logger.info(f"✅ [SDK] 历史资金费率获取完成: 共 {len(sorted_data)} 条 (分页{iteration}次)")
+            return sorted_data
+            
+        except Exception as e:
+            self._handle_sdk_exception(e)
+            logger.error(f"❌ [SDK] 获取OKX资金费率失败: {e}")
+            return []
+    
+    def get_historical_open_interest(
+        self, 
+        symbol: str, 
+        start_time: Optional[int] = None, 
+        end_time: Optional[int] = None,
+        period: str = "5m",
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        获取历史持仓量数据（SDK版，带自动分页）
+        
+        OKX API: GET /api/v5/rubik/stat/contracts/open-interest-volume
+        对应接口: TradingDataAPI.get_contracts_open_interest_volume
+        
+        Args:
+            symbol: 交易对符号
+            start_time: 开始时间戳（毫秒），可选
+            end_time: 结束时间戳（毫秒），可选
+            period: 时间周期（如5m, 15m, 1H, 4H, 1D），默认5m
+            limit: 每次请求的数量限制（默认100）
+        
+        Returns:
+            历史持仓量列表，每个元素包含：
+            - open_interest: 持仓量（张数）
+            - open_interest_usd: 持仓量（USDT价值）
+            - timestamp: 时间戳（毫秒）
+        """
+        try:
+            # 如果SDK未初始化，降级使用HTTP请求
+            if self.trading_data_api is None:
+                logger.warning("⚠️ TradingDataAPI未初始化，无法使用SDK")
+                return []
+            
+            okx_symbol = SymbolMapper.to_exchange_format(symbol, "OKX")
+            all_data = []
+            
+            # 时间处理
+            current_end = end_time or int(time.time() * 1000)
+            target_start = start_time or (current_end - 24 * 60 * 60 * 1000)  # 默认24小时前
+            
+            logger.info(f"🔄 [SDK] 开始分页获取持仓量: {symbol}, 目标范围: {target_start} -> {current_end}")
+            
+            max_iterations = 100  # 防止无限循环
+            iteration = 0
+            
+            while iteration < max_iterations:
+                try:
+                    # ✅ SDK 调用
+                    # 注意：不同版本的 SDK 方法名可能略有不同
+                    # 如果报错 AttributeError，请尝试 get_open_interest_volume
+                    if hasattr(self.trading_data_api, 'get_contracts_open_interest_volume'):
+                        response = self.trading_data_api.get_contracts_open_interest_volume(
+                            instId=okx_symbol,
+                            period=period,
+                            limit=str(limit),
+                            begin=str(current_end),  # 获取比这个时间更早的数据
+                            end=str(target_start)   # (可选) 截止时间
+                        )
+                    elif hasattr(self.trading_data_api, 'get_open_interest_volume'):
+                        response = self.trading_data_api.get_open_interest_volume(
+                            instId=okx_symbol,
+                            period=period,
+                            limit=str(limit),
+                            begin=str(current_end),
+                            end=str(target_start)
+                        )
+                    else:
+                        logger.error(f"❌ TradingDataAPI 不支持持仓量历史方法，可用方法: {[m for m in dir(self.trading_data_api) if not m.startswith('_')]}")
+                        break
+                    
+                    if response.get('code') != '0':
+                        logger.warning(f"SDK API错误: {response.get('msg')}")
+                        break
+                    
+                    data_list = response.get('data', [])
+                    if not data_list:
+                        break
+                    
+                    # 数据转换
+                    batch_data = []
+                    min_ts_in_batch = current_end
+                    
+                    for item in data_list:
+                        ts = int(item.get('ts', time.time() * 1000))
+                        min_ts_in_batch = min(min_ts_in_batch, ts)
+                        
+                        if ts < target_start:
+                            continue
+                        
+                        batch_data.append({
+                            'open_interest': self._safe_float(item.get('oi'), 0.0),
+                            'open_interest_usd': self._safe_float(item.get('oiCcy'), 0.0),
+                            'timestamp': ts
+                        })
+                    
+                    all_data.extend(batch_data)
+                    logger.debug(f"   SDK已获取 {len(batch_data)} 条, 当前最早时间: {datetime.fromtimestamp(min_ts_in_batch/1000)}")
+                    
+                    # 分页终止条件
+                    if min_ts_in_batch <= target_start or len(data_list) < limit:
+                        break
+                    
+                    # 更新游标
+                    current_end = min_ts_in_batch - 1
+                    iteration += 1
+                    time.sleep(0.1)  # 限流保护
+                    
+                except AttributeError as e:
+                    logger.error(f"❌ SDK方法不存在: {e}")
+                    logger.error(f"   可用方法: {[m for m in dir(self.trading_data_api) if not m.startswith('_')]}")
+                    break
+                except Exception as e:
+                    logger.error(f"❌ 调用SDK API失败: {e}")
+                    break
+            
+            all_data.sort(key=lambda x: x['timestamp'])
+            logger.info(f"✅ [SDK] 历史持仓量获取完成: 共 {len(all_data)} 条 (分页{iteration}次)")
+            return all_data
+            
+        except Exception as e:
+            self._handle_sdk_exception(e)
+            logger.error(f"❌ [SDK] 获取OKX历史持仓量失败: {e}")
+            return []
+    
+    def get_historical_long_short_ratio(
+        self, 
+        symbol: str, 
+        start_time: Optional[int] = None, 
+        end_time: Optional[int] = None,
+        period: str = "5m",
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        获取历史多空比数据（SDK版，带自动分页）
+        
+        OKX API: GET /api/v5/rubik/stat/contracts/long-short-account-ratio
+        对应接口: TradingDataAPI.get_contracts_long_short_account_ratio
+        
+        Args:
+            symbol: 交易对符号（如ETH-USDT，会提取基础货币ETH作为ccy）
+            start_time: 开始时间戳（毫秒），可选
+            end_time: 结束时间戳（毫秒），可选
+            period: 时间周期（如5m, 15m, 1H, 4H, 1D），默认5m
+            limit: 每次请求的数量限制（默认100）
+        
+        Returns:
+            历史多空比列表，每个元素包含：
+            - long_short_ratio: 多空比
+            - long_account: 多头账户比例
+            - short_account: 空头账户比例
+            - timestamp: 时间戳（毫秒）
+        """
+        try:
+            # 如果SDK未初始化，降级使用HTTP请求
+            if self.trading_data_api is None:
+                logger.warning("⚠️ TradingDataAPI未初始化，无法使用SDK")
+                return []
+            
+            okx_symbol = SymbolMapper.to_exchange_format(symbol, "OKX")
+            
+            # 从symbol提取基础货币（ccy）
+            # 例如：ETH-USDT-SWAP -> ETH, BTC-USDT-SWAP -> BTC
+            if '-SWAP' in okx_symbol:
+                ccy = okx_symbol.split('-')[0]  # ETH-USDT-SWAP -> ETH
+            elif '-' in okx_symbol:
+                ccy = okx_symbol.split('-')[0]  # ETH-USDT -> ETH
+            else:
+                ccy = okx_symbol  # 如果格式不对，使用原值
+            
+            all_data = []
+            current_end = end_time or int(time.time() * 1000)
+            target_start = start_time or (current_end - 24 * 60 * 60 * 1000)  # 默认24小时前
+            
+            logger.info(f"🔄 [SDK] 开始分页获取多空比: {ccy}, 目标范围: {target_start} -> {current_end}")
+            
+            max_iterations = 100  # 防止无限循环
+            iteration = 0
+            
+            while iteration < max_iterations:
+                try:
+                    # ✅ SDK 调用
+                    # 方法名通常是 get_contracts_long_short_account_ratio
+                    if hasattr(self.trading_data_api, 'get_contracts_long_short_account_ratio'):
+                        response = self.trading_data_api.get_contracts_long_short_account_ratio(
+                            ccy=ccy,
+                            period=period,
+                            limit=str(limit),
+                            begin=str(current_end),
+                            end=str(target_start)
+                        )
+                    elif hasattr(self.trading_data_api, 'get_long_short_account_ratio'):
+                        response = self.trading_data_api.get_long_short_account_ratio(
+                            ccy=ccy,
+                            period=period,
+                            limit=str(limit),
+                            begin=str(current_end),
+                            end=str(target_start)
+                        )
+                    else:
+                        logger.error(f"❌ TradingDataAPI 不支持多空比历史方法，可用方法: {[m for m in dir(self.trading_data_api) if not m.startswith('_')]}")
+                        break
+                    
+                    if response.get('code') != '0':
+                        logger.warning(f"SDK API错误: {response.get('msg')}")
+                        break
+                    
+                    data_list = response.get('data', [])
+                    if not data_list:
+                        break
+                    
+                    batch_data = []
+                    min_ts_in_batch = current_end
+                    
+                    for item in data_list:
+                        ts = int(item.get('ts', time.time() * 1000))
+                        min_ts_in_batch = min(min_ts_in_batch, ts)
+                        
+                        if ts < target_start:
+                            continue
+                        
+                        long_account = self._safe_float(item.get('longRatio'), 0.0)
+                        short_account = self._safe_float(item.get('shortRatio'), 0.0)
+                        # 自动计算比率防止除零
+                        ls_ratio = long_account / (short_account + 1e-10) if short_account > 0 else 0.0
+                        
+                        batch_data.append({
+                            'long_short_ratio': ls_ratio,
+                            'long_account': long_account,
+                            'short_account': short_account,
+                            'timestamp': ts
+                        })
+                    
+                    all_data.extend(batch_data)
+                    logger.debug(f"   SDK已获取 {len(batch_data)} 条, 当前最早时间: {datetime.fromtimestamp(min_ts_in_batch/1000)}")
+                    
+                    # 分页终止条件
+                    if min_ts_in_batch <= target_start or len(data_list) < limit:
+                        break
+                    
+                    # 更新游标
+                    current_end = min_ts_in_batch - 1
+                    iteration += 1
+                    time.sleep(0.1)  # 限流保护
+                    
+                except AttributeError as e:
+                    logger.error(f"❌ SDK方法不存在: {e}")
+                    logger.error(f"   可用方法: {[m for m in dir(self.trading_data_api) if not m.startswith('_')]}")
+                    break
+                except Exception as e:
+                    logger.error(f"❌ 调用SDK API失败: {e}")
+                    break
+            
+            all_data.sort(key=lambda x: x['timestamp'])
+            logger.info(f"✅ [SDK] 历史多空比获取完成: 共 {len(all_data)} 条 (分页{iteration}次)")
+            return all_data
+            
+        except Exception as e:
+            self._handle_sdk_exception(e)
+            logger.error(f"❌ [SDK] 获取OKX历史多空比失败: {e}")
+            return []
 
 
 

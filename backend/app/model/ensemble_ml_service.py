@@ -1721,7 +1721,7 @@ class EnsembleMLService(MLService):
             
             sample_weights = class_weights * time_decay * hold_penalty
             
-            # 🔑 时间框架差异化配置（防止2h/4h过拟合）
+            # 🔑 时间框架差异化配置（仅3m/5m/15m）
             if custom_params:
                 # 使用Optuna优化的参数
                 params = custom_params.copy()
@@ -1805,7 +1805,7 @@ class EnsembleMLService(MLService):
             
             sample_weights = class_weights * time_decay * hold_penalty
             
-            # 🔑 时间框架差异化配置（防止2h/4h过拟合）
+            # 🔑 时间框架差异化配置（仅3m/5m/15m）
             if custom_params:
                 # 使用Optuna优化的参数
                 params = custom_params.copy()

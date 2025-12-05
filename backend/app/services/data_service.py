@@ -627,9 +627,13 @@ class DataService:
         self, 
         symbol: str, 
         interval: str, 
-        limit: int = 100
+        limit: int = 250
     ) -> List[Dict[str, Any]]:
-        """获取最新K线数据（仅供前端API调用，模型训练和信号生成不使用此方法）"""
+        """
+        获取最新K线数据（仅供前端API调用，模型训练和信号生成不使用此方法）
+        
+        🔧 修复：默认limit从100增加到250，确保有足够数据计算长周期指标（如long_vol需要100周期）
+        """
         try:
             # 先尝试从缓存获取
             cached_data = await cache_manager.get_market_data(symbol, interval)

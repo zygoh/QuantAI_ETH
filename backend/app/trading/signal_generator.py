@@ -560,8 +560,11 @@ class SignalGenerator:
                         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                     data_source = "API备用"
                 
-                if df is None or len(df) < 50:
-                    logger.warning(f"❌ {timeframe}数据不足: {len(df) if df is not None else 0}条")
+                # 🔧 修复：确保有足够数据计算长周期指标（如long_vol需要100周期）
+                # 至少需要250条数据，确保所有技术指标都能正常计算
+                min_required_klines = 250
+                if df is None or len(df) < min_required_klines:
+                    logger.warning(f"❌ {timeframe}数据不足: {len(df) if df is not None else 0}条 < {min_required_klines}条（需要足够数据计算长周期指标）")
                     continue
                 
                 logger.debug(f"🤖 开始{timeframe}模型预测 (数据源: {data_source}, {len(df)}条K线)...")

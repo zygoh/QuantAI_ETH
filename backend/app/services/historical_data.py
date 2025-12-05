@@ -339,6 +339,201 @@ class HistoricalDataManager:
             logger.info(f"清理了{days}天前的旧数据")
         except Exception as e:
             logger.error(f"清理旧数据失败: {e}")
+    
+    async def fetch_historical_derivatives_data(
+        self, 
+        symbol: str, 
+        days: int = 120
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        获取历史衍生品数据（资金费率、持仓量、多空比）
+        
+        Args:
+            symbol: 交易对符号
+            days: 获取天数（默认120天）
+        
+        Returns:
+            包含历史衍生品数据的字典：
+            - funding_rate: 资金费率DataFrame（timestamp, funding_rate）
+            - open_interest: 持仓量DataFrame（timestamp, open_interest_usd）
+            - long_short_ratio: 多空比DataFrame（timestamp, long_short_ratio）
+        """
+        try:
+            logger.info(f"开始获取历史衍生品数据: {symbol} {days}天")
+            
+            # 计算时间范围
+            from datetime import datetime, timedelta
+            end_time = datetime.now()
+            start_time = end_time - timedelta(days=days)
+            start_time_ms = int(start_time.timestamp() * 1000)
+            end_time_ms = int(end_time.timestamp() * 1000)
+            
+            result = {}
+            
+            # 1. 获取历史资金费率（每8小时一次，120天需要360条）
+            try:
+                funding_history = self.exchange_client.get_historical_funding_rate(
+                    symbol=symbol,
+                    start_time=start_time_ms,
+                    end_time=end_time_ms,
+                    limit=360  # 120天 = 360个8小时周期
+                )
+                
+                if funding_history:
+                    df_funding = pd.DataFrame(funding_history)
+                    df_funding['timestamp'] = pd.to_datetime(df_funding['timestamp'], unit='ms')
+                    df_funding = df_funding.sort_values('timestamp')
+                    result['funding_rate'] = df_funding
+                    logger.info(f"✅ 获取历史资金费率: {len(df_funding)}条")
+                else:
+                    logger.warning(f"⚠️ 未获取到历史资金费率数据")
+                    result['funding_rate'] = pd.DataFrame(columns=['timestamp', 'funding_rate'])
+            except Exception as e:
+                logger.error(f"获取历史资金费率失败: {e}")
+                result['funding_rate'] = pd.DataFrame(columns=['timestamp', 'funding_rate'])
+            
+            # 2. 获取历史持仓量（使用Rubik API，需要period参数）
+            try:
+                # 根据数据跨度选择合适的period
+                # 如果数据跨度大，使用较长的period（如1H），否则使用5m
+                if days >= 30:
+                    period = "1H"  # 30天以上使用1小时周期
+                elif days >= 7:
+                    period = "15m"  # 7-30天使用15分钟周期
+                else:
+                    period = "5m"  # 7天以下使用5分钟周期
+                
+                oi_history = self.exchange_client.get_historical_open_interest(
+                    symbol=symbol,
+                    start_time=start_time_ms,
+                    end_time=end_time_ms,
+                    period=period  # Rubik API需要period参数
+                )
+                
+                if oi_history:
+                    df_oi = pd.DataFrame(oi_history)
+                    df_oi['timestamp'] = pd.to_datetime(df_oi['timestamp'], unit='ms')
+                    df_oi = df_oi.sort_values('timestamp')
+                    result['open_interest'] = df_oi
+                    logger.info(f"✅ 获取历史持仓量: {len(df_oi)}条")
+                else:
+                    logger.warning(f"⚠️ 未获取到历史持仓量数据（OKX可能不提供历史数据）")
+                    result['open_interest'] = pd.DataFrame(columns=['timestamp', 'open_interest_usd'])
+            except Exception as e:
+                logger.error(f"获取历史持仓量失败: {e}")
+                result['open_interest'] = pd.DataFrame(columns=['timestamp', 'open_interest_usd'])
+            
+            # 3. 获取历史多空比（使用Rubik API，需要period参数）
+            try:
+                # 根据数据跨度选择合适的period（与持仓量保持一致）
+                if days >= 30:
+                    period = "1H"  # 30天以上使用1小时周期
+                elif days >= 7:
+                    period = "15m"  # 7-30天使用15分钟周期
+                else:
+                    period = "5m"  # 7天以下使用5分钟周期
+                
+                ls_history = self.exchange_client.get_historical_long_short_ratio(
+                    symbol=symbol,
+                    start_time=start_time_ms,
+                    end_time=end_time_ms,
+                    period=period  # Rubik API需要period参数
+                )
+                
+                if ls_history:
+                    df_ls = pd.DataFrame(ls_history)
+                    df_ls['timestamp'] = pd.to_datetime(df_ls['timestamp'], unit='ms')
+                    df_ls = df_ls.sort_values('timestamp')
+                    result['long_short_ratio'] = df_ls
+                    logger.info(f"✅ 获取历史多空比: {len(df_ls)}条")
+                else:
+                    logger.warning(f"⚠️ 未获取到历史多空比数据（OKX可能不提供历史数据）")
+                    result['long_short_ratio'] = pd.DataFrame(columns=['timestamp', 'long_short_ratio'])
+            except Exception as e:
+                logger.error(f"获取历史多空比失败: {e}")
+                result['long_short_ratio'] = pd.DataFrame(columns=['timestamp', 'long_short_ratio'])
+            
+            logger.info(f"历史衍生品数据获取完成: {symbol}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"获取历史衍生品数据失败: {e}")
+            return {
+                'funding_rate': pd.DataFrame(columns=['timestamp', 'funding_rate']),
+                'open_interest': pd.DataFrame(columns=['timestamp', 'open_interest_usd']),
+                'long_short_ratio': pd.DataFrame(columns=['timestamp', 'long_short_ratio'])
+            }
+    
+    def merge_derivatives_to_klines(
+        self, 
+        df_klines: pd.DataFrame, 
+        derivatives_data: Dict[str, pd.DataFrame]
+    ) -> pd.DataFrame:
+        """
+        将历史衍生品数据合并到K线数据中（按时间戳对齐）
+        
+        Args:
+            df_klines: K线DataFrame（必须包含timestamp列）
+            derivatives_data: 历史衍生品数据字典
+        
+        Returns:
+            合并后的DataFrame
+        """
+        try:
+            if df_klines.empty:
+                return df_klines
+            
+            # 确保timestamp是datetime类型
+            if not pd.api.types.is_datetime64_any_dtype(df_klines['timestamp']):
+                df_klines['timestamp'] = pd.to_datetime(df_klines['timestamp'])
+            
+            df_result = df_klines.copy()
+            
+            # 1. 合并资金费率（前向填充，因为资金费率每8小时变化一次）
+            if 'funding_rate' in derivatives_data and not derivatives_data['funding_rate'].empty:
+                df_funding = derivatives_data['funding_rate'][['timestamp', 'funding_rate']].copy()
+                df_funding = df_funding.sort_values('timestamp')
+                
+                # 使用merge_asof进行时间对齐（前向填充）
+                df_result = pd.merge_asof(
+                    df_result.sort_values('timestamp'),
+                    df_funding,
+                    on='timestamp',
+                    direction='forward'  # 前向填充：使用最近的历史值
+                )
+                logger.debug(f"✅ 合并资金费率: {df_result['funding_rate'].notna().sum()}/{len(df_result)}行有数据")
+            
+            # 2. 合并持仓量（前向填充）
+            if 'open_interest' in derivatives_data and not derivatives_data['open_interest'].empty:
+                df_oi = derivatives_data['open_interest'][['timestamp', 'open_interest_usd']].copy()
+                df_oi = df_oi.sort_values('timestamp')
+                
+                df_result = pd.merge_asof(
+                    df_result.sort_values('timestamp'),
+                    df_oi,
+                    on='timestamp',
+                    direction='forward'
+                )
+                logger.debug(f"✅ 合并持仓量: {df_result['open_interest_usd'].notna().sum()}/{len(df_result)}行有数据")
+            
+            # 3. 合并多空比（前向填充）
+            if 'long_short_ratio' in derivatives_data and not derivatives_data['long_short_ratio'].empty:
+                df_ls = derivatives_data['long_short_ratio'][['timestamp', 'long_short_ratio']].copy()
+                df_ls = df_ls.sort_values('timestamp')
+                
+                df_result = pd.merge_asof(
+                    df_result.sort_values('timestamp'),
+                    df_ls,
+                    on='timestamp',
+                    direction='forward'
+                )
+                logger.debug(f"✅ 合并多空比: {df_result['long_short_ratio'].notna().sum()}/{len(df_result)}行有数据")
+            
+            return df_result
+            
+        except Exception as e:
+            logger.error(f"合并衍生品数据失败: {e}")
+            return df_klines
 
 # 全局历史数据管理器实例
 historical_data_manager = HistoricalDataManager()
