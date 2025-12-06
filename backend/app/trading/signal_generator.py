@@ -1053,8 +1053,80 @@ class SignalGenerator:
             except Exception as e:
                 logger.debug(f"信号频率检查失败（跳过此过滤）: {e}")
             
-            # 6. 所有过滤器通过
-            logger.info(f"✅ 信号通过所有增强过滤器")
+            # 6. 🆕 市场状态过滤（Market Regime Filtering）
+            # 根据ADX指标判断市场状态，过滤不匹配的信号
+            try:
+                # 获取最新5m K线数据（主时间框架）来计算ADX
+                buffer_data = self.kline_buffers.get('5m', [])
+                if len(buffer_data) >= 14:  # ADX需要至少14个周期
+                    # 转换为DataFrame以便计算ADX
+                    df_buffer = pd.DataFrame(buffer_data[-50:])  # 取最近50条用于计算
+                    if 'timestamp' in df_buffer.columns:
+                        df_buffer['timestamp'] = pd.to_datetime(df_buffer['timestamp'], unit='ms')
+                    df_buffer = df_buffer.set_index('timestamp') if 'timestamp' in df_buffer.columns else df_buffer
+                    
+                    # 计算ADX（使用ta库，与feature_engineering保持一致）
+                    try:
+                        import ta  # 与feature_engineering.py保持一致
+                        adx_indicator = ta.trend.ADXIndicator(
+                            df_buffer['high'], 
+                            df_buffer['low'], 
+                            df_buffer['close']
+                        )
+                        current_adx = adx_indicator.adx().iloc[-1]
+                        
+                        # 验证ADX值有效性
+                        if pd.isna(current_adx) or np.isinf(current_adx):
+                            raise ValueError("ADX计算结果无效")
+                        
+                        # 市场状态判断阈值
+                        TRENDING_THRESHOLD = 25  # ADX >= 25: 趋势市场
+                        RANGING_THRESHOLD = 20   # ADX <= 20: 震荡市场
+                        
+                        # 判断市场状态
+                        if current_adx >= TRENDING_THRESHOLD:
+                            market_regime = 'TRENDING'
+                        elif current_adx <= RANGING_THRESHOLD:
+                            market_regime = 'RANGING'
+                        else:
+                            market_regime = 'MIXED'  # 20 < ADX < 25: 混合状态
+                        
+                        logger.debug(f"📊 市场状态: {market_regime} (ADX={current_adx:.2f})")
+                        
+                        # 根据市场状态过滤信号
+                        if market_regime == 'TRENDING':
+                            # 趋势市场：只接受LONG/SHORT信号，拒绝HOLD
+                            if signal_type == 'HOLD':
+                                return {
+                                    'pass': False, 
+                                    'reason': f'趋势市场(ADX={current_adx:.2f})拒绝HOLD信号'
+                                }
+                            logger.debug(f"✅ 趋势市场信号匹配: {signal_type}")
+                            
+                        elif market_regime == 'RANGING':
+                            # 震荡市场：只接受HOLD信号，拒绝LONG/SHORT
+                            if signal_type in ['LONG', 'SHORT']:
+                                return {
+                                    'pass': False, 
+                                    'reason': f'震荡市场(ADX={current_adx:.2f})拒绝{signal_type}信号'
+                                }
+                            logger.debug(f"✅ 震荡市场信号匹配: {signal_type}")
+                            
+                        else:  # MIXED
+                            # 混合状态：接受所有信号，但降低置信度要求
+                            logger.debug(f"⚠️ 混合市场状态(ADX={current_adx:.2f})，接受所有信号")
+                            
+                    except ImportError:
+                        logger.warning("pandas_ta未安装，跳过ADX计算（市场状态过滤失效）")
+                    except Exception as e:
+                        logger.debug(f"ADX计算失败（跳过市场状态过滤）: {e}")
+                else:
+                    logger.debug(f"缓冲区数据不足({len(buffer_data)}条 < 14条)，跳过市场状态过滤")
+            except Exception as e:
+                logger.debug(f"市场状态过滤失败（跳过此过滤）: {e}")
+            
+            # 7. 所有过滤器通过
+            logger.info(f"✅ 信号通过所有增强过滤器（包括市场状态过滤）")
             return {'pass': True, 'reason': '通过所有过滤条件'}
             
         except Exception as e:

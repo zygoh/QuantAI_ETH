@@ -14,6 +14,12 @@ import json
 from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime
 
+# 导入httpx用于异常处理
+try:
+    import httpx
+except ImportError:
+    httpx = None
+
 from app.core.config import settings
 from app.exchange.base_exchange_client import (
     BaseExchangeClient,
@@ -134,15 +140,42 @@ class OKXClient(BaseExchangeClient):
         self.secret_key = config.get('secret_key') if config else settings.OKX_SECRET_KEY
         self.passphrase = config.get('passphrase') if config else settings.OKX_PASSPHRASE
         
-        # 配置代理
+        # 配置代理（httpx格式：直接传递字符串URL）
+        # 根据SDK源码，OkxClient继承自httpx.Client，proxy参数直接传递给httpx.Client
+        # httpx支持字符串格式：'http://host:port' 或 'socks5://host:port'
         proxy = None
         if settings.USE_PROXY:
             proxy_type = settings.PROXY_TYPE.lower()
             if proxy_type == "socks5":
-                proxy = f"socks5h://{settings.PROXY_HOST}:{settings.PROXY_PORT}"
+                # httpx使用socks5://格式（注意：不是socks5h）
+                proxy = f"socks5://{settings.PROXY_HOST}:{settings.PROXY_PORT}"
             else:
                 proxy = f"{proxy_type}://{settings.PROXY_HOST}:{settings.PROXY_PORT}"
-            logger.info(f"🔧 OKX SDK使用代理: {proxy}")
+            
+            # 🔧 修复：测试代理连接（避免SSL握手超时）
+            try:
+                import httpx
+                logger.info(f"🧪 测试代理连接: {proxy}...")
+                test_client = httpx.Client(proxy=proxy, timeout=5.0)
+                test_response = test_client.get("https://www.okx.com", timeout=5.0, follow_redirects=True)
+                test_client.close()
+                if test_response.status_code in [200, 301, 302]:
+                    logger.info(f"✅ 代理连接测试成功: {proxy}")
+                else:
+                    logger.warning(f"⚠️ 代理连接测试返回异常状态码: {test_response.status_code}")
+                    logger.warning("   将降级到直连模式")
+                    proxy = None
+            except Exception as e:
+                logger.warning(f"⚠️ 代理连接测试失败: {e}")
+                logger.warning("   将降级到直连模式（代理可能未运行或不可访问）")
+                proxy = None
+            
+            if proxy:
+                logger.info(f"🔧 OKX SDK使用代理: {proxy} (httpx格式)")
+            else:
+                logger.info("🔧 OKX SDK使用直连模式（代理测试失败，已降级）")
+        else:
+            logger.info("🔧 OKX SDK使用直连模式（未启用代理）")
         
         # 初始化python-okx SDK客户端
         # SDK会自动处理认证、签名、请求头等
@@ -175,7 +208,7 @@ class OKXClient(BaseExchangeClient):
                 api_secret_key=self.secret_key,
                 passphrase=self.passphrase,
                 flag=flag,
-                proxy=proxy if proxy else {}
+                proxy=proxy  # httpx格式：字符串URL或None
             )
             logger.debug("  ✅ Account API 初始化成功")
             
@@ -193,7 +226,7 @@ class OKXClient(BaseExchangeClient):
                 api_secret_key=self.secret_key,
                 passphrase=self.passphrase,
                 flag=flag,
-                proxy=proxy if proxy else {}
+                proxy=proxy  # httpx格式：字符串URL或None
             )
             logger.debug("  ✅ MarketData API 初始化成功")
             
@@ -211,7 +244,7 @@ class OKXClient(BaseExchangeClient):
                 api_secret_key=self.secret_key,
                 passphrase=self.passphrase,
                 flag=flag,
-                proxy=proxy if proxy else {}
+                proxy=proxy  # httpx格式：字符串URL或None
             )
             logger.debug("  ✅ Trade API 初始化成功")
             
@@ -229,7 +262,7 @@ class OKXClient(BaseExchangeClient):
                 api_secret_key=self.secret_key,
                 passphrase=self.passphrase,
                 flag=flag,
-                proxy=proxy if proxy else {}
+                proxy=proxy  # httpx格式：字符串URL或None
             )
             logger.debug("  ✅ PublicData API 初始化成功")
             
@@ -251,7 +284,7 @@ class OKXClient(BaseExchangeClient):
                     api_secret_key=self.secret_key,
                     passphrase=self.passphrase,
                     flag=flag,
-                    proxy=proxy if proxy else {}
+                    proxy=proxy  # httpx格式：字符串URL或None
                 )
                 logger.debug("  ✅ TradingData API 初始化成功")
             
@@ -404,8 +437,9 @@ class OKXClient(BaseExchangeClient):
             logger.debug(f"  收到 {len(klines)} 条原始K线数据")
             
             # 转换为统一格式
-            # 🔥 OKX K线数组格式：[timestamp, open, high, low, close, volume, volCcyQuote, volCcy, confirm]
-            # 索引：            [0,       1,    2,    3,    4,     5,      6,           7,       8]
+            # 🔥 OKX K线数组格式：[timestamp, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
+            # 索引：            [0,       1,    2,    3,    4,     5,   6,      7,           8]
+            # 字段说明：vol=合约张数/现货交易量, volCcy=交易货币数量(如ETH), volCcyQuote=计价货币数量(如USDT)
             # 根据OKX文档：https://www.okx.com/docs-v5/zh/#order-book-trading-market-data-get-candlesticks-history
             formatted_klines = []
             skipped_incomplete = 0
@@ -451,7 +485,7 @@ class OKXClient(BaseExchangeClient):
                         close=close_price,
                         volume=volume,
                         close_time=self._safe_int(kline[0]) + self._interval_to_ms(interval) - 1,
-                        quote_volume=self._safe_float(kline[6]),  # volCcyQuote
+                        quote_volume=self._safe_float(kline[7]),  # volCcyQuote (计价货币数量，如USDT)
                         trades=0,  # OKX不提供此字段
                         taker_buy_base_volume=0.0,  # OKX不提供此字段
                         taker_buy_quote_volume=0.0  # OKX不提供此字段
@@ -774,26 +808,55 @@ class OKXClient(BaseExchangeClient):
             logger.error(f"❌ OKX撤销订单失败: {e}")
             return {}
     
-    def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        """获取未成交订单"""
-        try:
-            # 使用SDK的交易API获取未成交订单
-            if symbol:
-                okx_symbol = SymbolMapper.to_exchange_format(symbol, "OKX")
-                response = self.trade_api.get_order_list(instType='SWAP', instId=okx_symbol)
-            else:
-                response = self.trade_api.get_order_list(instType='SWAP')
-            
-            if response['code'] != '0':
-                logger.error(f"获取未成交订单失败: {response['msg']}")
+    def get_open_orders(self, symbol: Optional[str] = None, max_retries: int = 3) -> List[Dict[str, Any]]:
+        """获取未成交订单（带重试机制，处理代理连接超时）"""
+        for attempt in range(max_retries):
+            try:
+                # 使用SDK的交易API获取未成交订单
+                if symbol:
+                    okx_symbol = SymbolMapper.to_exchange_format(symbol, "OKX")
+                    response = self.trade_api.get_order_list(instType='SWAP', instId=okx_symbol)
+                else:
+                    response = self.trade_api.get_order_list(instType='SWAP')
+                
+                if response['code'] != '0':
+                    logger.error(f"获取未成交订单失败: {response['msg']}")
+                    return []
+                
+                return response.get('data', [])
+                
+            except Exception as e:
+                # 检查是否是超时错误（httpx可能未导入）
+                error_str = str(e).lower()
+                is_timeout = 'timeout' in error_str or 'connecttimeout' in error_str or 'readtimeout' in error_str
+                
+                if is_timeout and httpx:
+                    # httpx超时错误：重试
+                    if attempt < max_retries - 1:
+                        wait_time = 2 * (attempt + 1)  # 递增等待：2秒、4秒、6秒
+                        logger.warning(f"⚠️ 获取订单超时（尝试 {attempt + 1}/{max_retries}），{wait_time}秒后重试...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"❌ 获取订单失败（已重试{max_retries}次，可能是代理服务器响应慢）: {e}")
+                        return []
+                elif is_timeout:
+                    # 超时错误但httpx未导入：直接返回
+                    logger.error(f"❌ 获取订单超时: {e}")
+                    return []
+                # 🔧 修复：处理代理连接超时，添加重试机制
+                if attempt < max_retries - 1:
+                    wait_time = 2 * (attempt + 1)  # 递增等待：2秒、4秒、6秒
+                    logger.warning(f"⚠️ 获取订单超时（尝试 {attempt + 1}/{max_retries}），{wait_time}秒后重试...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"❌ 获取订单失败（已重试{max_retries}次，可能是代理服务器响应慢）: {e}")
+                    return []
+            except Exception as e:
+                # 其他错误直接返回，不重试
+                self._handle_sdk_exception(e)
+                logger.error(f"❌ 获取OKX未成交订单失败: {e}")
                 return []
-            
-            return response.get('data', [])
-            
-        except Exception as e:
-            self._handle_sdk_exception(e)
-            logger.error(f"❌ 获取OKX未成交订单失败: {e}")
-            return []
 
     
     def change_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
@@ -867,7 +930,7 @@ class OKXClient(BaseExchangeClient):
             self._handle_sdk_exception(e)
             logger.error(f"❌ 获取OKX交易对信息失败: {e}")
             return None
-    
+
     def get_funding_rate(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
         获取资金费率
@@ -930,7 +993,8 @@ class OKXClient(BaseExchangeClient):
             
             # 使用SDK的公共API获取持仓量
             # OKX API: GET /api/v5/public/open-interest
-            response = self.public_api.get_open_interest(instId=okx_symbol)
+            # 🔧 修复：添加instType参数（必需）
+            response = self.public_api.get_open_interest(instType='SWAP', instId=okx_symbol)
             
             if response['code'] != '0':
                 logger.error(f"获取持仓量失败: {response['msg']}")
@@ -957,35 +1021,59 @@ class OKXClient(BaseExchangeClient):
     
     def get_long_short_ratio(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
-        获取多空持仓人数比
+        获取多空持仓人数比（实时数据）
         
         Args:
-            symbol: 交易对符号
+            symbol: 交易对符号（如ETH/USDT，会提取基础货币ETH作为ccy）
         
         Returns:
             多空比数据字典，包含：
             - long_short_ratio: 多空持仓人数比
-            - long_account: 多头账户数
-            - short_account: 空头账户数
+            - long_account: 多头账户比例
+            - short_account: 空头账户比例
             - timestamp: 时间戳
         """
         try:
+            # 🔧 修复：使用TradingDataAPI，而不是PublicAPI
+            # OKX API: GET /api/v5/rubik/stat/contracts/long-short-account-ratio
+            # SDK方法: TradingDataAPI.get_long_short_ratio(ccy, period='')
+            
+            if self.trading_data_api is None:
+                logger.warning("⚠️ TradingDataAPI未初始化，无法获取多空比")
+                return None
+            
             okx_symbol = SymbolMapper.to_exchange_format(symbol, "OKX")
             
-            # 使用SDK的公共API获取多空持仓人数比
-            # OKX API: GET /api/v5/public/retail-margin
-            response = self.public_api.get_retail_margin(instId=okx_symbol)
+            # 从symbol提取基础货币（ccy）
+            # 例如：ETH-USDT-SWAP -> ETH, BTC-USDT-SWAP -> BTC
+            if '-SWAP' in okx_symbol:
+                ccy = okx_symbol.split('-')[0]  # ETH-USDT-SWAP -> ETH
+            elif '-' in okx_symbol:
+                ccy = okx_symbol.split('-')[0]  # ETH-USDT -> ETH
+            else:
+                ccy = okx_symbol  # 如果格式不对，使用原值
             
-            if response['code'] != '0':
-                logger.error(f"获取多空比失败: {response['msg']}")
+            # ✅ 使用TradingDataAPI获取最新多空比
+            # 根据SDK源码，get_long_short_ratio(ccy, begin='', end='', period='')
+            # 对于实时数据，不传begin/end/period，获取最新数据
+            # 或者传入period=''获取最新周期的数据
+            response = self.trading_data_api.get_long_short_ratio(
+                ccy=ccy,
+                period='',  # 空字符串表示获取最新数据
+                begin='',   # 空字符串表示不限制开始时间
+                end=''      # 空字符串表示不限制结束时间
+            )
+            
+            if response.get('code') != '0':
+                logger.error(f"获取多空比失败: {response.get('msg')}")
                 return None
             
             data_list = response.get('data', [])
             if not data_list:
-                logger.warning(f"多空比数据为空: {okx_symbol}")
+                logger.warning(f"多空比数据为空: {ccy}")
                 return None
             
-            # 取最新的一条
+            # 取最新的一条（通常是第一条）
             data = data_list[0]
             
             long_account = self._safe_float(data.get('longRatio', 0.0))
@@ -1428,26 +1516,21 @@ class OKXClient(BaseExchangeClient):
             
             while iteration < max_iterations:
                 try:
-                    # ✅ SDK 调用
-                    # 方法名通常是 get_contracts_long_short_account_ratio
-                    if hasattr(self.trading_data_api, 'get_contracts_long_short_account_ratio'):
-                        response = self.trading_data_api.get_contracts_long_short_account_ratio(
+                    # ✅ SDK 调用（根据TradingData.py源码，方法名是get_long_short_ratio）
+                    # 方法签名: get_long_short_ratio(ccy, begin='', end='', period='')
+                    # 注意：begin和end参数顺序可能需要注意，根据API文档调整
+                    if hasattr(self.trading_data_api, 'get_long_short_ratio'):
+                        # 🔧 修复：使用正确的方法名和参数
+                        # 根据OKX API文档，begin是开始时间，end是结束时间
+                        # 但API可能期望begin是更早的时间，end是更晚的时间
+                        response = self.trading_data_api.get_long_short_ratio(
                             ccy=ccy,
                             period=period,
-                            limit=str(limit),
-                            begin=str(current_end),
-                            end=str(target_start)
-                        )
-                    elif hasattr(self.trading_data_api, 'get_long_short_account_ratio'):
-                        response = self.trading_data_api.get_long_short_account_ratio(
-                            ccy=ccy,
-                            period=period,
-                            limit=str(limit),
-                            begin=str(current_end),
-                            end=str(target_start)
+                            begin=str(target_start),  # 开始时间（更早）
+                            end=str(current_end)      # 结束时间（更晚）
                         )
                     else:
-                        logger.error(f"❌ TradingDataAPI 不支持多空比历史方法，可用方法: {[m for m in dir(self.trading_data_api) if not m.startswith('_')]}")
+                        logger.error(f"❌ TradingDataAPI 不支持get_long_short_ratio方法，可用方法: {[m for m in dir(self.trading_data_api) if not m.startswith('_')]}")
                         break
                     
                     if response.get('code') != '0':
@@ -1568,19 +1651,46 @@ class OKXWebSocketClient:
             }
             
             # 添加代理配置（仅在USE_PROXY_WS启用时）
+            # 🔧 修复：websocket-client对SOCKS5的支持需要特殊处理
+            # 注意：websocket-client库对SOCKS5代理的支持有限，主要通过环境变量
+            # 需要在创建WebSocketApp之前设置环境变量
+            self.ws_proxy_config = None  # 存储代理配置，供run_forever使用
             if settings.USE_PROXY and settings.USE_PROXY_WS:
                 proxy_type = settings.PROXY_TYPE.lower()
+                import os
+                
                 if proxy_type == "socks5":
-                    # SOCKS5代理（websocket-client通过http_proxy环境变量支持）
+                    # SOCKS5代理：websocket-client需要安装PySocks库
+                    # 通过环境变量设置（必须在创建WebSocketApp之前）
                     proxy_url = f"socks5h://{settings.PROXY_HOST}:{settings.PROXY_PORT}"
-                    import os
                     os.environ['http_proxy'] = proxy_url
                     os.environ['https_proxy'] = proxy_url
-                    logger.info(f"🔧 OKX WebSocket使用SOCKS5代理: {settings.PROXY_HOST}:{settings.PROXY_PORT}")
+                    # 同时设置大写版本（某些系统需要）
+                    os.environ['HTTP_PROXY'] = proxy_url
+                    os.environ['HTTPS_PROXY'] = proxy_url
+                    
+                    # 检查是否安装了PySocks（SOCKS5支持需要）
+                    try:
+                        import socks
+                        logger.debug("✅ PySocks已安装，SOCKS5代理支持可用")
+                    except ImportError:
+                        logger.warning("⚠️ PySocks未安装，SOCKS5代理可能无法工作")
+                        logger.warning("   请运行: pip install PySocks")
+                    
+                    self.ws_proxy_config = {
+                        'proxy_type': 'socks5',
+                        'proxy_url': proxy_url
+                    }
+                    logger.info(f"🔧 OKX WebSocket使用SOCKS5代理: {settings.PROXY_HOST}:{settings.PROXY_PORT} (通过环境变量)")
                 else:
-                    # HTTP/HTTPS代理
+                    # HTTP/HTTPS代理：可以通过参数传递
                     ws_kwargs["http_proxy_host"] = settings.PROXY_HOST
                     ws_kwargs["http_proxy_port"] = settings.PROXY_PORT
+                    self.ws_proxy_config = {
+                        'http_proxy_host': settings.PROXY_HOST,
+                        'http_proxy_port': settings.PROXY_PORT,
+                        'proxy_type': proxy_type
+                    }
                     logger.info(f"🔧 OKX WebSocket使用{proxy_type.upper()}代理: {settings.PROXY_HOST}:{settings.PROXY_PORT}")
             elif settings.USE_PROXY and not settings.USE_PROXY_WS:
                 logger.info("✅ OKX WebSocket直连（不使用代理），仅REST API使用代理")
@@ -1616,11 +1726,26 @@ class OKXWebSocketClient:
             
             # 运行WebSocket，添加ping/pong机制防止连接超时
             # OKX要求每30秒发送一次ping，否则会断开连接
-            self.ws.run_forever(
-                sslopt=sslopt,
-                ping_interval=25,  # 每25秒发送一次ping（小于OKX的30秒超时）
-                ping_timeout=10    # ping超时时间10秒
-            )
+            # 🔧 修复：传递代理配置（如果启用）
+            run_forever_kwargs = {
+                'sslopt': sslopt,
+                'ping_interval': 25,  # 每25秒发送一次ping（小于OKX的30秒超时）
+                'ping_timeout': 10    # ping超时时间10秒
+            }
+            
+            # 添加代理配置（如果启用）
+            if hasattr(self, 'ws_proxy_config') and self.ws_proxy_config:
+                # 对于HTTP/HTTPS代理，直接传递参数
+                if self.ws_proxy_config.get('proxy_type') != 'socks5':
+                    run_forever_kwargs['http_proxy_host'] = self.ws_proxy_config['http_proxy_host']
+                    run_forever_kwargs['http_proxy_port'] = self.ws_proxy_config['http_proxy_port']
+                    logger.debug(f"🔧 WebSocket run_forever使用代理参数: {self.ws_proxy_config['http_proxy_host']}:{self.ws_proxy_config['http_proxy_port']}")
+                else:
+                    # SOCKS5代理：websocket-client可能不支持直接参数传递
+                    # 依赖环境变量（已在start_websocket中设置）
+                    logger.debug("🔧 WebSocket run_forever使用SOCKS5代理（通过环境变量）")
+            
+            self.ws.run_forever(**run_forever_kwargs)
             
         except Exception as e:
             logger.error(f"❌ WebSocket运行失败: {e}")

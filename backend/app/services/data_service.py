@@ -230,8 +230,13 @@ class DataService:
                     logger.warning(f"⚠️ WebSocket客户端不支持subscribe_kline方法")
             
             # 订阅价格变动数据
-            if hasattr(self.ws_client, 'subscribe_ticker'):
-                self.ws_client.subscribe_ticker(symbol, self._on_ticker_data)
+            # 🔧 修复：暂时禁用tickers订阅
+            # 原因：tickers频道需要使用 /ws/v5/public URL，但当前WebSocket使用 /ws/v5/business
+            # 系统主要使用K线数据，tickers不是必需的
+            # 如果需要tickers，需要创建单独的WebSocket连接使用 /ws/v5/public URL
+            # if hasattr(self.ws_client, 'subscribe_ticker'):
+            #     self.ws_client.subscribe_ticker(symbol, self._on_ticker_data)
+            logger.debug("⏭️ 跳过tickers订阅（需要public URL，当前使用business URL）")
             
             logger.info(f"数据流订阅完成: {symbol} {timeframes}")
             

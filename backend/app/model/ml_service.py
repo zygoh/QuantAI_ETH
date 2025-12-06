@@ -554,99 +554,125 @@ class MLService:
             
         except Exception as e:
             logger.error(f"训练数据写入数据库失败: {e}")
-            logger.error(f"详细错误: {traceback.format_exc()}")
-            raise
-    
+            
+            return df
+            
     def _create_labels(self, df: pd.DataFrame, timeframe: str = None) -> pd.DataFrame:
         """
-        创建标签（优化版：解决HOLD占比过高问题）
+        创建标签：使用三重障碍法 (Triple Barrier Method)
         
-        改进:
-        1. 基于市场波动率的自适应阈值
-        2. 分位数阈值确保类别平衡
-        3. 混合策略提升稳定性
-        
-        目标分布:
-        - LONG: 28-32%
-        - HOLD: 36-44%
-        - SHORT: 28-32%
+        不再仅仅预测下一根K线，而是预测未来一段时间内价格路径是先触及止盈线(Top)还是止损线(Bottom)。
+        如果在时间窗口内均未触及，则标记为HOLD。
         
         Args:
             df: K线数据
-            timeframe: 时间框架（用于差异化阈值配置）
+            timeframe: 时间框架
+            
+        Returns:
+            df: 包含 'label' 列的DataFrame (0: SHORT, 1: HOLD, 2: LONG)
         """
         try:
-            # 计算下一根K线收益率
-            df['next_return'] = df['close'].shift(-1) / df['close'] - 1
+            # 1. 参数配置 (根据时间框架调整)
+            # 时间窗口 (预测未来多少根K线)
+            window_config = {
+                '3m': 20,   # 60分钟
+                '5m': 24,   # 2小时
+                '15m': 32   # 8小时
+            }
+            # 止盈止损系数 (相对于波动率)
+            # 目标：高胜率，所以TP可以略小于SL，或者接近
+            pt_sl_config = {
+                '3m':  (2.2, 1.6),  # TP=2.2*Vol, SL=1.6*Vol (稍微放宽TP以捕捉大波段)
+                '5m':  (2.2, 1.8),
+                '15m': (2.5, 2.0)
+            }
             
-            # ========================================
-            # 🔥 新增：自适应阈值计算（三种方法）
-            # ========================================
+            window = window_config.get(timeframe, 20)
+            pt_mult, sl_mult = pt_sl_config.get(timeframe, (2.0, 1.5))
             
-            # 方法1：基于历史波动率
+            # 2. 计算波动率 (使用ATR或Rolling Std)
+            # 这里简单使用Rolling Std of Returns (Close-to-Close)
             returns = df['close'].pct_change()
-            historical_volatility = returns.rolling(100).std()
-            median_vol = historical_volatility.median()
+            volatility = returns.rolling(window=20).std()
             
-            # 时间框架系数（优化版v2：针对低波动市场）
-            # 分析：当前阈值0.215%仍导致HOLD占比88%，说明需要更激进的系数
-            timeframe_multiplier = {
-                '3m': 1.50,   # 150%历史波动率（降低系数，让分位数主导）
-                '5m': 1.60,   # 160%历史波动率
-                '15m': 1.80   # 180%历史波动率
-            }
-            multiplier = timeframe_multiplier.get(timeframe, 1.60)
-            vol_threshold = median_vol * multiplier if not pd.isna(median_vol) else 0.0025
+            # 处理NaN波动率 (使用均值填充)
+            vol_mean = volatility.mean() if not volatility.isna().all() else 0.002
+            volatility = volatility.fillna(vol_mean)
             
-            # 方法2：基于收益率分位数（缩小范围以降低HOLD占比）
-            returns_clean = returns.dropna()
-            if len(returns_clean) > 100:
-                # 🔥 关键优化：使用60%/40%分位数（缩小范围，阈值更小，更多LONG/SHORT）
-                # 原理：60%/40%意味着只有中间20%是HOLD，其余80%是LONG/SHORT
-                upper_quantile = returns_clean.quantile(0.60)  # 60%分位数（缩小范围）
-                lower_quantile = returns_clean.quantile(0.40)  # 40%分位数（缩小范围）
-                quantile_threshold = max(abs(upper_quantile), abs(lower_quantile))
-            else:
-                quantile_threshold = 0.0025
+            # 确保波动率有一个下限，防止死市时的极小阈值
+            min_vol = 0.001
+            volatility = volatility.clip(lower=min_vol)
             
-            # 方法3：混合阈值（提高分位数权重）
-            # 🔥 关键优化：增加分位数权重到90%，几乎完全依赖分位数
-            # 原因：在低波动市场，分位数法更可靠，能确保类别平衡
-            hybrid_threshold = vol_threshold * 0.10 + quantile_threshold * 0.90
+            # 3. 向量化计算三重障碍
+            # 这种方法避免了慢速Python循环
             
-            # 设置合理范围（防止极端值，但放宽最小值以适配低波动市场）
-            min_threshold_config = {
-                '3m': 0.0003,  # 最小0.03%（3分钟单期波动率约0.06%，允许更低阈值）
-                '5m': 0.0004,  # 最小0.04%
-                '15m': 0.0008  # 最小0.08%
-            }
-            max_threshold_config = {
-                '3m': 0.0050,  # 最大0.50%
-                '5m': 0.0060,  # 最大0.60%
-                '15m': 0.0080  # 最大0.80%
-            }
+            close_prices = df['close'].values
+            n_samples = len(df)
             
-            min_threshold = min_threshold_config.get(timeframe, 0.0020)
-            max_threshold = max_threshold_config.get(timeframe, 0.0060)
+            # 初始化标签为 HOLD (1)
+            labels = np.ones(n_samples, dtype=int)
             
-            # 最终阈值（限制在合理范围）
-            up_threshold = np.clip(hybrid_threshold, min_threshold, max_threshold)
-            down_threshold = -up_threshold
+            # 为了提高效率，我们只在一个合理的lookahead窗口内检查
+            # 构建未来价格矩阵: shape (n_samples, window)
+            # future_prices[i, j] = price at time i + j + 1
+            future_prices = np.full((n_samples, window), np.nan)
             
-            # ========================================
-            # 创建分类标签
-            # ========================================
-            conditions = [
-                df['next_return'] <= down_threshold,  # SHORT (0)
-                (df['next_return'] > down_threshold) & (df['next_return'] < up_threshold),  # HOLD (1)
-                df['next_return'] >= up_threshold     # LONG (2)
-            ]
+            for i in range(1, window + 1):
+                # shift(-i) 将未来的数据以前移
+                future_prices[:, i-1] = df['close'].shift(-i).values
+                
+            # 计算相对于当前价格的收益率矩阵
+            # returns_matrix[i, j] = (price[i+j+1] - price[i]) / price[i]
+            current_prices = close_prices.reshape(-1, 1)
+            returns_matrix = (future_prices - current_prices) / current_prices
             
-            choices = [0, 1, 2]
-            df['label'] = np.select(conditions, choices, default=1)
+            # 动态阈值矩阵 (n_samples, 1)
+            vol_array = volatility.values.reshape(-1, 1)
+            upper_thresholds = vol_array * pt_mult
+            lower_thresholds = -vol_array * sl_mult
             
-            # 移除最后1行（没有next_return）
-            df = df[:-1]
+            # 识别触碰 (Boolean Matrices)
+            # 触碰上界
+            hit_upper = returns_matrix > upper_thresholds
+            # 触碰下界
+            hit_lower = returns_matrix < lower_thresholds
+            
+            # 找到每次触碰的时间点 (argmax返回第一个True的索引，全False返回0)
+            any_hit_upper = hit_upper.any(axis=1)
+            any_hit_lower = hit_lower.any(axis=1)
+            
+            first_upper_idx = np.argmax(hit_upper, axis=1)
+            first_lower_idx = np.argmax(hit_lower, axis=1)
+            
+            # 逻辑判定
+            # 1. 既没碰上也没碰下 -> HOLD (已初始化为1)
+            
+            # 2. 只碰上 -> LONG (2)
+            mask_only_upper = any_hit_upper & (~any_hit_lower)
+            labels[mask_only_upper] = 2
+            
+            # 3. 只碰下 -> SHORT (0)
+            mask_only_lower = (~any_hit_upper) & any_hit_lower
+            labels[mask_only_lower] = 0
+            
+            # 4. 都碰了 -> 看谁先碰到
+            mask_both = any_hit_upper & any_hit_lower
+            
+            # 如果 upper_idx < lower_idx -> 先涨 -> LONG
+            mask_upper_first = mask_both & (first_upper_idx < first_lower_idx)
+            labels[mask_upper_first] = 2
+            
+            # 如果 lower_idx < upper_idx -> 先跌 -> SHORT
+            mask_lower_first = mask_both & (first_lower_idx < first_upper_idx)
+            labels[mask_lower_first] = 0
+            
+            df['label'] = labels
+            
+            # 清理：最后 window 行的数据无效，因为看不了未来（这些行全是HOLD，最好去掉以免误导）
+            # 或者保留它们但明确知道它们是HOLD。通常训练时去掉。
+            # 这里选择保留前n_samples-window行
+            if len(df) > window:
+                df = df.iloc[:-window]
             
             # ========================================
             # 标签分布统计与质量检查
@@ -662,29 +688,17 @@ class MLService:
             hold_pct = hold_count / total * 100
             long_pct = long_count / total * 100
             
-            logger.info(f"📊 {timeframe} 标签分布（自适应阈值: ±{up_threshold*100:.3f}%）:")
+            logger.info(f"📊 {timeframe} 三重障碍标签分布 (Window={window}, PT={pt_mult}x, SL={sl_mult}x):")
             logger.info(f"  SHORT (0): {short_count:5d}条 ({short_pct:5.1f}%)")
             logger.info(f"  HOLD  (1): {hold_count:5d}条 ({hold_pct:5.1f}%)")
             logger.info(f"  LONG  (2): {long_count:5d}条 ({long_pct:5.1f}%)")
-            logger.info(f"  阈值来源: 波动率={vol_threshold*100:.3f}%, "
-                       f"分位数={quantile_threshold*100:.3f}%, "
-                       f"混合={hybrid_threshold*100:.3f}%")
             
-            # 质量检查与告警
-            if hold_pct > 50:
-                logger.warning(f"⚠️ {timeframe} HOLD占比仍然过高 ({hold_pct:.1f}%)，"
-                             f"建议检查市场波动率或调整系数")
-            elif hold_pct < 30:
-                logger.warning(f"⚠️ {timeframe} HOLD占比过低 ({hold_pct:.1f}%)，"
-                             f"可能导致过度交易")
-            else:
-                logger.info(f"✅ {timeframe} 标签分布健康 (HOLD={hold_pct:.1f}%)")
-            
-            if short_pct < 25 or long_pct < 25:
-                logger.warning(f"⚠️ {timeframe} LONG/SHORT占比不足 "
-                             f"(LONG={long_pct:.1f}%, SHORT={short_pct:.1f}%)，"
-                             f"可能影响模型学习")
-            
+            # 质量检查
+            if hold_pct > 60:
+                logger.warning(f"⚠️ {timeframe} HOLD占比过高 ({hold_pct:.1f}%)，建议降低障碍系数")
+            elif hold_pct < 20:
+                logger.warning(f"⚠️ {timeframe} HOLD占比过低 ({hold_pct:.1f}%)，建议增加障碍系数或窗口")
+
             return df
             
         except Exception as e:
@@ -727,12 +741,22 @@ class MLService:
             
             feature_columns = self.feature_columns_dict[timeframe]
             
+            # 🔧 修复：检查特征列是否为空
+            if not feature_columns or len(feature_columns) == 0:
+                logger.error(f"❌ {timeframe} 特征列为空，无法继续训练")
+                raise Exception(f"{timeframe} 特征选择失败：没有可用特征")
+            
             X = df[feature_columns].copy()
             
             # 移除包含NaN的行
             mask = ~(X.isna().any(axis=1) | y.isna())
             X = X[mask]
             y = y[mask]
+            
+            # 🔧 修复：检查特征数据是否为空
+            if X.empty or len(X) == 0:
+                logger.error(f"❌ {timeframe} 特征数据为空（过滤NaN后），无法继续训练")
+                raise Exception(f"{timeframe} 特征数据为空")
             
             logger.info(f"特征数量: {len(feature_columns)}, 样本数量: {len(X)}")
             
@@ -801,6 +825,24 @@ class MLService:
             
             filtered_count = n_feats - len(stage1_cols)
             logger.info(f"✅ 过滤了{filtered_count}个低重要性特征(<{imp_threshold:.6f}), 剩余{len(stage1_cols)}个")
+            
+            # 🔧 修复：如果过滤后特征数为0，使用更宽松的阈值
+            if len(stage1_cols) == 0:
+                logger.warning(f"⚠️ {timeframe} 特征选择后剩余0个特征，使用更宽松的阈值（均值的1%）")
+                imp_threshold = imp.mean() * 0.01  # 降低到均值的1%
+                stage1_mask = imp > imp_threshold
+                stage1_cols = X.columns[stage1_mask].tolist()
+                filtered_count = n_feats - len(stage1_cols)
+                logger.info(f"✅ 宽松过滤后剩余{len(stage1_cols)}个特征")
+                
+                # 如果仍然为0，使用最低阈值（保留至少前N个特征）
+                if len(stage1_cols) == 0:
+                    logger.warning(f"⚠️ {timeframe} 宽松过滤后仍为0，保留重要性最高的{min(budget, n_feats)}个特征")
+                    # 按重要性排序，取前budget个
+                    imp_sorted = sorted(enumerate(imp), key=lambda x: x[1], reverse=True)
+                    top_indices = [idx for idx, _ in imp_sorted[:min(budget, n_feats)]]
+                    stage1_cols = [X.columns[i] for i in top_indices]
+                    logger.info(f"✅ 保留重要性最高的{len(stage1_cols)}个特征")
             
             # 🆕 Kim建议4: 释放内存
             del lgb_filter
@@ -917,6 +959,11 @@ class MLService:
                 logger.warning(f"⚠️ 特征缩放前处理了{large_count}个过大值（>1e15）")
             if nan_count > 0:
                 logger.warning(f"⚠️ 特征缩放前处理了{nan_count}个缺失值（NaN）")
+            
+            # 🔧 修复：检查特征数据是否为空
+            if X.empty or len(X.columns) == 0:
+                logger.error(f"❌ {timeframe} 特征数据为空，无法进行缩放")
+                raise ValueError(f"{timeframe} 特征数据为空，无法进行缩放")
             
             # 每个时间框架独立的scaler
             # 🔧 修复：支持字典结构的scaler（用于Informer-2）

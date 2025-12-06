@@ -1384,37 +1384,37 @@ class FeatureEngineer:
                 
                 # 重采样到目标时间框架
                 df_resampled = df_temp.resample(resample_str).agg({
-                    'open': 'first',
-                    'high': 'max',
-                    'low': 'min',
-                    'close': 'last',
-                    'volume': 'sum'
-                }).ffill()
-                
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum'
+            }).ffill()
+            
                 # 计算关键指标
                 close_resampled = df_resampled['close']
                 sma_20_resampled = close_resampled.rolling(20).mean()
                 sma_50_resampled = close_resampled.rolling(50).mean()
                 rsi_resampled = self._calculate_rsi(close_resampled, 14)
-                
+            
                 # 趋势方向（1=上涨，0=横盘，-1=下跌）
                 trend_resampled = pd.Series(0, index=df_resampled.index)
                 trend_resampled[sma_20_resampled > sma_50_resampled] = 1  # 多头
                 trend_resampled[sma_20_resampled < sma_50_resampled] = -1  # 空头
-                
+            
                 # 波动率
                 close_resampled_safe = close_resampled.replace(0, np.nan) if (close_resampled == 0).sum() > 0 else close_resampled
                 returns_resampled = close_resampled_safe.pct_change(fill_method=None)
                 returns_resampled = returns_resampled.replace([np.inf, -np.inf], np.nan)
                 volatility_resampled = returns_resampled.rolling(20).std()
-                
+            
                 # 🔑 修复未来函数：shift(1)确保只使用上一根已收盘的K线数据
                 trend_resampled_shifted = trend_resampled.shift(1)
                 rsi_resampled_shifted = rsi_resampled.shift(1)
                 volatility_resampled_shifted = volatility_resampled.shift(1)
                 sma_20_resampled_shifted = sma_20_resampled.shift(1)
                 sma_50_resampled_shifted = sma_50_resampled.shift(1)
-                
+            
                 # 对齐到原始时间框架
                 new_features[f'trend_{other_tf}'] = trend_resampled_shifted.reindex(df_temp.index, method='ffill')
                 new_features[f'rsi_{other_tf}'] = rsi_resampled_shifted.reindex(df_temp.index, method='ffill')

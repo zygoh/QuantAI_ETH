@@ -339,7 +339,7 @@ class HistoricalDataManager:
             logger.info(f"清理了{days}天前的旧数据")
         except Exception as e:
             logger.error(f"清理旧数据失败: {e}")
-    
+
     async def fetch_historical_derivatives_data(
         self, 
         symbol: str, 
