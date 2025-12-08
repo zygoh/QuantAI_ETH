@@ -736,17 +736,7 @@ class HyperparameterOptimizer:
             try:
                 # 🎮 统一GPU内存管理：训练前清理
                 self.clear_gpu_memory()
-                
-                if self.model_type == "lightgbm":
-                    try:
-                        model = lgb.LGBMClassifier(**params)
-                        # 添加验证集和早停机制
-                        callbacks = [lgb.early_stopping(stopping_rounds=100, verbose=0)]
-                        model.fit(
-                            X_train, y_train,
-                # 🎮 统一GPU内存管理：训练前清理
-                self.clear_gpu_memory()
-                
+
                 if self.model_type == "lightgbm":
                     try:
                         model = lgb.LGBMClassifier(**params)
