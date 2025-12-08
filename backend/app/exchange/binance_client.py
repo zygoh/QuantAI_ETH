@@ -562,7 +562,9 @@ class BinanceClient(BaseExchangeClient):
                     logger.warning(f"   可能原因: Binance API版本或代理过滤了某些字段")
             
             # 转换为统一格式
+            current_time_ms = int(time.time() * 1000)  # 当前时间（毫秒）
             formatted_klines = []
+            skipped_incomplete = 0
             for idx, kline in enumerate(klines):
                 try:
                     # ✅ 安全访问：检查数组长度
@@ -574,6 +576,13 @@ class BinanceClient(BaseExchangeClient):
                         taker_buy_base = float(kline[9]) if kline[9] else 0.0
                         taker_buy_quote = float(kline[10]) if kline[10] else 0.0
                     
+                    close_time = kline[6]  # K线结束时
+                    # 🔥 关键修复：过滤未完成的K线
+                    if close_time >= current_time_ms:
+                        skipped_incomplete += 1
+                        logger.debug(f"⏸️ 跳过未完成K线: 索引={idx}")
+                        continue
+
                     formatted_kline = UnifiedKlineData(
                         timestamp=kline[0],
                         open=float(kline[1]),
@@ -592,7 +601,8 @@ class BinanceClient(BaseExchangeClient):
                     logger.error(f"❌ 解析K线数据失败 (索引{idx}): {e}")
                     logger.error(f"   数组长度: {len(kline)}, 数组内容: {kline}")
                     continue
-            
+            if skipped_incomplete > 0:
+                logger.debug(f"⏸️ 过滤了 {skipped_incomplete} 根未完成K线")
             logger.debug(f"获取K线数据: {symbol} {interval} {len(formatted_klines)}条")
             return formatted_klines
             

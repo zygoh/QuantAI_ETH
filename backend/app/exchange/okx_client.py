@@ -1073,25 +1073,139 @@ class OKXClient(BaseExchangeClient):
                 logger.warning(f"多空比数据为空: {ccy}")
                 return None
             
+            # 🔧 修复：OKX API实际返回的是二维数组 [["timestamp", "ratio"]]
+            # 不是对象 {longRatio, shortRatio}
             # 取最新的一条（通常是第一条）
             data = data_list[0]
             
-            long_account = self._safe_float(data.get('longRatio', 0.0))
-            short_account = self._safe_float(data.get('shortRatio', 0.0))
-            
-            # 计算多空比（避免除零）
-            long_short_ratio = long_account / (short_account + 1e-10) if short_account > 0 else 0.0
-            
-            return {
-                'long_short_ratio': long_short_ratio,
-                'long_account': long_account,
-                'short_account': short_account,
-                'timestamp': int(data.get('ts', time.time() * 1000))
-            }
+            # 检查是否是数组格式 ["timestamp", "ratio"]
+            if isinstance(data, list) and len(data) >= 2:
+                # 二维数组格式：[["1630502100000", "1.25"]]
+                timestamp = int(data[0]) if data[0] else int(time.time() * 1000)
+                ratio = self._safe_float(data[1], 0.0)
+                
+                # OKX返回的ratio是多空比（long/short），不是分开的比例
+                # 我们需要反推long_account和short_account
+                # 假设: ratio = long / short, 且 long + short = 1
+                # 解方程: long = ratio * short, ratio * short + short = 1
+                # short = 1 / (ratio + 1), long = ratio / (ratio + 1)
+                if ratio > 0:
+                    short_account = 1.0 / (ratio + 1.0)
+                    long_account = ratio / (ratio + 1.0)
+                else:
+                    short_account = 0.5
+                    long_account = 0.5
+                    ratio = 1.0
+                
+                return {
+                    'long_short_ratio': ratio,
+                    'long_account': long_account,
+                    'short_account': short_account,
+                    'timestamp': timestamp
+                }
+            else:
+                # 对象格式（旧版或其他API）：{longRatio, shortRatio, ts}
+                long_account = self._safe_float(data.get('longRatio', 0.0))
+                short_account = self._safe_float(data.get('shortRatio', 0.0))
+                
+                # 计算多空比（避免除零）
+                long_short_ratio = long_account / (short_account + 1e-10) if short_account > 0 else 0.0
+                
+                return {
+                    'long_short_ratio': long_short_ratio,
+                    'long_account': long_account,
+                    'short_account': short_account,
+                    'timestamp': int(data.get('ts', time.time() * 1000))
+                }
             
         except Exception as e:
             self._handle_sdk_exception(e)
             logger.error(f"❌ 获取OKX多空比失败: {e}")
+            return None
+    
+    def get_top_trader_long_short_ratio(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        获取精英交易员合约多空持仓人数比（实时数据）
+        
+        Args:
+            symbol: 交易对符号（如ETH/USDT）
+        
+        Returns:
+            精英交易员多空比数据字典，包含：
+            - long_short_ratio: 精英交易员多空持仓人数比
+            - long_account: 多头账户比例（反推值）
+            - short_account: 空头账户比例（反推值）
+            - timestamp: 时间戳
+        """
+        try:
+            # OKX API: GET /api/v5/rubik/stat/contracts/top-traders-long-short-account-ratio
+            # SDK方法: TradingDataAPI.get_top_trader_long_short_account_ratio(instId, period='')
+            
+            if self.trading_data_api is None:
+                logger.warning("⚠️ TradingDataAPI未初始化，无法获取精英交易员多空比")
+                return None
+            
+            okx_symbol = SymbolMapper.to_exchange_format(symbol, "OKX")
+            
+            # ✅ 使用TradingDataAPI获取精英交易员多空比
+            # 参数: instId (交易对), period (周期，空字符串表示获取最新数据)
+            response = self.trading_data_api.get_top_trader_long_short_account_ratio(
+                instId=okx_symbol,
+                period=''  # 空字符串表示获取最新数据
+            )
+            
+            if response.get('code') != '0':
+                logger.error(f"获取精英交易员多空比失败: {response.get('msg')}")
+                return None
+            
+            data_list = response.get('data', [])
+            if not data_list:
+                logger.warning(f"精英交易员多空比数据为空: {okx_symbol}")
+                return None
+            
+            # 取最新的一条（通常是第一条）
+            data = data_list[0]
+            
+            # 检查是否是数组格式 ["timestamp", "ratio"]
+            if isinstance(data, list) and len(data) >= 2:
+                # 二维数组格式：[["1701417600000", "1.1739"]]
+                timestamp = int(data[0]) if data[0] else int(time.time() * 1000)
+                ratio = self._safe_float(data[1], 0.0)
+                
+                # OKX返回的ratio是多空比（long/short）
+                # 反推long_account和short_account (假设 long + short = 1)
+                if ratio > 0:
+                    short_account = 1.0 / (ratio + 1.0)
+                    long_account = ratio / (ratio + 1.0)
+                else:
+                    short_account = 0.5
+                    long_account = 0.5
+                    ratio = 1.0
+                
+                return {
+                    'long_short_ratio': ratio,
+                    'long_account': long_account,
+                    'short_account': short_account,
+                    'timestamp': timestamp
+                }
+            else:
+                # 对象格式（如果API返回对象）
+                long_account = self._safe_float(data.get('longRatio', 0.0))
+                short_account = self._safe_float(data.get('shortRatio', 0.0))
+                
+                # 计算多空比（避免除零）
+                long_short_ratio = long_account / (short_account + 1e-10) if short_account > 0 else 0.0
+                
+                return {
+                    'long_short_ratio': long_short_ratio,
+                    'long_account': long_account,
+                    'short_account': short_account,
+                    'timestamp': int(data.get('ts', time.time() * 1000))
+                }
+            
+        except Exception as e:
+            self._handle_sdk_exception(e)
+            logger.error(f"❌ 获取OKX精英交易员多空比失败: {e}")
             return None
     
     def get_order_book(self, symbol: str, depth: int = 5) -> Optional[Dict[str, Any]]:
