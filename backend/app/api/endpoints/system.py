@@ -123,9 +123,9 @@ async def get_system_info(current_user: str = Depends(get_current_user)):
         
         system_info = {
             'application': {
-                'name': 'ETH合约中频智能交易系统',
+                'name': '量化交易系统',
                 'version': '1.0.0',
-                'description': '基于LightGBM的ETH合约中频智能交易系统'
+                'description': '基于LightGBM的合约中频智能交易系统'
             },
             'environment': {
                 'python_version': sys.version,

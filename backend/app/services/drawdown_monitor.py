@@ -160,7 +160,7 @@ class DrawdownMonitor:
             start_time = end_time - timedelta(days=self.lookback_days)
             
             # 这里应该从数据库获取账户权益历史
-            # 简化处理：使用ETH价格作为权益代理
+            # 简化处理：使用当前交易对价格作为权益代理
             symbol = settings.SYMBOL
             
             df = await postgresql_manager.query_kline_data(

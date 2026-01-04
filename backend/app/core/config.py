@@ -16,30 +16,19 @@ class Settings(BaseSettings):
     PORT: int = 8000
     DEBUG: bool = True
     
-    # 交易所选择配置
-    EXCHANGE_TYPE: str = "OKX"  # 支持: BINANCE, OKX, MOCK
-    
-    # Binance API配置
-    BINANCE_API_KEY: str = ""
-    BINANCE_SECRET_KEY: str = ""
-    BINANCE_TESTNET: bool = True  # 使用生产环境
-    
-    # OKX API配置
-    OKX_API_KEY: str = "ede47cb6-9250-4993-97ad-a251d47caf63"
-    OKX_SECRET_KEY: str = "8CEE9B57D73ADC49180AE6E962C50CC1"
-    OKX_PASSPHRASE: str = "Kuan@12345"
-    OKX_TESTNET: bool = False
+    # 交易所选择配置（仅使用公共接口，无需API Key）
+    EXCHANGE_TYPE: str = "BINANCE"  # 支持: BINANCE, OKX, MOCK
     
     # 代理配置（可选）
     USE_PROXY: bool = True  # 是否使用代理（REST API）
     USE_PROXY_WS: bool = True  # 是否为WebSocket使用代理（SOCKS5更稳定）
     PROXY_HOST: str = "127.0.0.1"  # 代理主机
-    PROXY_PORT: int = 10808  # 代理端口
-    PROXY_TYPE: str = "socks5"  # 代理类型：http, https, socks5（WebSocket推荐socks5）
+    PROXY_PORT: int = 10808  # 代理端口（SOCKS5通常10808，HTTP通常10809）
+    PROXY_TYPE: str = "socks5"  # 代理类型：http, https, socks5（V2Ray SOCKS5用socks5，HTTP用http）
     
     # 交易配置
-    SYMBOL: str = "ETH/USDT"  # 使用标准格式，系统会自动转换为交易所格式
-    LEVERAGE: int = 50  # 50x杠杆（1.5%止损 × 50x = 75%单次风险，风险回报1:2.67）
+    SYMBOL: str = "BTC/USDT"  # 使用标准格式，系统会自动转换为交易所格式
+    LEVERAGE: int = 20
     CONFIDENCE_THRESHOLD: float = 0.35  # 降低到0.35以增加信号数量（81%准确率下合理阈值）
     
     # 交易模式配置
@@ -54,8 +43,8 @@ class Settings(BaseSettings):
     PG_USER: str = "postgres"
     PG_PASSWORD: str = "Kuan12345"
     PG_DATABASE: str = "trading-data"
-    PG_POOL_SIZE: int = 20  # ✅ 修复：增加连接池大小（从10增加到20）
-    PG_MAX_OVERFLOW: int = 40  # ✅ 修复：增加溢出连接数（从20增加到40）
+    PG_POOL_SIZE: int = 20
+    PG_MAX_OVERFLOW: int = 40
     
     # Redis配置（缓存）
     REDIS_URL: str = "redis://172.22.22.93:6379"
@@ -78,7 +67,7 @@ class Settings(BaseSettings):
     KELLY_MULTIPLIER: float = 0.25  # Kelly系数乘数
     
     # 日志配置
-    LOG_LEVEL: str = "DEBUG"  # ✅ 临时改为DEBUG查看详细日志
+    LOG_LEVEL: str = "DEBUG"
     LOG_FILE: str = "trading_system.log"
     
     # WebSocket重连配置
@@ -93,8 +82,8 @@ class Settings(BaseSettings):
     WS_MESSAGE_WARNING_TIMEOUT: int = 600  # 消息警告超时（秒，10分钟）
     
     # GradScaler配置
-    GRAD_SCALER_GROWTH_FACTOR: float = 1.2  # 缩放增长因子（从1.5降低到1.2）
-    GRAD_SCALER_GROWTH_INTERVAL: int = 2000  # 缩放增长间隔（从1000增加到2000）
+    GRAD_SCALER_GROWTH_FACTOR: float = 1.2
+    GRAD_SCALER_GROWTH_INTERVAL: int = 2000
     GRAD_SCALER_MAX_SCALE: float = 100000.0  # 最大scale阈值
     GRAD_SCALER_AUTO_RESET: bool = True  # 是否启用自动重置
     GRAD_SCALER_RESET_THRESHOLD_EPOCHS: int = 3  # 触发重置的epoch阈值
@@ -114,23 +103,13 @@ class Settings(BaseSettings):
         import logging
         logger = logging.getLogger(__name__)
         
-        if self.EXCHANGE_TYPE == "BINANCE":
-            if not self.BINANCE_API_KEY or not self.BINANCE_SECRET_KEY:
-                logger.warning("⚠️ Binance API密钥未配置，部分功能可能不可用")
-                return False
-            logger.info("✅ Binance配置验证通过")
-        elif self.EXCHANGE_TYPE == "OKX":
-            if not self.OKX_API_KEY or not self.OKX_SECRET_KEY or not self.OKX_PASSPHRASE:
-                logger.warning("⚠️ OKX API密钥未配置，部分功能可能不可用")
-                return False
-            logger.info("✅ OKX配置验证通过")
-        elif self.EXCHANGE_TYPE == "MOCK":
-            logger.info("✅ Mock模式，无需验证API密钥")
-        else:
-            logger.warning(f"⚠️ 未知的交易所类型: {self.EXCHANGE_TYPE}，将使用默认值BINANCE")
+        # 仅使用公共接口，无需API Key验证
+        if self.EXCHANGE_TYPE not in ["BINANCE", "OKX", "MOCK"]:
+            logger.warning(f"未知的交易所类型: {self.EXCHANGE_TYPE}，将使用默认值BINANCE")
             self.EXCHANGE_TYPE = "BINANCE"
             return False
         
+        logger.info(f"✅ 交易所配置: {self.EXCHANGE_TYPE}（公共接口模式）")
         return True
     
     def validate_config(self):

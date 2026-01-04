@@ -8,7 +8,7 @@
 3. 市场状态感知
 4. 盈亏比优化
 
-作者: QuantAI-ETH Team
+作者: QuantAI Team
 版本: v3.0
 """
 

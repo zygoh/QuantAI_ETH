@@ -17,22 +17,6 @@ class ErrorResponse(BaseResponse):
     error_code: Optional[str] = None
     details: Optional[Dict[str, Any]] = None
 
-# 账户相关模型
-class AccountInfo(BaseModel):
-    """账户信息"""
-    total_wallet_balance: float
-    total_unrealized_pnl: float
-    total_margin_balance: float
-    available_balance: float
-    max_withdraw_amount: float
-    can_trade: bool
-    can_deposit: bool
-    can_withdraw: bool
-
-class AccountResponse(BaseResponse):
-    """账户响应"""
-    data: Optional[AccountInfo] = None
-
 # 持仓相关模型
 class PositionInfo(BaseModel):
     """持仓信息"""

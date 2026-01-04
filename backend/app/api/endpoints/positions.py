@@ -25,35 +25,43 @@ async def get_positions(
     symbol: Optional[str] = Query(None, description="交易对符号"),
     current_user: str = Depends(get_current_user)
 ):
-    """获取持仓信息"""
+    """获取持仓信息（模拟交易模式，使用position_manager）"""
     try:
         logger.info(f"获取持仓信息: {symbol}")
         
-        if not data_service:
-            raise HTTPException(status_code=503, detail="数据服务不可用")
-        
-        # 获取持仓信息
-        positions = await data_service.get_position_info(symbol)
+        # 🔥 模拟交易模式：使用position_manager获取虚拟持仓
+        if symbol:
+            position = await position_manager.get_position(symbol)
+            positions = [position] if position else []
+        else:
+            # 获取所有持仓
+            summary = await position_manager.get_position_summary()
+            positions = []
+            for pos_symbol in summary.get('positions', {}).keys():
+                pos = await position_manager.get_position(pos_symbol)
+                if pos:
+                    positions.append(pos)
         
         # 转换为响应模型
         position_list = []
         for pos in positions:
-            position_info = PositionInfo(
-                symbol=pos.get('symbol', ''),
-                side='LONG' if float(pos.get('position_amt', 0)) > 0 else 'SHORT',
-                size=abs(float(pos.get('position_amt', 0))),
-                entry_price=float(pos.get('entry_price', 0)),
-                mark_price=float(pos.get('mark_price', 0)),
-                unrealized_pnl=float(pos.get('pnl', 0)),
-                percentage=float(pos.get('percentage', 0)),
-                leverage=int(pos.get('leverage', 1)),
-                margin_type=pos.get('margin_type', 'cross')
-            )
-            position_list.append(position_info)
+            if pos:  # 确保position不为None
+                position_info = PositionInfo(
+                    symbol=pos.symbol if hasattr(pos, 'symbol') else pos.get('symbol', ''),
+                    side=pos.side if hasattr(pos, 'side') else ('LONG' if float(pos.get('position_amt', 0)) > 0 else 'SHORT'),
+                    size=pos.size if hasattr(pos, 'size') else abs(float(pos.get('position_amt', 0))),
+                    entry_price=pos.entry_price if hasattr(pos, 'entry_price') else float(pos.get('entry_price', 0)),
+                    mark_price=pos.mark_price if hasattr(pos, 'mark_price') else float(pos.get('mark_price', 0)),
+                    unrealized_pnl=pos.unrealized_pnl if hasattr(pos, 'unrealized_pnl') else float(pos.get('pnl', 0)),
+                    percentage=pos.percentage if hasattr(pos, 'percentage') else float(pos.get('percentage', 0)),
+                    leverage=pos.leverage if hasattr(pos, 'leverage') else int(pos.get('leverage', 1)),
+                    margin_type=pos.margin_type if hasattr(pos, 'margin_type') else pos.get('margin_type', 'cross')
+                )
+                position_list.append(position_info)
         
         return PositionsResponse(
             success=True,
-            message="持仓信息获取成功",
+            message="持仓信息获取成功（模拟交易模式）",
             data=position_list
         )
         

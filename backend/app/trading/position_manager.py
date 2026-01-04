@@ -66,72 +66,17 @@ class PositionManager:
         self.exchange_client = ExchangeFactory.get_current_client()
         
     async def initialize(self):
-        """初始化仓位管理器"""
+        """初始化仓位管理器（仅使用公共接口，不调用需要API key的功能）"""
         try:
-            logger.info("初始化仓位管理器...")
+            logger.info("初始化仓位管理器（模拟交易模式）...")
             
-            # 设置杠杆
-            await self._setup_leverage()
-            
-            # 加载当前持仓
-            await self._load_positions()
-            
-            logger.info("仓位管理器初始化完成")
+            # 🔥 模拟交易模式：不设置杠杆，不加载真实持仓
+            # 所有持仓信息都来自虚拟交易引擎
+            logger.info("✅ 仓位管理器初始化完成（使用虚拟持仓）")
             
         except Exception as e:
             logger.error(f"初始化仓位管理器失败: {e}")
             raise
-    
-    async def _setup_leverage(self):
-        """设置杠杆（可选，失败不影响系统运行）"""
-        try:
-            symbol = settings.SYMBOL
-            
-            # 尝试设置保证金模式为全仓（可能已经是全仓模式，失败不影响）
-            try:
-                result = self.exchange_client.change_margin_type(symbol, "CROSSED")
-                logger.info(f"✓ 保证金模式设置成功: {symbol} CROSSED")
-            except Exception as e:
-                logger.warning(f"⚠️ 保证金模式设置失败（可能已是全仓模式，可忽略）: {e}")
-            
-            # 设置杠杆倍数
-            try:
-                result = self.exchange_client.change_leverage(symbol, self.leverage)
-                logger.info(f"✓ 杠杆设置成功: {symbol} {self.leverage}x")
-            except Exception as e:
-                logger.warning(f"⚠️ 杠杆设置失败（可能已设置，可忽略）: {e}")
-            
-        except Exception as e:
-            logger.warning(f"⚠️ 杠杆设置过程出现异常（不影响系统运行）: {e}")
-    
-    async def _load_positions(self):
-        """加载当前持仓"""
-        try:
-            positions = self.exchange_client.get_position_info()
-            
-            for pos_data in positions:
-                position_amt = float(pos_data.get('positionAmt', 0))
-                
-                if position_amt != 0:  # 只处理有持仓的合约
-                    position = PositionInfo(
-                        symbol=pos_data['symbol'],
-                        side='LONG' if position_amt > 0 else 'SHORT',
-                        size=abs(position_amt),
-                        entry_price=float(pos_data.get('entryPrice', 0)),
-                        mark_price=float(pos_data.get('markPrice', 0)),
-                        unrealized_pnl=float(pos_data.get('unRealizedProfit', 0)),
-                        percentage=float(pos_data.get('percentage', 0)),
-                        margin_type=pos_data.get('marginType', 'cross'),
-                        leverage=int(pos_data.get('leverage', 1)),
-                        liquidation_price=float(pos_data.get('liquidationPrice', 0)),
-                        margin_ratio=0.0,  # 需要单独计算
-                        created_at=datetime.now(),
-                        updated_at=datetime.now()
-                    )
-                    
-                    self.positions[position.symbol] = position
-            
-            logger.info(f"加载了{len(self.positions)}个持仓")
             
         except Exception as e:
             logger.error(f"加载持仓失败: {e}")
@@ -255,17 +200,25 @@ class PositionManager:
                 
                 logger.debug(f"📊 使用虚拟余额: {available_balance} USDT")
             else:
-                account_info = self.exchange_client.get_account_info()
-                if not account_info:
-                    logger.warning("❌ 无法获取账户信息")
-                    return 0.0
+                # 🔥 模拟交易模式：即使is_virtual=False，也使用虚拟余额（不调用需要API key的接口）
+                cached_balance = await cache_manager.get(VIRTUAL_BALANCE_KEY)
+                if cached_balance is not None:
+                    try:
+                        available_balance = float(cached_balance)
+                        if available_balance <= 0:
+                            logger.warning(f"⚠️ 虚拟账户余额不足: {available_balance}，重置为初始值")
+                            available_balance = VIRTUAL_ACCOUNT_BALANCE
+                            await cache_manager.set(VIRTUAL_BALANCE_KEY, available_balance)
+                    except (ValueError, TypeError):
+                        logger.warning(f"⚠️ 虚拟账户余额格式错误: {cached_balance}，重置为初始值")
+                        available_balance = VIRTUAL_ACCOUNT_BALANCE
+                        await cache_manager.set(VIRTUAL_BALANCE_KEY, available_balance)
+                else:
+                    available_balance = VIRTUAL_ACCOUNT_BALANCE
+                    await cache_manager.set(VIRTUAL_BALANCE_KEY, available_balance)
+                    logger.info(f"💰 初始化虚拟账户余额: {available_balance} USDT")
                 
-                available_balance = float(account_info.get('availableBalance', 0))
-                if available_balance <= 0:
-                    logger.warning("❌ 账户余额不足")
-                    return 0.0
-                
-                logger.debug(f"📊 使用实盘余额: {available_balance} USDT")
+                logger.debug(f"📊 使用虚拟余额（模拟模式）: {available_balance} USDT")
             
             # 2. 根据策略计算仓位
             if use_full_position:
@@ -488,32 +441,49 @@ class PositionManager:
             return []
     
     async def calculate_risk_metrics(self) -> RiskMetrics:
-        """计算风险指标"""
+        """计算风险指标（使用虚拟余额，不调用需要API key的接口）"""
         try:
-            account_info = self.exchange_client.get_account_info()
+            # 🔥 模拟交易模式：使用虚拟余额
+            cached_balance = await cache_manager.get(VIRTUAL_BALANCE_KEY)
+            if cached_balance is not None:
+                try:
+                    total_wallet_balance = float(cached_balance)
+                except (ValueError, TypeError):
+                    total_wallet_balance = VIRTUAL_ACCOUNT_BALANCE
+            else:
+                total_wallet_balance = VIRTUAL_ACCOUNT_BALANCE
             
-            if not account_info:
-                return RiskMetrics(0, 0, 0, 0, 0, 0)
+            # 🔥 模拟交易模式：从虚拟持仓计算风险指标
+            total_unrealized_pnl = 0.0
+            total_position_initial_margin = 0.0
+            available_balance = total_wallet_balance
             
-            total_wallet_balance = float(account_info.get('totalWalletBalance', 0))
-            total_unrealized_pnl = float(account_info.get('totalUnrealizedPnL', 0))
-            total_margin_balance = float(account_info.get('totalMarginBalance', 0))
-            total_position_initial_margin = float(account_info.get('totalPositionInitialMargin', 0))
-            available_balance = float(account_info.get('availableBalance', 0))
-            max_withdraw_amount = float(account_info.get('maxWithdrawAmount', 0))
+            # 计算所有虚拟持仓的保证金和未实现盈亏
+            for symbol, position in self.positions.items():
+                if position.size > 0:
+                    # 计算持仓保证金（简化计算：持仓价值 / 杠杆）
+                    position_value = position.size * position.mark_price
+                    position_margin = position_value / self.leverage
+                    total_position_initial_margin += position_margin
+                    total_unrealized_pnl += position.unrealized_pnl
+            
+            total_margin_balance = total_wallet_balance + total_unrealized_pnl
+            available_balance = total_margin_balance - total_position_initial_margin
             
             # 计算保证金水平
             margin_level = 0
             if total_position_initial_margin > 0:
                 margin_level = total_margin_balance / total_position_initial_margin
+            else:
+                margin_level = 999.0  # 无持仓时，保证金水平设为很高
             
             risk_metrics = RiskMetrics(
                 total_margin=total_position_initial_margin,
-                free_margin=available_balance,
+                free_margin=max(0, available_balance),
                 margin_level=margin_level,
                 total_unrealized_pnl=total_unrealized_pnl,
                 total_wallet_balance=total_wallet_balance,
-                max_withdraw_amount=max_withdraw_amount
+                max_withdraw_amount=max(0, available_balance)
             )
             
             return risk_metrics

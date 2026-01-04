@@ -1,11 +1,11 @@
 """
-ETH合约中频智能交易系统 - 主应用入口
+量化交易系统 - 主应用入口
 """
 import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -37,12 +37,14 @@ log_file = os.path.join(log_dir, "trading_system.log")
 # 配置日志格式
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
-# 创建文件处理器（支持日志轮转，单文件最大10MB，保留5个备份）
-file_handler = RotatingFileHandler(
+# 创建文件处理器（按日期分割，每天午夜轮转，保留30天）
+file_handler = TimedRotatingFileHandler(
     log_file,
-    maxBytes=10 * 1024 * 1024,  # 10MB
-    backupCount=5,
-    encoding='utf-8'
+    when='midnight',  # 每天午夜
+    interval=1,       # 间隔1天
+    backupCount=30,  # 保留30天
+    encoding='utf-8',
+    utc=False        # 使用本地时间
 )
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter(log_format))
@@ -83,7 +85,7 @@ async def lifespan(app: FastAPI):
     global data_service, ml_service, trading_engine, risk_service
     global signal_generator, trading_controller, scheduler
 
-    logger.info("启动ETH合约中频智能交易系统...")
+    logger.info("启动量化交易系统...")
 
     try:
         # 初始化数据库
@@ -105,10 +107,9 @@ async def lifespan(app: FastAPI):
         )
         scheduler = TaskScheduler(ml_service, data_service, signal_generator)  # 🔥 传入signal_generator
 
-        # 设置API端点的服务依赖
-        from app.api.endpoints import account, positions, signals, trading, training, performance, system, websocket
+        # 设置API端点的服务依赖（已移除account端点，仅支持模拟交易）
+        from app.api.endpoints import positions, signals, trading, training, performance, system, websocket
 
-        account.set_data_service(data_service)
         positions.set_data_service(data_service)
         signals.set_services(signal_generator, ml_service, data_service)
         trading.set_trading_controller(trading_controller)
@@ -188,8 +189,8 @@ async def lifespan(app: FastAPI):
 
 # 创建FastAPI应用
 app = FastAPI(
-    title="ETH合约中频智能交易系统",
-    description="基于LightGBM的ETH合约中频智能交易系统",
+    title="量化交易系统",
+    description="基于机器学习的合约中频智能交易系统",
     version="1.0.0",
     lifespan=lifespan
 )

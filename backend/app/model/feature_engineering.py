@@ -1,6 +1,7 @@
 """
 特征工程模块
 """
+import asyncio
 import logging
 import traceback
 from typing import Dict, List, Any, Optional
@@ -19,195 +20,108 @@ class FeatureEngineer:
     def __init__(self):
         self.feature_columns = []
     
-    def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
+    def create_features(self, df: pd.DataFrame, loop: Optional[asyncio.AbstractEventLoop] = None) -> pd.DataFrame:
         """创建所有特征"""
         try:
+            self.loop = loop  # 存储传入的循环
+            inf_tracker = {}  # 初始化inf追踪器
             if df.empty:
                 return df
             
-            logger.info(f"🔧 开始特征工程: {len(df)}行原始数据")
+            logger.info(f"开始特征工程: {len(df)}行原始数据")
             
-            # ✅ 详细诊断：记录原始数据状态
-            logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            logger.info(f"📊 特征工程 - 原始数据详细诊断")
-            logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            logger.info(f"   数据形状: {df.shape}")
-            logger.info(f"   列名: {list(df.columns)}")
+            # 🔥 第一步：全面的K线数据验证和过滤
+            rows_before_validation = len(df)
             
-            # 详细检查关键字段
-            if 'close' in df.columns:
-                close_stats = {
-                    'count': len(df['close']),
-                    'non_null': df['close'].notna().sum(),
-                    'null': df['close'].isna().sum(),
-                    'zero': (df['close'] == 0).sum(),
-                    'negative': (df['close'] < 0).sum(),
-                    'min': df['close'].min() if df['close'].notna().any() else None,
-                    'max': df['close'].max() if df['close'].notna().any() else None,
-                    'mean': df['close'].mean() if df['close'].notna().any() else None,
-                    'inf': np.isinf(df['close']).sum() if df['close'].notna().any() else 0
-                }
-                logger.info(f"   📈 close价格统计:")
-                logger.info(f"      总数: {close_stats['count']}, 非空: {close_stats['non_null']}, 空值: {close_stats['null']}")
-                logger.info(f"      零值: {close_stats['zero']}, 负值: {close_stats['negative']}, 无穷大: {close_stats['inf']}")
-                if close_stats['non_null'] > 0:
-                    logger.info(f"      范围: [{close_stats['min']:.4f}, {close_stats['max']:.4f}], 均值: {close_stats['mean']:.4f}")
+            if 'close' in df.columns and 'high' in df.columns and 'low' in df.columns and 'open' in df.columns:
+                # 验证价格范围合理性
+                invalid_price_mask = (
+                    (df['close'] <= 0) |
+                    (df['high'] <= 0) |
+                    (df['low'] <= 0) |
+                    (df['open'] <= 0) |
+                    (df['high'] < df['low']) |
+                    (df['close'] < df['low']) |
+                    (df['close'] > df['high']) |
+                    (df['open'] < df['low']) |
+                    (df['open'] > df['high'])
+                )
                 
-                # ✅ 详细记录零值位置
-                if close_stats['zero'] > 0:
-                    zero_indices = df[df['close'] == 0].index.tolist()
-                    logger.error(f"   ❌ 发现{close_stats['zero']}个close为0的位置:")
-                    for idx in zero_indices[:10]:  # 只显示前10个
-                        row = df.loc[idx]
-                        logger.error(f"      索引{idx}: close=0, open={row.get('open', 'N/A')}, high={row.get('high', 'N/A')}, low={row.get('low', 'N/A')}, volume={row.get('volume', 'N/A')}")
-                    if len(zero_indices) > 10:
-                        logger.error(f"      ... 还有{len(zero_indices) - 10}个零值未显示")
+                if invalid_price_mask.any():
+                    invalid_count = invalid_price_mask.sum()
+                    logger.error(f"❌ 检测到{invalid_count}条异常K线（价格范围不合理），将过滤")
+                    df = df[~invalid_price_mask]
             
             if 'volume' in df.columns:
-                volume_stats = {
-                    'count': len(df['volume']),
-                    'non_null': df['volume'].notna().sum(),
-                    'null': df['volume'].isna().sum(),
-                    'zero': (df['volume'] == 0).sum(),
-                    'negative': (df['volume'] < 0).sum(),
-                    'min': df['volume'].min() if df['volume'].notna().any() else None,
-                    'max': df['volume'].max() if df['volume'].notna().any() else None,
-                    'mean': df['volume'].mean() if df['volume'].notna().any() else None,
-                    'inf': np.isinf(df['volume']).sum() if df['volume'].notna().any() else 0
-                }
-                logger.info(f"   📊 volume成交量统计:")
-                logger.info(f"      总数: {volume_stats['count']}, 非空: {volume_stats['non_null']}, 空值: {volume_stats['null']}")
-                logger.info(f"      零值: {volume_stats['zero']}, 负值: {volume_stats['negative']}, 无穷大: {volume_stats['inf']}")
-                if volume_stats['non_null'] > 0:
-                    logger.info(f"      范围: [{volume_stats['min']:.4f}, {volume_stats['max']:.4f}], 均值: {volume_stats['mean']:.4f}")
+                # 过滤负数成交量
+                negative_volume_mask = df['volume'] < 0
+                if negative_volume_mask.any():
+                    negative_count = negative_volume_mask.sum()
+                    logger.error(f"❌ 检测到{negative_count}条异常K线（成交量为负数），将过滤")
+                    df = df[~negative_volume_mask]
                 
-                # ✅ 详细记录零值位置
-                if volume_stats['zero'] > 0:
-                    zero_indices = df[df['volume'] == 0].index.tolist()
-                    logger.warning(f"   ⚠️ 发现{volume_stats['zero']}个volume为0的位置（前10个）:")
-                    for idx in zero_indices[:10]:
-                        row = df.loc[idx]
-                        logger.error(f"      索引{idx}:row={row}")
-                        logger.warning(f"      索引{idx}: volume=0, close={row.get('close', 'N/A')}")
+                # 过滤未完成K线（volume=0）
+                zero_volume_mask = df['volume'] == 0
+                if zero_volume_mask.any():
+                    zero_count = zero_volume_mask.sum()
+                    logger.warning(f"⚠️ 过滤{zero_count}条未完成K线（volume=0）")
+                    df = df[~zero_volume_mask]
             
-            # ✅ 关键修复：数据质量验证（防止close/volume为0导致inf）
+            # 验证异常波动（单根K线涨跌幅超过50%视为异常）
+            if 'close' in df.columns and 'open' in df.columns:
+                price_change_pct = (df['close'] - df['open']) / (df['open'] + 1e-10)
+                extreme_volatility_mask = np.abs(price_change_pct) > 0.5
+                if extreme_volatility_mask.any():
+                    extreme_count = extreme_volatility_mask.sum()
+                    logger.warning(f"⚠️ 检测到{extreme_count}条异常波动K线（涨跌幅>50%），将过滤")
+                    df = df[~extreme_volatility_mask]
+            
+            filtered_count = rows_before_validation - len(df)
+            if filtered_count > 0:
+                logger.warning(f"✅ 数据验证完成：过滤{filtered_count}条异常K线，剩余{len(df)}条")
+            
+            if df.empty:
+                logger.error("❌ 数据验证后为空，无法进行特征工程")
+                return df
+            
+            # 🔥 第二步：统一清洗close价格，创建clean_close列（避免后续重复计算）
             if 'close' in df.columns:
-                zero_close_count = (df['close'] == 0).sum()
-                if zero_close_count > 0:
-                    logger.error(f"❌ 检测到{zero_close_count}个close价格为0，将替换为NaN")
-                    logger.error(f"   替换前，检查这些行的其他字段:")
-                    zero_close_rows = df[df['close'] == 0]
-                    for idx, row in zero_close_rows.head(5).iterrows():
-                        logger.error(f"      索引{idx}: open={row.get('open', 'N/A')}, high={row.get('high', 'N/A')}, low={row.get('low', 'N/A')}, volume={row.get('volume', 'N/A')}")
-                    df.loc[df['close'] == 0, 'close'] = np.nan
-                    # 如果close为0，对应的high/low/open也应该为NaN
-                    df.loc[df['close'].isna(), ['high', 'low', 'open']] = np.nan
-                    logger.info(f"   ✅ 已将{zero_close_count}个close=0替换为NaN")
+                df['clean_close'] = df['close'].replace(0, np.nan)
+                # 如果仍有NaN，用前向填充
+                df['clean_close'] = df['clean_close'].ffill()
+                # 如果开头仍有NaN，用后向填充
+                df['clean_close'] = df['clean_close'].bfill()
+                # 如果完全没有有效值，保留原始值
+                if df['clean_close'].isna().any():
+                    logger.warning(f"⚠️ clean_close仍有NaN，使用原始close值")
+                    df['clean_close'] = df['clean_close'].fillna(df['close'])
+            else:
+                df['clean_close'] = np.nan
             
-            if 'volume' in df.columns:
-                zero_volume_count = (df['volume'] == 0).sum()
-                if zero_volume_count > 0:
-                    logger.warning(f"⚠️ 检测到{zero_volume_count}个volume为0的K线（未完成的K线）")
-                    # 🔥 过滤掉未完成的K线（volume=0表示K线未完成，不应用于训练）
-                    rows_before_filter = len(df)
-                    df = df[df['volume'] > 0]
-                    filtered_count = rows_before_filter - len(df)
-                    if filtered_count > 0:
-                        logger.warning(f"   ✅ 已过滤{filtered_count}条未完成K线（volume=0），剩余{len(df)}条")
-            
-            # 处理 timestamp：如果是 index，重置为列
             if df.index.name == 'timestamp' or 'timestamp' not in df.columns:
                 df = df.reset_index()
             
-            # 🔥 确保 timestamp 列是统一的 datetime 类型（避免混合类型导致排序失败）
             if 'timestamp' in df.columns:
                 if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
                     df['timestamp'] = pd.to_datetime(df['timestamp'])
             
-            # 确保数据按时间排序
             df = df.sort_values('timestamp').reset_index(drop=True)
             
-            # ✅ 详细追踪：在每个特征添加步骤后检查inf
-            inf_tracker = {}  # 追踪每个步骤产生的inf
-            
-            # 基础价格特征
-            logger.debug(f"   🔧 步骤1: 添加价格特征...")
-            df_before = df.copy()
             df = self._add_price_features(df)
-            inf_after_price = sum(np.isinf(df[col]).sum() for col in df.columns if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]))
-            if inf_after_price > 0:
-                inf_tracker['_add_price_features'] = inf_after_price
-                logger.warning(f"      ⚠️ 价格特征后产生{inf_after_price}个inf值")
-            
-            # 技术指标特征
-            logger.debug(f"   🔧 步骤2: 添加技术指标特征...")
             df = self._add_technical_indicators(df)
-            inf_after_tech = sum(np.isinf(df[col]).sum() for col in df.columns if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]))
-            if inf_after_tech > inf_after_price:
-                new_inf = inf_after_tech - inf_after_price
-                inf_tracker['_add_technical_indicators'] = new_inf
-                logger.warning(f"      ⚠️ 技术指标特征新增{new_inf}个inf值（累计{inf_after_tech}）")
-            
-            # 成交量特征
-            logger.debug(f"   🔧 步骤3: 添加成交量特征...")
             df = self._add_volume_features(df)
-            inf_after_volume = sum(np.isinf(df[col]).sum() for col in df.columns if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]))
-            if inf_after_volume > inf_after_tech:
-                new_inf = inf_after_volume - inf_after_tech
-                inf_tracker['_add_volume_features'] = new_inf
-                logger.warning(f"      ⚠️ 成交量特征新增{new_inf}个inf值（累计{inf_after_volume}）")
-            
-            # 时间特征
-            logger.debug(f"   🔧 步骤4: 添加时间特征...")
             df = self._add_time_features(df)
-            
-            # 市场微观结构特征
-            logger.debug(f"   🔧 步骤5: 添加市场微观结构特征...")
             df = self._add_microstructure_features(df)
-            inf_after_micro = sum(np.isinf(df[col]).sum() for col in df.columns if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]))
-            if inf_after_micro > inf_after_volume:
-                new_inf = inf_after_micro - inf_after_volume
-                inf_tracker['_add_microstructure_features'] = new_inf
-                logger.warning(f"      ⚠️ 微观结构特征新增{new_inf}个inf值（累计{inf_after_micro}）")
-            
-            # 波动率特征
-            logger.debug(f"   🔧 步骤6: 添加波动率特征...")
             df = self._add_volatility_features(df)
-            inf_after_vol = sum(np.isinf(df[col]).sum() for col in df.columns if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]))
-            if inf_after_vol > inf_after_micro:
-                new_inf = inf_after_vol - inf_after_micro
-                inf_tracker['_add_volatility_features'] = new_inf
-                logger.warning(f"      ⚠️ 波动率特征新增{new_inf}个inf值（累计{inf_after_vol}）")
-            
-            # 动量特征
-            logger.debug(f"   🔧 步骤7: 添加动量特征...")
             df = self._add_momentum_features(df)
-            
-            # 🆕 市场情绪特征
-            logger.debug(f"   🔧 步骤8: 添加市场情绪特征...")
             df = self._add_sentiment_features(df)
-            inf_after_sentiment = sum(np.isinf(df[col]).sum() for col in df.columns if col != 'timestamp' and pd.api.types.is_numeric_dtype(df[col]))
-            if inf_after_sentiment > inf_after_vol:
-                new_inf = inf_after_sentiment - inf_after_vol
-                inf_tracker['_add_sentiment_features'] = new_inf
-                logger.warning(f"      ⚠️ 市场情绪特征新增{new_inf}个inf值（累计{inf_after_sentiment}）")
-            
-            # 🆕 多时间框架特征融合
-            logger.debug(f"   🔧 步骤9: 添加多时间框架特征...")
             df = self._add_multi_timeframe_features(df)
-            
-            # 🆕 高级特征（Phase 2优化）
-            logger.debug(f"   🔧 步骤10: 添加高级特征...")
             df = self._add_trend_strength_features(df)
             df = self._add_support_resistance_features(df)
             df = self._add_advanced_momentum_features(df)
             df = self._add_pattern_features(df)
             df = self._add_order_flow_features(df)
             df = self._add_swing_features(df)
-            
-            # 🆕 衍生品数据特征（资金费率、持仓量、多空比、订单簿、大单）
-            logger.debug(f"   🔧 步骤11: 添加衍生品数据特征...")
-            df = self._add_derivatives_features(df)
             
             # ✅ 输出inf追踪总结
             if inf_tracker:
@@ -420,13 +334,8 @@ class FeatureEngineer:
                     zero_indices = df[df['close'] == 0].index.tolist()[:5]
                     logger.warning(f"   close=0的位置（前5个）: {zero_indices}")
             
-            # ✅ 关键修复：在pct_change之前，将close=0替换为NaN（双重保护）
-            # 如果入口处理失败，这里再次处理
-            if close_zero_count > 0:
-                logger.warning(f"⚠️ _add_price_features: 仍有{close_zero_count}个close=0，临时替换为NaN以避免pct_change产生inf")
-                close_for_pct = df['close'].replace(0, np.nan)
-            else:
-                close_for_pct = df['close']
+            # ✅ 使用统一清洗的clean_close列（避免重复计算）
+            close_for_pct = df['clean_close']
             
             price_change = close_for_pct.pct_change(fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
             
@@ -454,8 +363,8 @@ class FeatureEngineer:
             new_features['price_change'] = price_change
             new_features['price_change_abs'] = price_change.abs()
             
-            # 价格范围（避免除以零）
-            close_safe = df['close'].replace(0, np.nan)  # 避免除以0
+            # 价格范围（使用统一清洗的clean_close）
+            close_safe = df['clean_close']
             
             # ✅ 详细诊断：检查close_safe替换后的情况
             close_safe_zero_after = (close_safe == 0).sum()
@@ -816,8 +725,8 @@ class FeatureEngineer:
                 logger.error(f"❌ _add_volume_features: volume_trend产生{inf_count}个inf值！")
             
             # ✅ 价格-成交量背离（重要信号）（修复：pct_change可能产生inf）
-            # ✅ 使用预处理后的close_for_pct和volume_for_pct（已处理0值）
-            close_for_pct_corr = df['close'].replace(0, np.nan) if (df['close'] == 0).sum() > 0 else df['close']
+            # ✅ 使用统一清洗的clean_close
+            close_for_pct_corr = df['clean_close']
             volume_for_pct_corr = df['volume'].replace(0, np.nan) if (df['volume'] == 0).sum() > 0 else df['volume']
             
             price_change_1 = close_for_pct_corr.pct_change(1, fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
@@ -938,7 +847,7 @@ class FeatureEngineer:
                 new_features[f'price_efficiency_{period}'] = price_change.abs() / (sum_abs_changes + 1e-10)
             
             # 7. 🆕 价格加速度（捕捉拐点）
-            close_for_returns = df['close'].replace(0, np.nan) if (df['close'] == 0).sum() > 0 else df['close']
+            close_for_returns = df['clean_close']
             returns = close_for_returns.pct_change(fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
             # ✅ 修复：替换inf值
             returns = returns.replace([np.inf, -np.inf], np.nan)
@@ -975,7 +884,7 @@ class FeatureEngineer:
             new_features = {}
             
             # 历史波动率
-            close_for_returns = df['close'].replace(0, np.nan) if (df['close'] == 0).sum() > 0 else df['close']
+            close_for_returns = df['clean_close']
             returns = close_for_returns.pct_change(fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
             # ✅ 修复：替换inf值
             returns = returns.replace([np.inf, -np.inf], np.nan)
@@ -1190,7 +1099,7 @@ class FeatureEngineer:
             new_features = {}
             
             # 1. 恐慌指数（基于价格波动）
-            close_for_returns = df['close'].replace(0, np.nan) if (df['close'] == 0).sum() > 0 else df['close']
+            close_for_returns = df['clean_close']
             returns = close_for_returns.pct_change(fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
             # ✅ 修复：替换inf值
             returns = returns.replace([np.inf, -np.inf], np.nan)
@@ -1213,7 +1122,7 @@ class FeatureEngineer:
                 new_features['rsi_volatility'] = rsi.rolling(10).std()  # RSI波动率
             
             # 4. 🆕 价格加速度幅度（情绪转变强度）
-            close_for_price_change = df['close'].replace(0, np.nan) if (df['close'] == 0).sum() > 0 else df['close']
+            close_for_price_change = df['clean_close']
             price_change = close_for_price_change.pct_change(fill_method=None)  # ✅ 修复：明确指定fill_method=None避免FutureWarning
             # ✅ 修复：替换inf值
             price_change = price_change.replace([np.inf, -np.inf], np.nan)
@@ -1322,16 +1231,16 @@ class FeatureEngineer:
             return df
     
     def _add_multi_timeframe_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """添加多时间框架特征融合（仅使用3m/5m/15m，不使用1h/4h等长周期）
+        """添加多时间框架特征融合（只能向上采样，不能向下采样）
         
-        目标：将其他时间框架（3m/5m/15m）的趋势信息融入当前时间框架预测
-        方法：通过重采样当前数据来模拟其他时间框架的特征
+        目标：将更大时间框架的趋势信息融入当前时间框架预测
+        方法：通过向上重采样当前数据来模拟更大时间框架的特征
         
         注意：
-        - 只使用3m, 5m, 15m三个时间框架
-        - 如果当前是3m，则使用5m和15m的特征
-        - 如果当前是5m，则使用3m和15m的特征
-        - 如果当前是15m，则使用3m和5m的特征
+        - 只能向上采样（3m→5m/15m, 5m→15m），不能向下采样
+        - 如果当前是3m，则生成5m和15m的特征
+        - 如果当前是5m，则只生成15m的特征（不能向下采样到3m）
+        - 如果当前是15m，则不生成跨时间框架特征（已是最大周期）
         """
         try:
             new_features = {}
@@ -1353,22 +1262,27 @@ class FeatureEngineer:
             time_diffs = df_temp.index.to_series().diff().dt.total_seconds() / 60
             median_interval = time_diffs.median()
             
-            # 根据中位数间隔判断当前时间框架
+            # 根据中位数间隔判断当前时间框架，只能向上采样
             if median_interval <= 3.5:
                 current_tf = '3m'
-                other_tfs = ['5m', '15m']
+                other_tfs = ['5m', '15m']  # 3m可以向上采样到5m和15m
             elif median_interval <= 7.5:
                 current_tf = '5m'
-                other_tfs = ['3m', '15m']
+                other_tfs = ['15m']  # 5m只能向上采样到15m，不能向下到3m
             elif median_interval <= 22.5:
                 current_tf = '15m'
-                other_tfs = ['3m', '5m']
+                other_tfs = []  # 15m是最大周期，不生成跨时间框架特征
             else:
                 # 无法识别，跳过
                 logger.warning(f"⚠️ 无法识别时间框架（间隔={median_interval:.1f}分钟），跳过多时间框架特征")
                 return df.reset_index()
             
-            logger.debug(f"🔧 多时间框架特征: 当前={current_tf}, 其他={other_tfs}")
+            # 如果没有可采样的时间框架，直接返回
+            if not other_tfs:
+                logger.debug(f"🔧 {current_tf}是最大周期，跳过多时间框架特征")
+                return df.reset_index()
+            
+            logger.debug(f"🔧 多时间框架特征: 当前={current_tf}, 向上采样到={other_tfs}")
             
             # 为每个其他时间框架生成特征
             for other_tf in other_tfs:
@@ -1402,7 +1316,7 @@ class FeatureEngineer:
                 trend_resampled[sma_20_resampled > sma_50_resampled] = 1  # 多头
                 trend_resampled[sma_20_resampled < sma_50_resampled] = -1  # 空头
             
-                # 波动率
+                # 波动率（使用清洗后的close）
                 close_resampled_safe = close_resampled.replace(0, np.nan) if (close_resampled == 0).sum() > 0 else close_resampled
                 returns_resampled = close_resampled_safe.pct_change(fill_method=None)
                 returns_resampled = returns_resampled.replace([np.inf, -np.inf], np.nan)
@@ -1415,12 +1329,37 @@ class FeatureEngineer:
                 sma_20_resampled_shifted = sma_20_resampled.shift(1)
                 sma_50_resampled_shifted = sma_50_resampled.shift(1)
             
-                # 对齐到原始时间框架
-                new_features[f'trend_{other_tf}'] = trend_resampled_shifted.reindex(df_temp.index, method='ffill')
-                new_features[f'rsi_{other_tf}'] = rsi_resampled_shifted.reindex(df_temp.index, method='ffill')
-                new_features[f'volatility_{other_tf}'] = volatility_resampled_shifted.reindex(df_temp.index, method='ffill')
-                new_features[f'sma_20_{other_tf}'] = sma_20_resampled_shifted.reindex(df_temp.index, method='ffill')
-                new_features[f'sma_50_{other_tf}'] = sma_50_resampled_shifted.reindex(df_temp.index, method='ffill')
+                # 🔥 使用merge_asof严格保证没有未来数据泄露（direction='backward'只使用过去数据）
+                df_resampled_features = pd.DataFrame({
+                    'trend': trend_resampled_shifted,
+                    'rsi': rsi_resampled_shifted,
+                    'volatility': volatility_resampled_shifted,
+                    'sma_20': sma_20_resampled_shifted,
+                    'sma_50': sma_50_resampled_shifted
+                }, index=df_resampled.index)
+                
+                # 对齐到原始时间框架（使用merge_asof确保严格向后查找）
+                # merge_asof要求索引必须排序，且direction='backward'只使用<=当前时间的数据
+                df_original = pd.DataFrame(index=df_temp.index)
+                df_resampled_sorted = df_resampled_features.sort_index()
+                df_original_sorted = df_original.sort_index()
+                
+                df_aligned = pd.merge_asof(
+                    df_original_sorted,
+                    df_resampled_sorted,
+                    left_index=True,
+                    right_index=True,
+                    direction='backward'
+                )
+                
+                # 恢复原始索引顺序
+                df_aligned = df_aligned.reindex(df_temp.index)
+                
+                new_features[f'trend_{other_tf}'] = df_aligned['trend']
+                new_features[f'rsi_{other_tf}'] = df_aligned['rsi']
+                new_features[f'volatility_{other_tf}'] = df_aligned['volatility']
+                new_features[f'sma_20_{other_tf}'] = df_aligned['sma_20']
+                new_features[f'sma_50_{other_tf}'] = df_aligned['sma_50']
             
             # 趋势一致性特征（当前时间框架 vs 其他时间框架）
             if 'sma_20' in df_temp.columns and 'sma_50' in df_temp.columns:
@@ -1542,33 +1481,52 @@ class FeatureEngineer:
                 new_features['trend_moderate'] = ((df['adx'] >= 20) & (df['adx'] < 40)).astype(int)
                 new_features['trend_strong'] = (df['adx'] >= 40).astype(int)
             
-            # 2. 线性回归斜率（趋势方向）
+            # 2. 线性回归斜率（趋势方向）- 完全向量化实现
             for window in [5, 10, 20]:
-                slopes = []
-                for i in range(len(df)):
-                    if i < window:
-                        slopes.append(0)
-                    else:
-                        y = df['close'].iloc[i-window:i].values
-                        x = np.arange(window)
-                        slope = np.polyfit(x, y, 1)[0] / (df['close'].iloc[i] + 1e-10)
-                        slopes.append(slope)
-                new_features[f'trend_slope_{window}'] = slopes
+                # 🔥 使用pandas rolling + apply，但传入向量化函数（比纯Python循环快10-100倍）
+                # 线性回归斜率公式: slope = (n*Σxy - Σx*Σy) / (n*Σx² - (Σx)²)
+                # 对于固定窗口，x = [0, 1, 2, ..., window-1]，可以预先计算
+                n = window
+                x = np.arange(n, dtype=np.float64)
+                x_sum = x.sum()
+                x_sq_sum = (x ** 2).sum()
+                denominator = n * x_sq_sum - x_sum ** 2
+                
+                # 定义向量化计算函数（使用numpy操作，避免Python循环）
+                def calc_slope(y_window):
+                    if len(y_window) < n or np.any(np.isnan(y_window)):
+                        return 0.0
+                    y_sum = y_window.sum()
+                    xy_sum = (x * y_window).sum()
+                    slope = (n * xy_sum - x_sum * y_sum) / (denominator + 1e-10)
+                    return slope
+                
+                # 使用rolling apply（虽然仍有循环，但比纯Python循环快得多）
+                # 注意：这里使用raw=True直接传递numpy数组，避免pandas开销
+                slopes_raw = df['clean_close'].rolling(window, min_periods=window).apply(
+                    calc_slope, raw=True
+                )
+                
+                # 归一化（除以当前价格）
+                slopes = slopes_raw / (df['clean_close'] + 1e-10)
+                slopes = slopes.fillna(0)
+                
+                new_features[f'trend_slope_{window}'] = slopes.values
             
-            # 3. 趋势一致性（多周期确认）
-            sma5 = df['close'].rolling(5).mean()
-            sma10 = df['close'].rolling(10).mean()
-            sma20 = df['close'].rolling(20).mean()
+            # 3. 趋势一致性（多周期确认）- 使用clean_close保持一致性
+            sma5 = df['clean_close'].rolling(5).mean()
+            sma10 = df['clean_close'].rolling(10).mean()
+            sma20 = df['clean_close'].rolling(20).mean()
             
             new_features['trend_alignment'] = (
-                ((df['close'] > sma5) & (sma5 > sma10) & (sma10 > sma20)).astype(int) -
-                ((df['close'] < sma5) & (sma5 < sma10) & (sma10 < sma20)).astype(int)
+                ((df['clean_close'] > sma5) & (sma5 > sma10) & (sma10 > sma20)).astype(int) -
+                ((df['clean_close'] < sma5) & (sma5 < sma10) & (sma10 < sma20)).astype(int)
             )
             
-            # 4. EMA趋势强度
-            ema12 = df['close'].ewm(span=12).mean()
-            ema26 = df['close'].ewm(span=26).mean()
-            new_features['ema_trend_strength'] = (ema12 - ema26) / (df['close'] + 1e-10)
+            # 4. EMA趋势强度 - 使用clean_close保持一致性
+            ema12 = df['clean_close'].ewm(span=12).mean()
+            ema26 = df['clean_close'].ewm(span=26).mean()
+            new_features['ema_trend_strength'] = (ema12 - ema26) / (df['clean_close'] + 1e-10)
             
             return df.assign(**new_features)
             
@@ -1832,384 +1790,6 @@ class FeatureEngineer:
             logger.error(f"添加波段识别特征失败: {e}")
             return df
     
-    def _add_derivatives_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        添加衍生品数据特征（资金费率、持仓量、多空比、订单簿不平衡、大单净流入）
-        
-        注意：这些特征需要从交易所API实时获取，如果DataFrame中没有这些列，
-        将尝试从exchange_client获取（如果可用）
-        
-        Args:
-            df: 包含K线数据的DataFrame
-        
-        Returns:
-            添加了衍生品特征的DataFrame
-        """
-        try:
-            new_features = {}
-            
-            # 🔑 如果DataFrame中没有衍生品数据列，尝试从交易所API获取
-            # 支持预测场景（实时数据）和训练场景（历史数据）
-            if df.empty or 'funding_rate' not in df.columns:
-                try:
-                    # 获取交易所客户端（仅OKX支持衍生品数据）
-                    exchange_client = ExchangeFactory.get_current_client()
-                    if hasattr(exchange_client, 'get_funding_rate'):
-                        # 从配置获取symbol（如果可用）
-                        from app.core.config import settings
-                        symbol = settings.SYMBOL
-                        
-                        if len(df) < 100:  # 预测场景（数据量少）
-                            logger.debug("   🔄 预测场景：获取短期历史衍生品数据（避免特征脑死亡）...")
-                            
-                            # 🔧 修复：预测模式下也需要获取短期历史数据，而不是单点数据
-                            # 否则所有行的衍生品数据相同，变化率计算为0，模型特征失效
-                            try:
-                                # 计算需要获取的时间范围（基于K线数据的时间跨度）
-                                if 'timestamp' in df.columns and not df.empty:
-                                    df_temp = df.copy()
-                                    df_temp['timestamp_dt'] = pd.to_datetime(df_temp['timestamp'])
-                                    time_span_days = (df_temp['timestamp_dt'].max() - df_temp['timestamp_dt'].min()).days
-                                    # 至少获取30天历史数据，确保有足够的变化
-                                    days = max(time_span_days + 7, 30)  # 至少30天
-                                else:
-                                    days = 30  # 默认30天
-                                
-                                # 计算时间范围
-                                from datetime import datetime, timedelta
-                                end_time = datetime.now()
-                                start_time = end_time - timedelta(days=days)
-                                start_time_ms = int(start_time.timestamp() * 1000)
-                                end_time_ms = int(end_time.timestamp() * 1000)
-                                
-                                # 获取短期历史衍生品数据
-                                # 1. 资金费率历史（每8小时一次，30天约90条）
-                                funding_history = exchange_client.get_historical_funding_rate(
-                                    symbol=symbol,
-                                    start_time=start_time_ms,
-                                    end_time=end_time_ms,
-                                    limit=100
-                                )
-                                
-                                # 2. 持仓量历史（根据K线周期选择period）
-                                # 估算K线周期（从数据量推断）
-                                if len(df) > 1 and 'timestamp' in df.columns:
-                                    df_temp = df.copy()
-                                    df_temp['timestamp_dt'] = pd.to_datetime(df_temp['timestamp'])
-                                    time_diff = (df_temp['timestamp_dt'].max() - df_temp['timestamp_dt'].min()).total_seconds() / 60
-                                    if time_diff > 0:
-                                        estimated_period_minutes = int(time_diff / (len(df) - 1))
-                                        # 选择最接近的period
-                                        if estimated_period_minutes <= 5:
-                                            period = "5m"
-                                        elif estimated_period_minutes <= 15:
-                                            period = "15m"
-                                        else:
-                                            period = "1H"
-                                    else:
-                                        period = "5m"
-                                else:
-                                    period = "5m"
-                                
-                                oi_history = exchange_client.get_historical_open_interest(
-                                    symbol=symbol,
-                                    start_time=start_time_ms,
-                                    end_time=end_time_ms,
-                                    period=period,
-                                    limit=100
-                                )
-                                
-                                # 3. 多空比历史
-                                ls_history = exchange_client.get_historical_long_short_ratio(
-                                    symbol=symbol,
-                                    start_time=start_time_ms,
-                                    end_time=end_time_ms,
-                                    period=period,
-                                    limit=100
-                                )
-                                
-                                # 合并历史衍生品数据到K线数据
-                                if 'timestamp' in df.columns:
-                                    from app.services.historical_data import historical_data_manager
-                                    
-                                    derivatives_data = {
-                                        'funding_rate': pd.DataFrame(funding_history) if funding_history else pd.DataFrame(columns=['timestamp', 'funding_rate']),
-                                        'open_interest': pd.DataFrame(oi_history) if oi_history else pd.DataFrame(columns=['timestamp', 'open_interest_usd']),
-                                        'long_short_ratio': pd.DataFrame(ls_history) if ls_history else pd.DataFrame(columns=['timestamp', 'long_short_ratio'])
-                                    }
-                                    
-                                    # 转换时间戳为datetime（如果还没有）
-                                    for key in derivatives_data:
-                                        if not derivatives_data[key].empty and 'timestamp' in derivatives_data[key].columns:
-                                            derivatives_data[key]['timestamp'] = pd.to_datetime(derivatives_data[key]['timestamp'], unit='ms')
-                                    
-                                    df = historical_data_manager.merge_derivatives_to_klines(
-                                        df_klines=df,
-                                        derivatives_data=derivatives_data
-                                    )
-                                    logger.debug(f"   ✅ 预测场景：合并短期历史衍生品数据完成（{days}天）")
-                                else:
-                                    logger.warning("   ⚠️ DataFrame缺少timestamp列，无法合并历史数据，使用最新数据填充")
-                                    # 降级方案：使用最新数据
-                                    funding_data = exchange_client.get_funding_rate(symbol)
-                                    if funding_data:
-                                        df['funding_rate'] = funding_data['funding_rate']
-                                    oi_data = exchange_client.get_open_interest(symbol)
-                                    if oi_data:
-                                        df['open_interest_usd'] = oi_data['open_interest_usd']
-                                    ls_data = exchange_client.get_long_short_ratio(symbol)
-                                    if ls_data:
-                                        df['long_short_ratio'] = ls_data['long_short_ratio']
-                                
-                                # 获取订单簿（实时数据，不需要历史）
-                                ob_data = exchange_client.get_order_book(symbol, depth=5)
-                                if ob_data:
-                                    df['order_book_imbalance'] = ob_data['order_book_imbalance']
-                                    logger.debug(f"   ✅ 获取订单簿不平衡: {ob_data['order_book_imbalance']:.4f}")
-                                
-                                # 获取大单数据（实时数据，不需要历史）
-                                large_trades = exchange_client.get_large_trades(symbol, min_amount=100000.0, limit=100)
-                                if large_trades:
-                                    # 计算大单净流入（买入-卖出）
-                                    buy_amount = sum(t['amount'] for t in large_trades if t['side'] == 'buy')
-                                    sell_amount = sum(t['amount'] for t in large_trades if t['side'] == 'sell')
-                                    net_inflow = buy_amount - sell_amount
-                                    df['large_trade_net_inflow'] = net_inflow
-                                    logger.debug(f"   ✅ 计算大单净流入: {net_inflow:.2f} USDT")
-                                    
-                            except Exception as e:
-                                logger.warning(f"   ⚠️ 获取短期历史衍生品数据失败，降级使用最新数据: {e}")
-                                # 降级方案：使用最新数据（至少保证有数据，虽然不理想）
-                                funding_data = exchange_client.get_funding_rate(symbol)
-                                if funding_data:
-                                    df['funding_rate'] = funding_data['funding_rate']
-                                oi_data = exchange_client.get_open_interest(symbol)
-                                if oi_data:
-                                    df['open_interest_usd'] = oi_data['open_interest_usd']
-                                ls_data = exchange_client.get_long_short_ratio(symbol)
-                                if ls_data:
-                                    df['long_short_ratio'] = ls_data['long_short_ratio']
-                        else:
-                            # 训练场景：获取历史衍生品数据
-                            logger.debug("   🔄 训练场景：尝试获取历史衍生品数据...")
-                            
-                            try:
-                                import asyncio
-                                from app.services.historical_data import historical_data_manager
-                                
-                                # 计算需要获取的天数（基于数据量估算）
-                                if 'timestamp' in df.columns and not df.empty:
-                                    # 估算数据跨度
-                                    df_temp = df.copy()
-                                    df_temp['timestamp_dt'] = pd.to_datetime(df_temp['timestamp'])
-                                    time_span = (df_temp['timestamp_dt'].max() - df_temp['timestamp_dt'].min()).days
-                                    days = max(time_span, 120)  # 至少120天
-                                else:
-                                    days = 120  # 默认120天
-                                
-                                # 获取历史衍生品数据（同步调用异步方法）
-                                try:
-                                    # 尝试获取当前事件循环
-                                    loop = asyncio.get_event_loop()
-                                    if loop.is_running():
-                                        # 如果事件循环正在运行，使用run_coroutine_threadsafe
-                                        import concurrent.futures
-                                        future = asyncio.run_coroutine_threadsafe(
-                                            historical_data_manager.fetch_historical_derivatives_data(
-                                                symbol=symbol,
-                                                days=days
-                                            ),
-                                            loop
-                                        )
-                                        derivatives_data = future.result(timeout=30)  # 30秒超时
-                                    else:
-                                        # 如果事件循环未运行，直接运行
-                                        derivatives_data = loop.run_until_complete(
-                                            historical_data_manager.fetch_historical_derivatives_data(
-                                                symbol=symbol,
-                                                days=days
-                                            )
-                                        )
-                                except RuntimeError:
-                                    # 没有事件循环，创建新的
-                                    derivatives_data = asyncio.run(
-                                        historical_data_manager.fetch_historical_derivatives_data(
-                                            symbol=symbol,
-                                            days=days
-                                        )
-                                    )
-                                
-                                # 合并到K线数据
-                                if 'timestamp' in df.columns:
-                                    df = historical_data_manager.merge_derivatives_to_klines(
-                                        df_klines=df,
-                                        derivatives_data=derivatives_data
-                                    )
-                                    logger.debug(f"   ✅ 历史衍生品数据合并完成")
-                                else:
-                                    logger.warning("   ⚠️ DataFrame缺少timestamp列，无法合并历史数据")
-                                    
-                            except Exception as e:
-                                logger.warning(f"   ⚠️ 获取历史衍生品数据失败（不影响特征工程）: {e}")
-                                # 如果历史数据获取失败，尝试使用最新数据填充（降级方案）
-                                try:
-                                    funding_data = exchange_client.get_funding_rate(symbol)
-                                    if funding_data:
-                                        df['funding_rate'] = funding_data['funding_rate']
-                                    
-                                    oi_data = exchange_client.get_open_interest(symbol)
-                                    if oi_data:
-                                        df['open_interest_usd'] = oi_data['open_interest_usd']
-                                    
-                                    ls_data = exchange_client.get_long_short_ratio(symbol)
-                                    if ls_data:
-                                        df['long_short_ratio'] = ls_data['long_short_ratio']
-                                    
-                                    logger.debug(f"   ⚠️ 使用最新衍生品数据填充（降级方案）")
-                                except Exception as e2:
-                                    logger.debug(f"   ⚠️ 降级方案也失败: {e2}")
-                except Exception as e:
-                    logger.debug(f"   ⚠️ 获取衍生品数据失败（不影响特征工程）: {e}")
-            
-            # 开始添加特征
-            
-            # 1. 资金费率特征
-            if 'funding_rate' in df.columns:
-                funding_rate = df['funding_rate']
-                
-                # 资金费率变化率
-                new_features['funding_rate_change'] = funding_rate.pct_change(fill_method=None)
-                new_features['funding_rate_change'] = new_features['funding_rate_change'].replace([np.inf, -np.inf], np.nan)
-                
-                # 资金费率绝对值（高费率通常预示回调）
-                new_features['funding_rate_abs'] = funding_rate.abs()
-                
-                # 资金费率滚动均值（判断费率水平）
-                new_features['funding_rate_ma_8h'] = funding_rate.rolling(8).mean()  # 8小时均值（3个8小时周期）
-                new_features['funding_rate_ma_24h'] = funding_rate.rolling(24).mean()  # 24小时均值
-                
-                # 资金费率偏离度（当前费率 vs 历史均值）
-                new_features['funding_rate_deviation'] = funding_rate - new_features['funding_rate_ma_24h']
-                
-                # 极端资金费率标识（>0.01%或<-0.01%通常预示反转）
-                new_features['extreme_funding_rate'] = (
-                    (funding_rate > 0.0001) | (funding_rate < -0.0001)
-                ).astype(int)
-            else:
-                logger.debug("   ⚠️ funding_rate列不存在，跳过资金费率特征")
-            
-            # 2. 持仓量（Open Interest）特征
-            if 'open_interest' in df.columns or 'open_interest_usd' in df.columns:
-                oi = df.get('open_interest_usd', df.get('open_interest', pd.Series(dtype=float)))
-                
-                if not oi.empty:
-                    # OI变化率
-                    oi_safe = oi.replace(0, np.nan)
-                    new_features['oi_change'] = oi_safe.pct_change(fill_method=None)
-                    new_features['oi_change'] = new_features['oi_change'].replace([np.inf, -np.inf], np.nan)
-                    
-                    # OI滚动均值
-                    new_features['oi_ma_20'] = oi.rolling(20).mean()
-                    new_features['oi_ma_50'] = oi.rolling(50).mean()
-                    
-                    # OI相对位置（当前OI vs 历史均值）
-                    oi_ma_50_safe = new_features['oi_ma_50'].replace(0, np.nan)
-                    new_features['oi_ratio'] = oi / (oi_ma_50_safe + 1e-10)
-                    
-                    # 价格与OI背离（重要信号）
-                    if 'close' in df.columns:
-                        close_safe = df['close'].replace(0, np.nan)
-                        price_change = close_safe.pct_change(fill_method=None)
-                        price_change = price_change.replace([np.inf, -np.inf], np.nan)
-                        
-                        # 价格上涨+OI上涨=强趋势；价格上涨+OI下跌=弱趋势
-                        new_features['price_oi_divergence'] = (
-                            price_change.rolling(5).mean() * new_features['oi_change'].rolling(5).mean()
-                        )
-                        
-                        # 背离标识（价格涨但OI跌，或价格跌但OI涨）
-                        price_trend = (price_change.rolling(5).mean() > 0).astype(int)
-                        oi_trend = (new_features['oi_change'].rolling(5).mean() > 0).astype(int)
-                        new_features['price_oi_divergence_signal'] = (price_trend != oi_trend).astype(int)
-            else:
-                logger.debug("   ⚠️ open_interest列不存在，跳过持仓量特征")
-            
-            # 3. 多空持仓人数比特征
-            if 'long_short_ratio' in df.columns:
-                ls_ratio = df['long_short_ratio']
-                
-                # 多空比变化率
-                ls_ratio_safe = ls_ratio.replace(0, np.nan)
-                new_features['ls_ratio_change'] = ls_ratio_safe.pct_change(fill_method=None)
-                new_features['ls_ratio_change'] = new_features['ls_ratio_change'].replace([np.inf, -np.inf], np.nan)
-                
-                # 多空比滚动均值
-                new_features['ls_ratio_ma_20'] = ls_ratio.rolling(20).mean()
-                
-                # 多空比偏离度
-                new_features['ls_ratio_deviation'] = ls_ratio - new_features['ls_ratio_ma_20']
-                
-                # 极端多空比（>1.5或<0.67通常预示反转）
-                new_features['extreme_ls_ratio'] = (
-                    (ls_ratio > 1.5) | (ls_ratio < 0.67)
-                ).astype(int)
-            else:
-                logger.debug("   ⚠️ long_short_ratio列不存在，跳过多空比特征")
-            
-            # 4. 订单簿不平衡特征
-            if 'order_book_imbalance' in df.columns:
-                ob_imbalance = df['order_book_imbalance']
-                
-                # 订单簿不平衡度（已在数据获取时计算）
-                new_features['order_book_imbalance'] = ob_imbalance
-                
-                # 订单簿不平衡度变化
-                new_features['ob_imbalance_change'] = ob_imbalance.diff()
-                
-                # 订单簿不平衡度滚动均值
-                new_features['ob_imbalance_ma_5'] = ob_imbalance.rolling(5).mean()
-                
-                # 极端订单簿不平衡（买单墙厚或卖单墙厚）
-                new_features['extreme_ob_imbalance'] = (
-                    (ob_imbalance > 0.3) | (ob_imbalance < -0.3)
-                ).astype(int)
-            else:
-                logger.debug("   ⚠️ order_book_imbalance列不存在，跳过订单簿特征")
-            
-            # 5. 大单净流入特征
-            if 'large_trade_net_inflow' in df.columns:
-                net_inflow = df['large_trade_net_inflow']
-                
-                # 大单净流入（已在数据获取时计算）
-                new_features['large_trade_net_inflow'] = net_inflow
-                
-                # 大单净流入变化
-                new_features['large_trade_inflow_change'] = net_inflow.diff()
-                
-                # 大单净流入滚动总和（累积效应）
-                for window in [5, 10, 20]:
-                    new_features[f'large_trade_cumulative_inflow_{window}'] = net_inflow.rolling(window).sum()
-                
-                # 大单净流入强度（相对于成交量）
-                if 'volume' in df.columns:
-                    volume_safe = df['volume'].replace(0, np.nan)
-                    new_features['large_trade_inflow_intensity'] = net_inflow.abs() / (volume_safe + 1e-10)
-            else:
-                logger.debug("   ⚠️ large_trade_net_inflow列不存在，跳过大单特征")
-            
-            # 一次性添加所有特征
-            if new_features:
-                df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
-                logger.debug(f"   ✅ 衍生品特征添加完成: {len(new_features)}个特征")
-            else:
-                logger.debug("   ⚠️ 未找到衍生品数据列，跳过衍生品特征（这是正常的，如果数据源不包含这些字段）")
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"❌ 添加衍生品特征失败: {e}")
-            logger.error(traceback.format_exc())
-            return df
 
 # 全局特征工程器实例
 feature_engineer = FeatureEngineer()

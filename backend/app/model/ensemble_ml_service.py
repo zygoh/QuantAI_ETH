@@ -537,6 +537,10 @@ class EnsembleMLService(MLService):
                 logger.error(f"{timeframe} 特征列未找到，无法复用")
                 return pd.DataFrame(), pd.Series()
             
+            # 🔧 防御性过滤：移除无效列
+            invalid_cols = {'index', 'timestamp', 'date', 'label', 'target'}
+            feature_columns = [f for f in feature_columns if f not in invalid_cols]
+            
             X = df[feature_columns].copy()
             y = df['label'].copy()
             
@@ -584,6 +588,10 @@ class EnsembleMLService(MLService):
             if not feature_columns:
                 logger.error(f"❌ {timeframe} 特征列未找到，无法构造序列输入")
                 return np.array([]), np.array([])
+            
+            # 🔧 防御性过滤：移除无效列
+            invalid_cols = {'index', 'timestamp', 'date', 'label', 'target'}
+            feature_columns = [f for f in feature_columns if f not in invalid_cols]
             
             # 🔥 优化1：预先转换为NumPy数组（避免重复DataFrame切片）
             logger.debug(f"🔧 {timeframe} 开始构造序列输入（seq_len={seq_len}）...")
@@ -785,6 +793,20 @@ class EnsembleMLService(MLService):
             
             logger.info(f"✅ 三份数据处理完成: LGB={len(X_lgb)}, XGB={len(X_xgb)}, CAT={len(X_cat)}")
             
+            # 🔧 安全回退：如果差异化数据获取失败，使用LightGBM数据作为备份
+            if len(X_xgb) == 0:
+                logger.warning(f"⚠️ XGBoost数据为空，回退使用LightGBM数据")
+                X_xgb, y_xgb = X_lgb.copy(), y_lgb.copy()
+                X_xgb_scaled = X_lgb_scaled.copy() if isinstance(X_lgb_scaled, np.ndarray) else X_lgb_scaled.copy()
+            if len(X_cat) == 0:
+                logger.warning(f"⚠️ CatBoost数据为空，回退使用LightGBM数据")
+                X_cat, y_cat = X_lgb.copy(), y_lgb.copy()
+                X_cat_scaled = X_lgb_scaled.copy() if isinstance(X_lgb_scaled, np.ndarray) else X_lgb_scaled.copy()
+            
+            # 🔧 最终验证：确保LightGBM数据足够
+            if len(X_lgb) < 100:
+                raise ValueError(f"LightGBM训练数据不足 ({len(X_lgb)}条)，需要至少100条，请检查数据源")
+            
             # 🆕 构造序列输入（仅用于Informer-2）
             X_seq_lgb, y_seq_lgb = None, None
             if self.enable_informer2 and TORCH_AVAILABLE:
@@ -967,8 +989,15 @@ class EnsembleMLService(MLService):
                 
                 # 优化LightGBM
                 logger.info(f"   🔧 [1/{'3' if self.optimize_all_models else '1'}] 优化LightGBM...")
+                
+                # 数据验证：确保训练数据非空
+                lgb_train_data = X_lgb_train.values if isinstance(X_lgb_train, pd.DataFrame) else X_lgb_train
+                if lgb_train_data.size == 0:
+                    raise ValueError(f"LightGBM训练数据为空，请检查数据准备流程")
+                logger.debug(f"   LightGBM训练数据形状: {lgb_train_data.shape}")
+                
                 lgb_optimizer = HyperparameterOptimizer(
-                    X=X_lgb_train.values if isinstance(X_lgb_train, pd.DataFrame) else X_lgb_train,
+                    X=lgb_train_data,
                     y=y_lgb_train,
                     timeframe=timeframe,
                     model_type="lightgbm",
@@ -1239,53 +1268,77 @@ class EnsembleMLService(MLService):
             # 5️⃣ 评估集成模型 - 使用时间序列交叉验证
             logger.info(f"📊 {timeframe} 时间序列交叉验证评估...")
             
-            # 🆕 时间序列5折交叉验证（更可靠的评估）
-            tscv = TimeSeriesSplit(n_splits=5)
-            cv_scores = []
+            # 🆕 时间序列交叉验证（更可靠的评估）
+            # 🔑 修复：根据验证集大小动态调整折数，确保每个fold至少有2个训练样本
+            val_size = len(meta_features_val)
+            # 计算合适的折数：每个fold至少需要2个训练样本和1个测试样本
+            max_splits = min(5, max(1, (val_size - 1) // 2))
+            if max_splits < 2:
+                logger.warning(f"⚠️ 验证集太小（{val_size}个样本），跳过交叉验证")
+                cv_scores = []
+            else:
+                tscv = TimeSeriesSplit(n_splits=max_splits)
+                cv_scores = []
             
-            # 对验证集进行交叉验证
-            for fold, (train_idx, test_idx) in enumerate(tscv.split(meta_features_val), 1):
-                meta_train, meta_test = meta_features_val[train_idx], meta_features_val[test_idx]
-                y_train, y_test = meta_labels_val.iloc[train_idx], meta_labels_val.iloc[test_idx]
-                
-                # 训练元学习器（每个fold）- 与最终模型完全一致的配置
-                fold_meta = lgb.LGBMClassifier(
-                    n_estimators=50, max_depth=3, learning_rate=0.15,
-                    num_leaves=7, min_child_samples=30, subsample=0.7,
-                    colsample_bytree=0.7, reg_alpha=0.3, reg_lambda=0.3,
-                    random_state=42, verbose=-1
-                )
-                
-                # 🔑 HOLD惩罚（与最终模型一致，使用相同的动态策略）
-                fold_weights = compute_sample_weight('balanced', y_train)
-                fold_hold_ratio = (y_train == 1).sum() / len(y_train)
-                
-                # 动态惩罚（平衡策略，与最终模型完全一致）
-                if fold_hold_ratio > 0.60:
-                    fold_penalty = 0.45
-                elif fold_hold_ratio > 0.50:
-                    fold_penalty = 0.55
-                elif fold_hold_ratio > 0.40:
-                    fold_penalty = 0.65
-                else:
-                    fold_penalty = 0.75
-                
-                fold_hold_penalty = np.where(y_train == 1, fold_penalty, 1.0)
-                fold_sample_weights = fold_weights * fold_hold_penalty
-                
-                fold_meta.fit(meta_train, y_train, sample_weight=fold_sample_weights)
-                fold_pred = fold_meta.predict(meta_test)
-                fold_acc = accuracy_score(y_test, fold_pred)
-                cv_scores.append(fold_acc)
-                
-                logger.debug(f"  Fold {fold}: 准确率={fold_acc:.4f}")
+                # 对验证集进行交叉验证
+                for fold, (train_idx, test_idx) in enumerate(tscv.split(meta_features_val), 1):
+                    meta_train, meta_test = meta_features_val[train_idx], meta_features_val[test_idx]
+                    y_train, y_test = meta_labels_val.iloc[train_idx], meta_labels_val.iloc[test_idx]
+                    
+                    # 🔑 修复：检查训练集大小，至少需要2个样本
+                    if len(meta_train) < 2:
+                        logger.warning(f"⚠️ Fold {fold} 训练集太小（{len(meta_train)}个样本），跳过该fold")
+                        continue
+                    
+                    if len(meta_test) < 1:
+                        logger.warning(f"⚠️ Fold {fold} 测试集太小（{len(meta_test)}个样本），跳过该fold")
+                        continue
+                        
+                    # 训练元学习器（每个fold）- 与最终模型完全一致的配置
+                    fold_meta = lgb.LGBMClassifier(
+                        n_estimators=50, max_depth=3, learning_rate=0.15,
+                        num_leaves=7, min_child_samples=30, subsample=0.7,
+                        colsample_bytree=0.7, reg_alpha=0.3, reg_lambda=0.3,
+                        random_state=42, verbose=-1
+                    )
+                    
+                    # 🔑 HOLD惩罚（与最终模型一致，使用相同的动态策略）
+                    fold_weights = compute_sample_weight('balanced', y_train)
+                    fold_hold_ratio = (y_train == 1).sum() / len(y_train)
+                    
+                    # 动态惩罚（平衡策略，与最终模型完全一致）
+                    if fold_hold_ratio > 0.60:
+                        fold_penalty = 0.45
+                    elif fold_hold_ratio > 0.50:
+                        fold_penalty = 0.55
+                    elif fold_hold_ratio > 0.40:
+                        fold_penalty = 0.65
+                    else:
+                        fold_penalty = 0.75
+                    
+                    fold_hold_penalty = np.where(y_train == 1, fold_penalty, 1.0)
+                    fold_sample_weights = fold_weights * fold_hold_penalty
+                    
+                    try:
+                        fold_meta.fit(meta_train, y_train, sample_weight=fold_sample_weights)
+                        fold_pred = fold_meta.predict(meta_test)
+                        fold_acc = accuracy_score(y_test, fold_pred)
+                        cv_scores.append(fold_acc)
+                        logger.debug(f"  Fold {fold}: 准确率={fold_acc:.4f}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Fold {fold} 训练失败: {e}，跳过该fold")
+                        continue
             
             # 交叉验证准确率
-            cv_mean = np.mean(cv_scores)
-            cv_std = np.std(cv_scores)
-            
-            logger.info(f"✅ {timeframe} 时间序列CV结果: {cv_mean:.4f} ± {cv_std:.4f}")
-            logger.info(f"   CV分数: {[f'{s:.4f}' for s in cv_scores]}")
+            if cv_scores:
+                cv_mean = np.mean(cv_scores)
+                cv_std = np.std(cv_scores)
+                logger.info(f"✅ {timeframe} 时间序列CV结果: {cv_mean:.4f} ± {cv_std:.4f}")
+                logger.info(f"   CV分数: {[f'{s:.4f}' for s in cv_scores]}")
+            else:
+                logger.warning(f"⚠️ {timeframe} 交叉验证无法执行（验证集太小或所有fold都失败）")
+                cv_mean = 0.0
+                cv_std = 0.0
             
             # 🔑 修复数据泄露：使用独立测试集评估最终模型（而不是验证集）
             logger.info(f"📊 使用独立测试集评估元学习器（修复数据泄露）...")
@@ -1352,8 +1405,8 @@ class EnsembleMLService(MLService):
             
             # 🆕 模型稳定性指标
             cv_stability = float(cv_std / cv_mean if cv_mean > 0 else 0)  # 变异系数
-            cv_min = float(np.min(cv_scores))
-            cv_max = float(np.max(cv_scores))
+            cv_min = float(np.min(cv_scores)) if cv_scores else 0.0
+            cv_max = float(np.max(cv_scores)) if cv_scores else 0.0
             
             # 基础模型一致性（使用验证集预测结果）
             model_agreement = float(np.mean([
@@ -2523,7 +2576,7 @@ class EnsembleMLService(MLService):
             预测结果，如果模型训练中则返回None
         """
         try:
-            # � 检生产级别：后台训练不影响预测
+            #  检生产级别：后台训练不影响预测
             # 训练和预测并行运行，训练完成后热更新模型
             if self.background_training:
                 training_tfs = [tf for tf, status in self.training_in_progress.items() if status]
@@ -2558,6 +2611,16 @@ class EnsembleMLService(MLService):
                 logger.error(f"{timeframe} 特征列未找到")
                 return None
             
+            # 🔧 防御性过滤：移除无效列（确保预测时数据可用）
+            invalid_cols = {'index', 'timestamp', 'date', 'label', 'target'}
+            feature_columns = [f for f in feature_columns if f not in invalid_cols]
+            
+            # 验证特征列是否存在于processed_data中
+            missing_cols = [f for f in feature_columns if f not in processed_data.columns]
+            if missing_cols:
+                logger.error(f"❌ {timeframe} 特征列缺失: {missing_cols[:5]}{'...' if len(missing_cols) > 5 else ''}")
+                return None
+            
             X = processed_data.iloc[-1:][feature_columns]
             if len(X) == 0:
                 return None
@@ -2573,6 +2636,25 @@ class EnsembleMLService(MLService):
                 X_pred = X_scaled
             else:
                 X_pred = X_scaled.iloc[[-1]] if hasattr(X_scaled, 'iloc') else X_scaled
+            
+            # 🔧 验证特征数量：检查模型期望的特征数与输入是否匹配
+            n_features_input = X_pred.shape[-1] if len(X_pred.shape) > 1 else X_pred.shape[0]
+            
+            # 检查所有基础模型的特征数量
+            model_checks = []
+            for model_name, model in [('lgb', models['lgb']), ('xgb', models.get('xgb')), ('cat', models.get('cat'))]:
+                if model and hasattr(model, 'n_features_'):
+                    n_features_model = model.n_features_
+                    if n_features_model != n_features_input:
+                        model_checks.append(f"{model_name}(期望{n_features_model})")
+            
+            if model_checks:
+                logger.error(f"❌ {timeframe} 模型特征数量不匹配: 输入{n_features_input}个特征")
+                logger.error(f"   不匹配的模型: {', '.join(model_checks)}")
+                logger.error(f"   原因：旧模型训练时包含了无效列'index'，但预测时已过滤")
+                logger.error(f"   解决方案：删除旧模型文件并重新训练")
+                logger.error(f"   命令：Remove-Item \"models\\ETH_USDT_{timeframe}_*\" -Force")
+                return None
             
             # 🔑 基础模型预测（使用短键名）
             lgb_proba = models['lgb'].predict_proba(X_pred)[0]
@@ -2734,12 +2816,13 @@ class EnsembleMLService(MLService):
     
     def _save_ensemble_models(self, timeframe: str):
         """
-        保存集成模型（生产级别：原子性保存）
+        保存集成模型（生产级别：原子性保存 + 热部署）
         
         使用临时文件+原子性重命名，确保：
         1. 保存过程中不影响正在使用的模型
         2. 保存失败不会破坏现有模型
-        3. 保存成功后立即可用
+        3. 保存成功后立即可用（热部署）
+        4. 旧模型自动备份到 models/old/YYYY-MM-DD_HH-MM-SS/
         """
         try:
             models = self.ensemble_models[timeframe]
@@ -2749,6 +2832,29 @@ class EnsembleMLService(MLService):
             # 🔥 使用临时目录进行原子性保存
             # 🔧 修复：处理SYMBOL中的/字符（如"ETH/USDT"），替换为_避免路径问题
             safe_symbol = settings.SYMBOL.replace('/', '_')
+            
+            # 🔑 备份旧模型到 models/old/YYYY-MM-DD_HH-MM-SS/
+            old_model_files = []
+            backup_dir = None
+            if model_dir.exists():
+                # 查找现有的模型文件
+                pattern = f"{safe_symbol}_{timeframe}_*"
+                existing_files = list(model_dir.glob(pattern))
+                if existing_files:
+                    # 创建备份目录（使用当前时间戳）
+                    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+                    old_dir = model_dir.parent / 'old' / timestamp
+                    old_dir.mkdir(parents=True, exist_ok=True)
+                    backup_dir = old_dir
+                    
+                    # 备份所有相关文件
+                    for file_path in existing_files:
+                        backup_path = old_dir / file_path.name
+                        shutil.copy2(file_path, backup_path)
+                        old_model_files.append(file_path.name)
+                    
+                    if old_model_files:
+                        logger.info(f"📦 {timeframe} 旧模型已备份到: {old_dir} ({len(old_model_files)}个文件)")
             
             with tempfile.TemporaryDirectory(dir=model_dir) as temp_dir:
                 temp_path = Path(temp_dir)
@@ -2765,7 +2871,7 @@ class EnsembleMLService(MLService):
                 for short_name in model_mapping:
                     if short_name in models:
                         temp_file = temp_path / f"{safe_symbol}_{timeframe}_{short_name}_model.pkl"
-                        temp_file.parent.mkdir(parents=True, exist_ok=True)  # 🔧 确保目录存在
+                        temp_file.parent.mkdir(parents=True, exist_ok=True)
                         with open(temp_file, 'wb') as f:
                             pickle.dump(models[short_name], f)
                         saved_count += 1
@@ -2773,7 +2879,7 @@ class EnsembleMLService(MLService):
                 # 保存Informer-2
                 if 'inf' in models and TORCH_AVAILABLE:
                     temp_file = temp_path / f"{safe_symbol}_{timeframe}_inf_model.pt"
-                    temp_file.parent.mkdir(parents=True, exist_ok=True)  # 🔧 确保目录存在
+                    temp_file.parent.mkdir(parents=True, exist_ok=True)
                     with open(temp_file, 'wb') as f:
                         pickle.dump(models['inf'], f)
                     saved_count += 1
@@ -2781,14 +2887,14 @@ class EnsembleMLService(MLService):
                 # 保存scaler和特征列表
                 if timeframe in self.scalers:
                     temp_file = temp_path / f"{safe_symbol}_{timeframe}_scaler.pkl"
-                    temp_file.parent.mkdir(parents=True, exist_ok=True)  # 🔧 确保目录存在
+                    temp_file.parent.mkdir(parents=True, exist_ok=True)
                     with open(temp_file, 'wb') as f:
                         pickle.dump(self.scalers[timeframe], f)
                     saved_count += 1
                 
                 if timeframe in self.feature_columns_dict:
                     temp_file = temp_path / f"{safe_symbol}_{timeframe}_features.pkl"
-                    temp_file.parent.mkdir(parents=True, exist_ok=True)  # 🔧 确保目录存在
+                    temp_file.parent.mkdir(parents=True, exist_ok=True)
                     with open(temp_file, 'wb') as f:
                         pickle.dump(self.feature_columns_dict[timeframe], f)
                     saved_count += 1
@@ -2796,11 +2902,17 @@ class EnsembleMLService(MLService):
                 # 🔥 原子性移动：一次性替换所有文件
                 for temp_file in temp_path.glob(f"{safe_symbol}_{timeframe}_*"):
                     target_file = model_dir / temp_file.name
-                    # Windows下使用replace实现原子性替换
-                    target_file.parent.mkdir(parents=True, exist_ok=True)  # 🔧 确保目标目录存在
+                    target_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(temp_file), str(target_file))
                 
                 logger.info(f"✅ {timeframe} 集成模型保存完成（{saved_count}个文件，原子性更新）")
+            
+            # 🔥 热部署：重新加载模型（确保使用最新模型）
+            logger.info(f"🔄 {timeframe} 开始热部署：重新加载模型...")
+            if self._load_ensemble_models(timeframe):
+                logger.info(f"✅ {timeframe} 热部署完成：新模型已生效")
+            else:
+                logger.warning(f"⚠️ {timeframe} 热部署失败：模型加载失败，但文件已保存")
             
         except Exception as e:
             logger.error(f"保存集成模型失败: {e}")
@@ -2860,7 +2972,14 @@ class EnsembleMLService(MLService):
             features_path = model_dir / f"{safe_symbol}_{timeframe}_features.pkl"
             if features_path.exists():
                 with open(features_path, 'rb') as f:
-                    self.feature_columns_dict[timeframe] = pickle.load(f)
+                    raw_features = pickle.load(f)
+                    # 过滤掉无效列（如'index'等非特征列）
+                    invalid_cols = {'index', 'timestamp', 'date', 'label', 'target'}
+                    cleaned_features = [f for f in raw_features if f not in invalid_cols]
+                    if len(cleaned_features) != len(raw_features):
+                        removed = set(raw_features) - set(cleaned_features)
+                        logger.warning(f"⚠️ {timeframe} 特征列过滤: 移除了无效列 {removed}")
+                    self.feature_columns_dict[timeframe] = cleaned_features
             
             # 🔓 模型加载成功，标记为就绪
             self.models_ready[timeframe] = True
@@ -3223,4 +3342,3 @@ class EnsembleMLService(MLService):
 
 # 全局集成ML服务实例
 ensemble_ml_service = EnsembleMLService()
-

@@ -1,6 +1,6 @@
 -- =====================================================
 -- PostgreSQL + TimescaleDB 初始化脚本
--- QuantAI-ETH 交易系统数据库表结构
+-- 量化交易系统数据库表结构
 -- =====================================================
 -- 
 -- 说明：
@@ -224,7 +224,7 @@ CREATE INDEX IF NOT EXISTS idx_virtual_positions_symbol_status
 DO $$ 
 BEGIN
     RAISE NOTICE '====================================================';
-    RAISE NOTICE '✅ QuantAI-ETH 数据库初始化完成！';
+    RAISE NOTICE '✅ 数据库初始化完成！';
     RAISE NOTICE '====================================================';
     RAISE NOTICE '';
     RAISE NOTICE '📊 已创建的表：';

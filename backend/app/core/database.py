@@ -4,6 +4,7 @@ PostgreSQL + TimescaleDB 数据库管理
 """
 import asyncio
 import logging
+import traceback
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -119,7 +120,7 @@ class PostgreSQLManager:
                 # 5. 添加表和字段注释（klines表）- 每个COMMENT语句单独执行
                 await conn.execute(text("COMMENT ON TABLE klines IS 'K线数据表：存储历史K线数据，用于模型训练和特征工程。使用BIGINT存储毫秒时间戳（不使用hypertable）'"))
                 await conn.execute(text("COMMENT ON COLUMN klines.time IS '开盘时间（毫秒时间戳）'"))
-                await conn.execute(text("COMMENT ON COLUMN klines.symbol IS '交易对（如：ETH/USDT）'"))
+                await conn.execute(text("COMMENT ON COLUMN klines.symbol IS '交易对（如：BTC/USDT）'"))
                 await conn.execute(text("COMMENT ON COLUMN klines.interval IS '时间周期（3m, 5m, 15m等）'"))
                 await conn.execute(text("COMMENT ON COLUMN klines.open IS '开盘价'"))
                 await conn.execute(text("COMMENT ON COLUMN klines.high IS '最高价'"))
@@ -833,6 +834,176 @@ class PostgreSQLManager:
         except Exception as e:
             logger.error(f"获取虚拟仓位失败: {e}")
             return None
+    
+    async def get_virtual_positions_statistics(self, symbol: str = None) -> Dict[str, Any]:
+        """
+        获取虚拟仓位历史统计数据
+        
+        Args:
+            symbol: 交易对符号（可选，不传则统计所有）
+        
+        Returns:
+            统计数据字典，包含：
+            - total_trades: 总交易次数
+            - win_count: 盈利次数
+            - loss_count: 亏损次数
+            - win_rate: 胜率
+            - total_pnl: 总盈亏
+            - avg_pnl: 平均盈亏
+            - max_profit: 最大单笔盈利
+            - max_loss: 最大单笔亏损
+            - avg_hold_time_minutes: 平均持仓时间（分钟）
+            - avg_signal_delay_seconds: 信号产生到开仓的平均延迟（秒）
+            - recent_trades: 最近10笔交易详情
+        """
+        try:
+            async with self.SessionLocal() as session:
+                if symbol:
+                    query = text("""
+                        SELECT 
+                            vp.id,
+                            vp.symbol,
+                            vp.side,
+                            vp.entry_price,
+                            vp.exit_price,
+                            vp.quantity,
+                            vp.entry_time,
+                            vp.exit_time,
+                            vp.pnl,
+                            vp.pnl_percent,
+                            vp.signal_id,
+                            ts.timestamp as signal_time
+                        FROM virtual_positions vp
+                        LEFT JOIN trading_signals ts ON vp.signal_id = ts.id::text
+                        WHERE vp.status = 'CLOSED' AND vp.symbol = :symbol
+                        ORDER BY vp.exit_time DESC
+                    """)
+                    result = await session.execute(query, {'symbol': symbol})
+                else:
+                    query = text("""
+                        SELECT 
+                            vp.id,
+                            vp.symbol,
+                            vp.side,
+                            vp.entry_price,
+                            vp.exit_price,
+                            vp.quantity,
+                            vp.entry_time,
+                            vp.exit_time,
+                            vp.pnl,
+                            vp.pnl_percent,
+                            vp.signal_id,
+                            ts.timestamp as signal_time
+                        FROM virtual_positions vp
+                        LEFT JOIN trading_signals ts ON vp.signal_id = ts.id::text
+                        WHERE vp.status = 'CLOSED'
+                        ORDER BY vp.exit_time DESC
+                    """)
+                    result = await session.execute(query)
+                
+                rows = result.fetchall()
+                
+                if not rows:
+                    return {
+                        'total_trades': 0,
+                        'win_count': 0,
+                        'loss_count': 0,
+                        'win_rate': 0.0,
+                        'total_pnl': 0.0,
+                        'avg_pnl': 0.0,
+                        'max_profit': 0.0,
+                        'max_loss': 0.0,
+                        'avg_hold_time_minutes': 0.0,
+                        'avg_signal_delay_seconds': 0.0,
+                        'recent_trades': []
+                    }
+                
+                total_trades = len(rows)
+                win_count = 0
+                loss_count = 0
+                total_pnl = 0.0
+                max_profit = 0.0
+                max_loss = 0.0
+                hold_times = []
+                signal_delays = []
+                recent_trades = []
+                
+                for row in rows:
+                    pnl = float(row[8]) if row[8] else 0.0
+                    pnl_percent = float(row[9]) if row[9] else 0.0
+                    
+                    total_pnl += pnl
+                    
+                    if pnl > 0:
+                        win_count += 1
+                        max_profit = max(max_profit, pnl)
+                    elif pnl < 0:
+                        loss_count += 1
+                        max_loss = min(max_loss, pnl)
+                    
+                    entry_time = row[6]
+                    exit_time = row[7]
+                    if entry_time and exit_time:
+                        hold_time = (exit_time - entry_time).total_seconds() / 60
+                        hold_times.append(hold_time)
+                    
+                    signal_time = row[11]
+                    if signal_time and entry_time:
+                        delay = (entry_time - signal_time).total_seconds()
+                        if delay >= 0:
+                            signal_delays.append(delay)
+                    
+                    if len(recent_trades) < 10:
+                        recent_trades.append({
+                            'id': row[0],
+                            'symbol': row[1],
+                            'side': row[2],
+                            'entry_price': float(row[3]) if row[3] else 0.0,
+                            'exit_price': float(row[4]) if row[4] else 0.0,
+                            'quantity': float(row[5]) if row[5] else 0.0,
+                            'entry_time': entry_time.isoformat() if entry_time else None,
+                            'exit_time': exit_time.isoformat() if exit_time else None,
+                            'pnl': pnl,
+                            'pnl_percent': pnl_percent,
+                            'signal_delay_seconds': (entry_time - signal_time).total_seconds() if signal_time and entry_time else None
+                        })
+                
+                win_rate = (win_count / total_trades * 100) if total_trades > 0 else 0.0
+                avg_pnl = total_pnl / total_trades if total_trades > 0 else 0.0
+                avg_hold_time = sum(hold_times) / len(hold_times) if hold_times else 0.0
+                avg_signal_delay = sum(signal_delays) / len(signal_delays) if signal_delays else 0.0
+                
+                return {
+                    'total_trades': total_trades,
+                    'win_count': win_count,
+                    'loss_count': loss_count,
+                    'win_rate': round(win_rate, 2),
+                    'total_pnl': round(total_pnl, 2),
+                    'avg_pnl': round(avg_pnl, 2),
+                    'max_profit': round(max_profit, 2),
+                    'max_loss': round(max_loss, 2),
+                    'avg_hold_time_minutes': round(avg_hold_time, 2),
+                    'avg_signal_delay_seconds': round(avg_signal_delay, 2),
+                    'recent_trades': recent_trades
+                }
+                
+        except Exception as e:
+            logger.error(f"获取虚拟仓位统计失败: {e}")
+            logger.error(traceback.format_exc())
+            return {
+                'total_trades': 0,
+                'win_count': 0,
+                'loss_count': 0,
+                'win_rate': 0.0,
+                'total_pnl': 0.0,
+                'avg_pnl': 0.0,
+                'max_profit': 0.0,
+                'max_loss': 0.0,
+                'avg_hold_time_minutes': 0.0,
+                'avg_signal_delay_seconds': 0.0,
+                'recent_trades': [],
+                'error': str(e)
+            }
     
     async def close(self):
         """关闭连接"""

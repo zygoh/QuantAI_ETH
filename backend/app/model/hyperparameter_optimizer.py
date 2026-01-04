@@ -1618,6 +1618,29 @@ class HyperparameterOptimizer:
                 # 预测并评估
                 if self.model_type != "informer2":
                     y_pred = model.predict(X_val)
+                    
+                    # 🔑 修复：确保 y_pred 格式正确（1D 标签数组）
+                    # 如果 y_pred 是 2D（概率矩阵），转换为类别标签
+                    if y_pred.ndim > 1:
+                        y_pred = np.argmax(y_pred, axis=1)
+                    # 确保 y_pred 是 1D 数组
+                    y_pred = y_pred.ravel()
+                
+                # 🔑 修复：确保 y_val 和 y_pred 格式一致（1D 标签数组）
+                # 确保 y_val 是 1D 标签数组（不是 one-hot 编码）
+                if y_val.ndim > 1:
+                    y_val = np.argmax(y_val, axis=1)
+                y_val = y_val.ravel()
+                
+                # 确保 y_pred 是 1D 数组（Informer2 可能已经是，但确保一致性）
+                if y_pred.ndim > 1:
+                    y_pred = np.argmax(y_pred, axis=1)
+                y_pred = y_pred.ravel()
+                
+                # 确保数据类型一致
+                y_val = y_val.astype(int)
+                y_pred = y_pred.astype(int)
+                    
                 acc = accuracy_score(y_val, y_pred)
                 cv_scores.append(acc)
                 

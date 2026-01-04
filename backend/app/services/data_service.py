@@ -156,22 +156,9 @@ class DataService:
             symbol = settings.SYMBOL
             leverage = settings.LEVERAGE
             
-            # 尝试修改保证金模式为全仓（可能已经是全仓模式，失败不影响）
-            try:
-                self.exchange_client.change_margin_type(symbol, "CROSSED")
-                logger.info(f"✓ 保证金模式设置成功: {symbol} CROSSED")
-            except Exception as e:
-                logger.warning(f"⚠️ 保证金模式设置失败（可能已是全仓模式，可忽略）: {e}")
-            
-            # 设置杠杆倍数
-            try:
-                result = self.exchange_client.change_leverage(symbol, leverage)
-                if result:
-                    logger.info(f"✓ 杠杆设置成功: {symbol} {leverage}x")
-                else:
-                    logger.warning(f"⚠️ 杠杆设置返回空结果（可能已设置，可忽略）")
-            except Exception as e:
-                logger.warning(f"⚠️ 杠杆设置失败（可能已设置，可忽略）: {e}")
+            # 🔥 模拟交易模式：不设置杠杆（不需要API key）
+            # 杠杆设置仅在虚拟交易中使用配置值
+            logger.info(f"📊 使用配置杠杆: {symbol} {leverage}x（模拟模式）")
                 
         except Exception as e:
             logger.warning(f"⚠️ 杠杆设置过程出现异常（不影响系统运行）: {e}")
@@ -434,10 +421,12 @@ class DataService:
                     for idx, callback in enumerate(self.data_callbacks):
                         try:
                             logger.debug(f"   调用回调 {idx+1}/{len(self.data_callbacks)}: {callback.__name__ if hasattr(callback, '__name__') else type(callback).__name__}")
-                            asyncio.run_coroutine_threadsafe(
+                            future = asyncio.run_coroutine_threadsafe(
                                 callback(kline),
                                 self.loop
                             )
+                            # ✅ 注册回调处理异常，避免 "Future exception was never retrieved"
+                            future.add_done_callback(lambda f: f.exception())
                         except Exception as e:
                             logger.error(f"   ❌ 回调 {idx+1} 调用失败: {e}")
             else:
@@ -453,8 +442,8 @@ class DataService:
         
         Args:
             data: WebSocket返回的数据，格式因交易所而异：
-                  - Binance: {"e":"24hrTicker", "s":"ETHUSDT", "c":"2000.5", ...} 或 {"stream":"...", "data":{...}}
-                  - OKX: [{"instId": "ETH-USDT-SWAP", "last": "2000.5", ...}] 或 {"data": [...]}
+                  - Binance: {"e":"24hrTicker", "s":"SYMBOL", "c":"2000.5", ...} 或 {"stream":"...", "data":{...}}
+                  - OKX: [{"instId": "SYMBOL-SWAP", "last": "2000.5", ...}] 或 {"data": [...]}
         """
         try:
             ticker_item = None
@@ -505,7 +494,7 @@ class DataService:
                     logger.warning("⚠️ ticker数据中缺少symbol字段(s)")
                     return
                 
-                # 转换为标准格式（ETHUSDT -> ETH/USDT）
+                # 转换为标准格式
                 symbol = SymbolMapper.to_standard_format(binance_symbol, "BINANCE")
                 
                 # 获取最新价格
@@ -524,7 +513,7 @@ class DataService:
                     logger.warning("⚠️ ticker数据中缺少instId字段")
                     return
                 
-                # 转换为标准格式（ETH-USDT-SWAP -> ETH/USDT）
+                # 转换为标准格式
                 symbol = SymbolMapper.to_standard_format(okx_symbol, "OKX")
                 
                 # 获取最新价格
@@ -550,7 +539,7 @@ class DataService:
             
             # 🔧 缓存最新价格（使用run_coroutine_threadsafe，因为WebSocket回调不在异步上下文）
             if self.loop:
-                asyncio.run_coroutine_threadsafe(
+                future = asyncio.run_coroutine_threadsafe(
                 cache_manager.set_market_data(
                     symbol, 
                     "ticker", 
@@ -562,6 +551,7 @@ class DataService:
                     ),
                     self.loop
                 )
+                future.add_done_callback(lambda f: f.exception())
             else:
                 logger.warning("⚠️ 事件循环未初始化，跳过价格缓存")
             
@@ -569,10 +559,11 @@ class DataService:
             if self.loop and self.price_callbacks:
                 for callback in self.price_callbacks:
                     try:
-                        asyncio.run_coroutine_threadsafe(
+                        future = asyncio.run_coroutine_threadsafe(
                             callback(symbol, price),
                             self.loop
                         )
+                        future.add_done_callback(lambda f: f.exception())
                     except Exception as e:
                         logger.error(f"执行价格更新回调失败: {e}", exc_info=True)
             

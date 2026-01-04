@@ -8,7 +8,7 @@
 3. 稳定性指标监控
 4. 动态权重调整
 
-作者: QuantAI-ETH Team
+作者: QuantAI Team
 版本: v3.0
 """
 

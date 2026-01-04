@@ -271,11 +271,15 @@ async def price_push_task():
         try:
             if data_service and len(manager.active_connections) > 0:
                 # 获取最新价格
-                ticker_data = await cache_manager.get_market_data("ETHUSDT", "ticker")
+                from app.core.config import settings
+                from app.exchange.mappers import SymbolMapper
+                
+                symbol_exchange = SymbolMapper.to_exchange_format(settings.SYMBOL, "BINANCE")
+                ticker_data = await cache_manager.get_market_data(symbol_exchange, "ticker")
                 
                 if ticker_data:
                     price_update = WSPriceUpdate(
-                        symbol="ETHUSDT",
+                        symbol=symbol_exchange,
                         price=float(ticker_data.get('price', 0)),
                         change=0,  # 需要计算
                         change_percent=0,  # 需要计算

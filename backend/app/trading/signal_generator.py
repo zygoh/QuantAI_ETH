@@ -733,35 +733,65 @@ class SignalGenerator:
             return None
     
     async def _get_current_price(self, symbol: str) -> Optional[float]:
-        """获取当前价格 - 直接从API获取实时价格"""
+        """
+        获取当前实时价格 - 严格模式，拒绝过时数据
+        
+        安全原则：宁可放弃信号，也不使用过时价格导致亏损
+        """
         try:
-            # 优先从缓存获取最新价格（缓存是WebSocket实时更新的）
-            ticker_data = await cache_manager.get_market_data(symbol, "ticker")
+            # 🔧 修复：将标准格式转换为交易所格式（如BTC/USDT -> BTCUSDT）
+            from app.exchange.mappers import SymbolMapper
+            exchange_symbol = SymbolMapper.to_exchange_format(symbol, settings.EXCHANGE_TYPE)
             
-            if ticker_data:
-                logger.debug(f"从缓存获取价格: {ticker_data.get('price')}")
-                return float(ticker_data.get('price', 0))
+            # 方法1：从ticker缓存获取（WebSocket实时推送，有时间戳验证）
+            ticker_data = await cache_manager.get_market_data(exchange_symbol, "ticker")
+            if ticker_data and ticker_data.get('price'):
+                # 检查数据时效性（如果有时间戳）
+                ticker_time = ticker_data.get('timestamp')
+                if ticker_time:
+                    from datetime import datetime, timezone
+                    try:
+                        if isinstance(ticker_time, (int, float)):
+                            data_time = datetime.fromtimestamp(ticker_time / 1000, tz=timezone.utc)
+                        else:
+                            data_time = datetime.fromisoformat(str(ticker_time).replace('Z', '+00:00'))
+                        age_seconds = (datetime.now(timezone.utc) - data_time).total_seconds()
+                        if age_seconds > 60:  # 超过60秒视为过时
+                            logger.warning(f"⚠️ ticker数据过时 ({age_seconds:.0f}秒)，拒绝使用")
+                        else:
+                            price = float(ticker_data.get('price'))
+                            if price > 0:
+                                logger.debug(f"✓ ticker价格: {price} (延迟{age_seconds:.1f}秒)")
+                                return price
+                    except Exception:
+                        pass  # 时间戳解析失败，继续尝试其他方法
+                else:
+                    # 无时间戳但有价格，谨慎使用
+                    price = float(ticker_data.get('price'))
+                    if price > 0:
+                        logger.debug(f"✓ ticker价格: {price} (无时间戳)")
+                        return price
             
-            # 缓存失效时，直接从API获取最新价格
+            # 方法2：从API获取最新价格（同步请求，确保实时）
             logger.debug(f"从API获取实时价格: {symbol}")
-            # ✅ 统一使用分页方法（limit=1时自动调用单次获取，不影响性能）
-            klines = self.exchange_client.get_klines_paginated(symbol, '1m', limit=1)
+            klines = self.exchange_client.get_klines_paginated(exchange_symbol, '1m', limit=1)
             
             if klines and len(klines) > 0:
-                # 🔥 UnifiedKlineData是对象，使用属性访问而不是索引
                 kline = klines[0]
                 if isinstance(kline, dict):
                     price = float(kline.get('close', 0))
                 else:
                     price = float(kline.close)
-                logger.debug(f"✓ API价格: {price}")
-                return price
+                if price > 0:
+                    logger.debug(f"✓ API价格: {price}")
+                    return price
             
-            logger.warning(f"无法获取{symbol}的当前价格")
+            # 所有方法失败 - 严格模式：不使用任何回退，直接放弃信号
+            logger.error(f"❌ 无法获取{symbol}实时价格，放弃本次信号（保护资金安全）")
             return None
             
         except Exception as e:
-            logger.error(f"获取当前价格失败: {e}")
+            logger.error(f"❌ 获取实时价格异常: {e}，放弃本次信号")
             return None
     
     # ✅ 已移除重复的 _calculate_position_size 方法
@@ -970,18 +1000,19 @@ class SignalGenerator:
             if confidence < self.confidence_threshold:
                 return {'pass': False, 'reason': f'置信度过低 ({confidence:.4f} < {self.confidence_threshold})'}
             
-            # 2. 趋势一致性过滤
-            # 检查多时间框架是否趋势一致
-            if len(predictions) >= 2:
-                signal_types = [pred['signal_type'] for pred in predictions.values()]
-                # 如果有任何一个时间框架是反向信号，过滤
-                if signal_type == 'LONG' and 'SHORT' in signal_types:
-                    # 但如果15m置信度特别高（>0.7），允许通过
-                    if confidence < 0.7:
-                        return {'pass': False, 'reason': '多时间框架趋势不一致（有SHORT信号）'}
-                elif signal_type == 'SHORT' and 'LONG' in signal_types:
-                    if confidence < 0.7:
-                        return {'pass': False, 'reason': '多时间框架趋势不一致（有LONG信号）'}
+            # 2. 趋势一致性过滤（已通过权重合成，不应再过滤）
+            # 🔧 修复：权重信号已经考虑了多时间框架的加权结果
+            # 如果最终信号是通过权重计算得出的，说明已经考虑了各时间框架的贡献
+            # 因此不应该因为某个时间框架有反向信号就过滤掉
+            # 只有在权重信号置信度很低时才需要额外检查
+            if confidence < 0.5:  # 只有置信度很低时才检查趋势一致性
+                if len(predictions) >= 2:
+                    signal_types = [pred['signal_type'] for pred in predictions.values()]
+                    # 如果所有时间框架都是反向信号，才过滤
+                    if signal_type == 'LONG' and all(s == 'SHORT' for s in signal_types):
+                        return {'pass': False, 'reason': '所有时间框架都是SHORT信号，与LONG冲突'}
+                    elif signal_type == 'SHORT' and all(s == 'LONG' for s in signal_types):
+                        return {'pass': False, 'reason': '所有时间框架都是LONG信号，与SHORT冲突'}
             
             # 3. 波动率过滤（避免在极端波动时交易）
             try:

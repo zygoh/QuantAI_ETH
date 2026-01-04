@@ -403,23 +403,13 @@ class BinanceClient(BaseExchangeClient):
             return default
     
     def __init__(self, config: Optional[Dict[str, Any]] = None):
-        self.api_key = settings.BINANCE_API_KEY
-        self.secret_key = settings.BINANCE_SECRET_KEY
-        self.testnet = settings.BINANCE_TESTNET
-        # ⛔️ 当前账户不可用，临时禁用需要签名的账户相关接口
-        # TODO: 恢复账户权限后将该标记改为 True 并恢复相关调用
+        # 仅使用公共接口，无需API Key
         self.account_endpoints_enabled = False
         
-        # 配置代理地址
-        # REST API: https://n8n.do2ge.com/tail/http/relay/fapi/v1/... -> https://fapi.binance.com/fapi/v1/...
-        self.base_url = "https://n8n.do2ge.com/tail/http/relay"
-        
-        # 🔧 配置REST API代理（如果启用）
+        self.base_url = "https://fapi.binance.com"
         client_kwargs = {
-            "key": self.api_key,
-            "secret": self.secret_key,
             "base_url": self.base_url,
-            "timeout": 30  # 增加超时时间
+            "timeout": 60
         }
         
         # 添加代理配置
@@ -428,12 +418,13 @@ class BinanceClient(BaseExchangeClient):
             
             if proxy_type == "socks5":
                 # SOCKS5代理（需要PySocks库支持）
-                proxy_url = f"socks5://{settings.PROXY_HOST}:{settings.PROXY_PORT}"
+                # 使用 socks5h 协议以支持远程 DNS 解析 (解决 getaddrinfo failed 问题)
+                proxy_url = f"socks5h://{settings.PROXY_HOST}:{settings.PROXY_PORT}"
                 client_kwargs["proxies"] = {
                     "http": proxy_url,
                     "https": proxy_url
                 }
-                logger.info(f"🔧 REST API使用SOCKS5代理: {settings.PROXY_HOST}:{settings.PROXY_PORT}")
+                logger.info(f"REST API使用SOCKS5代理 (Remote DNS): {settings.PROXY_HOST}:{settings.PROXY_PORT}")
             else:
                 # HTTP/HTTPS代理
                 proxy_url = f"{proxy_type}://{settings.PROXY_HOST}:{settings.PROXY_PORT}"
@@ -441,7 +432,9 @@ class BinanceClient(BaseExchangeClient):
                     "http": proxy_url,
                     "https": proxy_url
                 }
-                logger.info(f"🔧 REST API使用{proxy_type.upper()}代理: {settings.PROXY_HOST}:{settings.PROXY_PORT}")
+                logger.info(f"✓ REST API使用{proxy_type.upper()}代理: {settings.PROXY_HOST}:{settings.PROXY_PORT}")
+        else:
+            logger.info("✓ REST API直连（未使用代理）")
         
         # REST API客户端
         self.client = UMFutures(**client_kwargs)
@@ -453,39 +446,35 @@ class BinanceClient(BaseExchangeClient):
         self.ws_client: Optional[UMFuturesWebsocketClient] = None
         self.ws_callbacks: Dict[str, Callable] = {}
         
-        logger.info(f"Binance客户端初始化完成")
-        logger.info(f"  - 模式: {'测试网' if self.testnet else '生产环境'}")
+        logger.info(f"Binance客户端初始化完成（公共接口模式）")
         logger.info(f"  - REST URL: {self.base_url}")
-        logger.info(f"  - API Key 长度: {len(self.api_key)} 字符")
-        logger.info(f"  - API Key (前8位): {self.api_key[:8]}...")
-        logger.info(f"  - Secret Key 长度: {len(self.secret_key)} 字符")
-        logger.info(f"  - Secret Key (前8位): {self.secret_key[:8]}...")
     
     async def test_connection(self) -> bool:
         """测试API连接"""
         try:
-            # 测试REST API
             server_time = self.client.time()
-            logger.info(f"✓ 服务器时间获取成功: {server_time.get('serverTime')}")
-            
-            # 测试账户信息（需要签名）
-            if not self.account_endpoints_enabled:
-                logger.warning("⏸️ 已跳过账户信息检测：账户相关接口暂时禁用")
-                return True
-            logger.info("正在测试账户信息获取（需要 API Key 签名）...")
-            try:
-                account = self.client.account(recvWindow=self.recv_window)
-                logger.info(f"✓ 账户余额: {account.get('totalWalletBalance', 0)} USDT")
-                return True
-            except Exception as account_error:
-                logger.error(f"✗ 账户信息获取失败: {account_error}")
-                logger.error("可能的原因：")
-                logger.error("  1. API Key 未启用期货交易权限")
-                logger.error("  2. API Key 或 Secret Key 不正确")
-                return False
+            logger.info(f"服务器时间获取成功: {server_time.get('serverTime')}")
+            return True
             
         except Exception as e:
+            error_msg = str(e)
             logger.error(f"服务器时间获取失败: {e}")
+            
+            # 检查是否是代理连接问题
+            if settings.USE_PROXY:
+                if "10061" in error_msg or "积极拒绝" in error_msg or "Connection refused" in error_msg:
+                    logger.error("❌ 代理连接失败：代理服务器可能未运行")
+                    logger.error(f"   请检查代理服务是否在 {settings.PROXY_HOST}:{settings.PROXY_PORT} 运行")
+                    logger.error("   解决方案：")
+                    logger.error("   1. 启动代理服务（如V2Ray、Clash等）")
+                    logger.error("   2. 或者设置 USE_PROXY=False 禁用代理")
+                elif "SOCKS" in error_msg or "socks" in error_msg:
+                    logger.error("❌ SOCKS代理连接失败")
+                    logger.error("   可能原因：")
+                    logger.error("   1. 代理服务未启动")
+                    logger.error("   2. 代理端口配置错误")
+                    logger.error("   3. 缺少PySocks库（pip install pysocks）")
+            
             return False
     
     def get_server_time(self) -> int:
@@ -511,8 +500,12 @@ class BinanceClient(BaseExchangeClient):
             exchange_info = self.get_exchange_info()
             symbols = exchange_info.get('symbols', [])
             
+            # 将标准格式转换为 Binance 格式
+            from app.exchange.mappers import SymbolMapper
+            exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
+            
             for symbol_info in symbols:
-                if symbol_info['symbol'] == symbol:
+                if symbol_info['symbol'] == exchange_symbol:
                     return symbol_info
             
             return None
@@ -531,16 +524,19 @@ class BinanceClient(BaseExchangeClient):
     ) -> List[UnifiedKlineData]:
         """获取K线数据"""
         try:
-            # ✅ 关键修复：Binance API limit 最大值为 1500
-            if limit > 1500:
-                logger.warning(f"⚠️ limit={limit} 超过Binance最大限制1500，自动调整为1500")
-                limit = 1500
+            # 将标准格式转换为 Binance 格式
+            from app.exchange.mappers import SymbolMapper
+            exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
+            
+            if limit > 1000:
+                logger.warning(f"limit={limit} 超过Binance最大限制1000，自动调整为1000")
+                limit = 1000
             elif limit <= 0:
-                logger.warning(f"⚠️ limit={limit} 无效，使用默认值500")
+                logger.warning(f"limit={limit} 无效，使用默认值500")
                 limit = 500
             
             params = {
-                'symbol': symbol,
+                'symbol': exchange_symbol,
                 'interval': interval,
                 'limit': limit
             }
@@ -552,35 +548,34 @@ class BinanceClient(BaseExchangeClient):
             
             klines = self.client.klines(**params)
             
-            # ✅ 诊断：检查REST API返回的数组长度
-            if klines and len(klines) > 0:
-                first_kline = klines[0]
-                logger.debug(f"📊 REST API K线数组长度: {len(first_kline)} (预期11个字段)")
-                if len(first_kline) < 11:
-                    logger.warning(f"⚠️ REST API返回的K线数组长度不足: {len(first_kline)} < 11")
-                    logger.warning(f"   数组内容: {first_kline}")
-                    logger.warning(f"   可能原因: Binance API版本或代理过滤了某些字段")
-            
             # 转换为统一格式
             current_time_ms = int(time.time() * 1000)  # 当前时间（毫秒）
             formatted_klines = []
             skipped_incomplete = 0
+            skipped_invalid = 0
             for idx, kline in enumerate(klines):
                 try:
-                    # ✅ 安全访问：检查数组长度
                     if len(kline) < 11:
-                        logger.warning(f"⚠️ K线数组{idx}长度不足: {len(kline)} < 11，使用默认值0")
                         taker_buy_base = 0.0
                         taker_buy_quote = 0.0
                     else:
                         taker_buy_base = float(kline[9]) if kline[9] else 0.0
                         taker_buy_quote = float(kline[10]) if kline[10] else 0.0
                     
-                    close_time = kline[6]  # K线结束时
-                    # 🔥 关键修复：过滤未完成的K线
+                    close_time = kline[6]
                     if close_time >= current_time_ms:
                         skipped_incomplete += 1
-                        logger.debug(f"⏸️ 跳过未完成K线: 索引={idx}")
+                        continue
+                    
+                    close_price = float(kline[4])
+                    volume = float(kline[5])
+                    
+                    if close_price <= 0:
+                        skipped_invalid += 1
+                        continue
+                    
+                    if volume is None or volume <= 0 or (isinstance(volume, float) and (volume != volume)):
+                        skipped_invalid += 1
                         continue
 
                     formatted_kline = UnifiedKlineData(
@@ -588,8 +583,8 @@ class BinanceClient(BaseExchangeClient):
                         open=float(kline[1]),
                         high=float(kline[2]),
                         low=float(kline[3]),
-                        close=float(kline[4]),
-                        volume=float(kline[5]),
+                        close=close_price,
+                        volume=volume,
                         close_time=kline[6],
                         quote_volume=float(kline[7]),
                         trades=int(kline[8]),
@@ -598,11 +593,14 @@ class BinanceClient(BaseExchangeClient):
                     )
                     formatted_klines.append(formatted_kline)
                 except (IndexError, ValueError, TypeError) as e:
-                    logger.error(f"❌ 解析K线数据失败 (索引{idx}): {e}")
-                    logger.error(f"   数组长度: {len(kline)}, 数组内容: {kline}")
+                    logger.error(f"解析K线数据失败 (索引{idx}): {e}")
+                    skipped_invalid += 1
                     continue
+            
             if skipped_incomplete > 0:
-                logger.debug(f"⏸️ 过滤了 {skipped_incomplete} 根未完成K线")
+                logger.debug(f"过滤了 {skipped_incomplete} 根未完成K线")
+            if skipped_invalid > 0:
+                logger.info(f"已过滤 {skipped_invalid} 条无效K线")
             logger.debug(f"获取K线数据: {symbol} {interval} {len(formatted_klines)}条")
             return formatted_klines
             
@@ -620,7 +618,7 @@ class BinanceClient(BaseExchangeClient):
         rate_limit_delay: float = 0.1
     ) -> List[UnifiedKlineData]:
         """
-        分页获取K线数据（自动处理超过1500的情况）
+        分页获取K线数据（自动处理超过1000的情况）
         
         Args:
             symbol: 交易对符号
@@ -634,16 +632,15 @@ class BinanceClient(BaseExchangeClient):
             K线数据列表（按时间升序排列）
         """
         try:
-            # 如果 limit <= 1500，直接调用单次获取
-            if limit <= 1500:
+            if limit <= 1000:
                 return self.get_klines(symbol, interval, limit, start_time, end_time)
             
-            # 超过1500，需要分页获取
+            # 超过1000，需要分页获取
             all_klines = []
-            max_per_request = 1500
+            max_per_request = 1000
             batches_needed = (limit + max_per_request - 1) // max_per_request
             
-            logger.debug(f"📊 分页获取K线: {symbol} {interval} 需要{limit}条，分{batches_needed}批获取")
+            logger.debug(f"分页获取K线: {symbol} {interval} 需要{limit}条，分{batches_needed}批获取")
             
             current_end_time = end_time
             
@@ -664,19 +661,14 @@ class BinanceClient(BaseExchangeClient):
                 )
                 
                 if not klines:
-                    logger.warning(f"⚠️ 批次 {batch + 1}/{batches_needed} 未获取到数据")
                     break
                 
-                # 添加到总列表
                 all_klines.extend(klines)
                 
-                # 如果已经获取到足够的数据，退出
                 if len(all_klines) >= limit:
                     break
                 
-                # 如果返回的数据少于请求的数量，说明没有更多数据了
-                if len(klines) < batch_limit:
-                    logger.debug(f"📊 批次 {batch + 1}/{batches_needed} 返回{len(klines)}条 < 请求{batch_limit}条，数据已获取完毕")
+                if not klines:
                     break
                 
                 # 设置下一批次的 end_time 为当前批次最早的时间 - 1ms
@@ -698,7 +690,7 @@ class BinanceClient(BaseExchangeClient):
                     seen_timestamps.add(ts)
                     unique_klines.append(kline)
             
-            logger.debug(f"✅ 分页获取完成: {symbol} {interval} 共{len(unique_klines)}条（去重后）")
+            logger.debug(f"分页获取完成: {symbol} {interval} 共{len(unique_klines)}条")
             return unique_klines[:limit]  # 确保不超过请求的数量
             
         except Exception as e:
@@ -708,8 +700,11 @@ class BinanceClient(BaseExchangeClient):
     def get_ticker_price(self, symbol: str) -> Optional[UnifiedTickerData]:
         """获取实时价格（24hr ticker）"""
         try:
-            # ✅ 使用代理的 REST API
-            ticker = self.client.ticker_price(symbol=symbol)
+            # 将标准格式转换为 Binance 格式
+            from app.exchange.mappers import SymbolMapper
+            exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
+            
+            ticker = self.client.ticker_price(symbol=exchange_symbol)
             
             if ticker:
                 return UnifiedTickerData(
@@ -724,74 +719,12 @@ class BinanceClient(BaseExchangeClient):
             return None
     
     def get_account_info(self) -> Dict[str, Any]:
-        """获取账户信息"""
-        try:
-            if not self.account_endpoints_enabled:
-                logger.warning("⏸️ 账户接口已临时禁用，返回空账户信息")
-                return {}
-
-            account = self.client.account(recvWindow=self.recv_window)
-            
-            # 格式化账户信息 - 使用安全转换
-            formatted_account = {
-                'total_wallet_balance': self._safe_float(account.get('totalWalletBalance'), 0.0),
-                'total_unrealized_pnl': self._safe_float(account.get('totalUnrealizedPnL'), 0.0),
-                'total_margin_balance': self._safe_float(account.get('totalMarginBalance'), 0.0),
-                'total_position_initial_margin': self._safe_float(account.get('totalPositionInitialMargin'), 0.0),
-                'total_open_order_initial_margin': self._safe_float(account.get('totalOpenOrderInitialMargin'), 0.0),
-                'available_balance': self._safe_float(account.get('availableBalance'), 0.0),
-                'max_withdraw_amount': self._safe_float(account.get('maxWithdrawAmount'), 0.0),
-                'can_trade': account.get('canTrade', False),
-                'can_deposit': account.get('canDeposit', False),
-                'can_withdraw': account.get('canWithdraw', False),
-                'update_time': account.get('updateTime', 0)
-            }
-            
-            return formatted_account
-            
-        except Exception as e:
-            logger.error(f"获取账户信息失败: {e}")
-            return {}
+        """获取账户信息（仅公共接口，返回空）"""
+        return {}
     
     def get_position_info(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        """获取持仓信息"""
-        try:
-            if not self.account_endpoints_enabled:
-                logger.warning("⏸️ 持仓接口已临时禁用，返回空列表")
-                return []
-
-            params = {'recvWindow': self.recv_window}
-            if symbol:
-                params['symbol'] = symbol
-            
-            positions = self.client.get_position_risk(**params)
-            
-            # 过滤有持仓的合约
-            active_positions = []
-            for position in positions:
-                position_amt = self._safe_float(position.get('positionAmt'), 0.0)
-                if position_amt != 0:
-                    formatted_position = {
-                        'symbol': position.get('symbol', ''),
-                        'position_amt': position_amt,
-                        'entry_price': self._safe_float(position.get('entryPrice'), 0.0),
-                        'mark_price': self._safe_float(position.get('markPrice'), 0.0),
-                        'pnl': self._safe_float(position.get('unRealizedProfit'), 0.0),
-                        'percentage': self._safe_float(position.get('percentage'), 0.0),
-                        'position_side': position.get('positionSide', 'BOTH'),
-                        'isolated': position.get('isolated', False),
-                        'margin_type': position.get('marginType', 'cross'),
-                        'leverage': self._safe_int(position.get('leverage'), 1),
-                        'max_notional_value': self._safe_float(position.get('maxNotionalValue'), 0.0),
-                        'update_time': position.get('updateTime', 0)
-                    }
-                    active_positions.append(formatted_position)
-            
-            return active_positions
-            
-        except Exception as e:
-            logger.error(f"获取持仓信息失败: {e}")
-            return []
+        """获取持仓信息（仅公共接口，返回空）"""
+        return []
     
     def place_order(
         self,
@@ -807,128 +740,31 @@ class BinanceClient(BaseExchangeClient):
         callback_rate: Optional[float] = None,
         working_type: str = "MARK_PRICE"
     ) -> Dict[str, Any]:
-        """下单"""
-        try:
-            if not self.account_endpoints_enabled:
-                logger.warning("⏸️ 下单接口已临时禁用，返回空结果")
-                return {}
-
-            params = {
-                'symbol': symbol,
-                'side': side,
-                'type': order_type,
-                'quantity': quantity,
-                'timeInForce': time_in_force,
-                'reduceOnly': reduce_only,
-                'closePosition': close_position,
-                'workingType': working_type
-            }
-            
-            if price is not None:
-                params['price'] = price
-            
-            if stop_price is not None:
-                params['stopPrice'] = stop_price
-            
-            if callback_rate is not None:
-                params['callbackRate'] = callback_rate
-            
-            # 添加recvWindow参数
-            params['recvWindow'] = self.recv_window
-            
-            result = self.client.new_order(**params)
-            
-            logger.info(f"下单成功: {symbol} {side} {quantity} @ {price}")
-            return result
-            
-        except Exception as e:
-            logger.error(f"下单失败: {e}")
-            return {}
+        """下单（仅公共接口，返回空）"""
+        return {}
     
     def cancel_order(self, symbol: str, order_id: str) -> Dict[str, Any]:
-        """
-        撤销订单
-        
-        Args:
-            symbol: 交易对符号
-            order_id: 订单ID（字符串格式，内部转换为整数）
-        
-        Returns:
-            取消结果字典
-        """
-        try:
-            if not self.account_endpoints_enabled:
-                logger.warning("⏸️ 撤单接口已临时禁用，返回空结果")
-                return {}
-
-            # Binance API需要整数类型的orderId，但接口统一使用str
-            order_id_int = int(order_id)
-            result = self.client.cancel_order(symbol=symbol, orderId=order_id_int, recvWindow=self.recv_window)
-            logger.info(f"撤销订单成功: {symbol} {order_id}")
-            return result
-        except ValueError as e:
-            logger.error(f"撤销订单失败: 订单ID格式错误 '{order_id}': {e}")
-            return {}
-        except Exception as e:
-            logger.error(f"撤销订单失败: {e}")
-            return {}
+        """撤销订单（仅公共接口，返回空）"""
+        return {}
     
     def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        """获取未成交订单"""
-        try:
-            if not self.account_endpoints_enabled:
-                logger.warning("⏸️ 未成交订单接口已临时禁用，返回空列表")
-                return []
-
-            params = {'recvWindow': self.recv_window}
-            if symbol:
-                params['symbol'] = symbol
-            
-            orders = self.client.get_orders(**params)
-            return orders
-            
-        except Exception as e:
-            logger.error(f"获取未成交订单失败: {e}")
-            return []
+        """获取未成交订单（仅公共接口，返回空）"""
+        return []
     
     def change_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
-        """修改杠杆倍数"""
-        try:
-            if not self.account_endpoints_enabled:
-                logger.warning("⏸️ 杠杆调整接口已临时禁用，返回空结果")
-                return {}
-
-            result = self.client.change_leverage(symbol=symbol, leverage=leverage, recvWindow=self.recv_window)
-            logger.info(f"修改杠杆成功: {symbol} {leverage}x")
-            return result
-        except Exception as e:
-            logger.error(f"修改杠杆失败: {e}")
-            return {}
+        """修改杠杆倍数（仅公共接口，返回空）"""
+        return {}
     
     def change_margin_type(self, symbol: str, margin_type: str) -> Dict[str, Any]:
-        """修改保证金模式（可能已设置，失败不影响）"""
-        try:
-            if not self.account_endpoints_enabled:
-                logger.warning("⏸️ 保证金模式调整接口已临时禁用，返回空结果")
-                return {}
-
-            result = self.client.change_margin_type(symbol=symbol, marginType=margin_type, recvWindow=self.recv_window)
-            logger.info(f"修改保证金模式成功: {symbol} {margin_type}")
-            return result
-        except Exception as e:
-            # 如果提示"No need to change"，说明已经是目标模式，使用warning而非error
-            error_msg = str(e)
-            if 'No need to change' in error_msg or '-4046' in error_msg:
-                logger.warning(f"保证金模式无需修改（已是 {margin_type} 模式）: {symbol}")
-            else:
-                logger.error(f"修改保证金模式失败: {e}")
-            return {}
+        """修改保证金模式（仅公共接口，返回空）"""
+        return {}
+    
 
 class BinanceWebSocketClient:
     """Binance WebSocket客户端（支持自动重连和心跳保活）"""
     
     def __init__(self):
-        self.testnet = settings.BINANCE_TESTNET
+        # 仅使用公共接口，无需testnet配置
         self.ws_client: Optional[UMFuturesWebsocketClient] = None
         self.callbacks: Dict[str, Callable] = {}
         self.is_connected = False
@@ -960,8 +796,7 @@ class BinanceWebSocketClient:
             else:
                 logger.debug("✅ 使用已设置的事件循环")
             
-            # WebSocket: wss://n8n.do2ge.com/tail/ws/relay -> wss://fstream.binance.com
-            stream_url = "wss://n8n.do2ge.com/tail/ws/relay"
+            stream_url = "wss://fstream.binance.com"
             
             # 🔒 配置SSL上下文（增强安全性和稳定性）
             ssl_context = ssl.create_default_context()
@@ -981,16 +816,16 @@ class BinanceWebSocketClient:
                 "on_open": self._on_open,
                 "on_ping": self._on_ping,
                 "on_pong": self._on_pong,
-                "sslopt": {
-                    "context": ssl_context,
-                    "check_hostname": True,
-                    "cert_reqs": ssl.CERT_REQUIRED,
-                    "ssl_version": ssl.PROTOCOL_TLS,  # 使用最新TLS版本
-                    "timeout": settings.WS_SSL_TIMEOUT  # SSL握手超时
-                },
-                "timeout": settings.WS_SSL_TIMEOUT,  # 整体超时
-                "ping_interval": settings.WS_PING_INTERVAL,  # 启用内置ping
-                "ping_timeout": settings.WS_PONG_TIMEOUT
+                # "sslopt": {
+                #     "context": ssl_context,
+                #     "check_hostname": True,
+                #     "cert_reqs": ssl.CERT_REQUIRED,
+                #     "ssl_version": ssl.PROTOCOL_TLS,  # 使用最新TLS版本
+                #     "timeout": settings.WS_SSL_TIMEOUT  # SSL握手超时
+                # },
+                # "timeout": settings.WS_SSL_TIMEOUT,  # 整体超时
+                # "ping_interval": settings.WS_PING_INTERVAL,  # 启用内置ping
+                # "ping_timeout": settings.WS_PONG_TIMEOUT
             }
             
             # 添加代理配置（仅在USE_PROXY_WS启用时）
@@ -1014,15 +849,29 @@ class BinanceWebSocketClient:
             # 💓 初始化并启动心跳机制
             if self.heartbeat is None:
                 self.heartbeat = WebSocketHeartbeat(self.ws_client)
-            asyncio.create_task(self.heartbeat.start())
+            # 🔑 修复：使用 run_coroutine_threadsafe 在 WebSocket 线程中调度异步任务
+            if self.loop:
+                asyncio.run_coroutine_threadsafe(self.heartbeat.start(), self.loop)
+            else:
+                logger.warning("⚠️ 事件循环未设置，心跳机制无法启动")
             
             # 启动连接监控任务（24小时重建连接）
-            if self.monitor_task is None or self.monitor_task.done():
-                self.monitor_task = asyncio.create_task(self._monitor_connection())
+            if self.loop:
+                if self.monitor_task is None or (hasattr(self.monitor_task, 'done') and self.monitor_task.done()):
+                    self.monitor_task = asyncio.run_coroutine_threadsafe(self._monitor_connection(), self.loop)
+                else:
+                    logger.debug("监控任务已在运行")
+            else:
+                logger.warning("⚠️ 事件循环未设置，监控任务无法启动")
             
             # 启动健康检查任务（检测消息超时）
-            if self.health_check_task is None or self.health_check_task.done():
-                self.health_check_task = asyncio.create_task(self._health_check())
+            if self.loop:
+                if self.health_check_task is None or (hasattr(self.health_check_task, 'done') and self.health_check_task.done()):
+                    self.health_check_task = asyncio.run_coroutine_threadsafe(self._health_check(), self.loop)
+                else:
+                    logger.debug("健康检查任务已在运行")
+            else:
+                logger.warning("⚠️ 事件循环未设置，健康检查任务无法启动")
             
             logger.info(f"WebSocket客户端启动 (URL: {stream_url})")
             
@@ -1045,7 +894,8 @@ class BinanceWebSocketClient:
         # 如果系统还在运行，且没有正在重连，尝试重连
         if self.is_running and not self.is_reconnecting:
             self.is_reconnecting = True  # 🔒 设置重连锁
-            logger.info(f"将在 {self.current_reconnect_delay} 秒后尝试重连...")
+            # 🔧 修复: 使用 reconnector.current_delay 而不是不存在的 self.current_reconnect_delay
+            logger.info(f"将在 {self.reconnector.current_delay} 秒后尝试重连...")
             
             # 🔥 使用run_coroutine_threadsafe将重连任务提交到主事件循环
             if self.loop:
@@ -1114,8 +964,8 @@ class BinanceWebSocketClient:
             data = json.loads(message)
             
             # 🔥 修复：兼容两种消息格式
-            # 格式1（多流订阅）: {"stream":"ethusdt@kline_15m", "data":{...}}
-            # 格式2（单流订阅）: {"e":"kline", "s":"ETHUSDT", "k":{"i":"15m",...}}
+            # 格式1（多流订阅）: {"stream":"symbol@kline_15m", "data":{...}}
+            # 格式2（单流订阅）: {"e":"kline", "s":"SYMBOL", "k":{"i":"15m",...}}
             stream = data.get('stream', '')
             
             if not stream:
@@ -1369,8 +1219,12 @@ class BinanceWebSocketClient:
             raise Exception("WebSocket未连接")
         
         try:
-            self.ws_client.kline(symbol=symbol, interval=interval, id=1)
-            logger.info(f"✓ 订阅K线: {symbol} {interval}")
+            # 🔧 修复: 转换符号
+            from app.exchange.mappers import SymbolMapper
+            exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
+            
+            self.ws_client.kline(symbol=exchange_symbol, interval=interval, id=1)
+            logger.info(f"✓ 订阅K线: {symbol} ({exchange_symbol}) {interval}")
         except Exception as e:
             logger.error(f"✗ 订阅K线失败: {symbol} {interval} - {e}")
             raise  # 🔑 向上抛出，让调用方知道失败
@@ -1383,8 +1237,12 @@ class BinanceWebSocketClient:
             raise Exception("WebSocket未连接")
         
         try:
-            self.ws_client.ticker(symbol=symbol, id=2)
-            logger.info(f"✓ 订阅价格: {symbol}")
+            # 🔧 修复: 转换符号
+            from app.exchange.mappers import SymbolMapper
+            exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
+            
+            self.ws_client.ticker(symbol=exchange_symbol, id=2)
+            logger.info(f"✓ 订阅价格: {symbol} ({exchange_symbol})")
         except Exception as e:
             logger.error(f"✗ 订阅价格失败: {symbol} - {e}")
             raise  # 🔑 向上抛出，让调用方知道失败
@@ -1392,7 +1250,11 @@ class BinanceWebSocketClient:
     def subscribe_kline(self, symbol: str, interval: str, callback: Callable):
         """订阅K线数据"""
         try:
-            stream_name = f"{symbol.lower()}@kline_{interval}"
+            # 🔧 修复: 使用映射后的符号构造 stream_name
+            from app.exchange.mappers import SymbolMapper
+            exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
+            
+            stream_name = f"{exchange_symbol.lower()}@kline_{interval}"
             self.callbacks[stream_name] = callback
             
             # 保存订阅信息以便重连后恢复
@@ -1412,7 +1274,11 @@ class BinanceWebSocketClient:
     def subscribe_ticker(self, symbol: str, callback: Callable):
         """订阅价格变动数据"""
         try:
-            stream_name = f"{symbol.lower()}@ticker"
+            # 🔧 修复: 使用映射后的符号构造 stream_name
+            from app.exchange.mappers import SymbolMapper
+            exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
+            
+            stream_name = f"{exchange_symbol.lower()}@ticker"
             self.callbacks[stream_name] = callback
             
             # 保存订阅信息以便重连后恢复
@@ -1436,17 +1302,36 @@ class BinanceWebSocketClient:
             
             # 💓 停止心跳任务
             if self.heartbeat:
-                asyncio.create_task(self.heartbeat.stop())
+                if self.loop:
+                    asyncio.run_coroutine_threadsafe(self.heartbeat.stop(), self.loop)
+                else:
+                    logger.warning("⚠️ 事件循环未设置，无法停止心跳任务")
                 logger.debug("心跳任务已取消")
             
             # 取消健康检查任务
-            if self.health_check_task and not self.health_check_task.done():
-                self.health_check_task.cancel()
+            if self.health_check_task:
+                if hasattr(self.health_check_task, 'done') and not self.health_check_task.done():
+                    if hasattr(self.health_check_task, 'cancel'):
+                        self.health_check_task.cancel()
+                    elif hasattr(self.health_check_task, 'result'):
+                        # 如果是 Future，尝试取消
+                        try:
+                            self.health_check_task.cancel()
+                        except Exception:
+                            pass
                 logger.debug("健康检查任务已取消")
             
             # 取消监控任务
-            if self.monitor_task and not self.monitor_task.done():
-                self.monitor_task.cancel()
+            if self.monitor_task:
+                if hasattr(self.monitor_task, 'done') and not self.monitor_task.done():
+                    if hasattr(self.monitor_task, 'cancel'):
+                        self.monitor_task.cancel()
+                    elif hasattr(self.monitor_task, 'result'):
+                        # 如果是 Future，尝试取消
+                        try:
+                            self.monitor_task.cancel()
+                        except Exception:
+                            pass
                 logger.debug("连接监控任务已取消")
             
             # 取消重连任务

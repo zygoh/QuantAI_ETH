@@ -1,4 +1,4 @@
-# QuantAI-ETH 依赖包（GPU加速版本）
+# 量化交易系统依赖包（GPU加速版本）
 # 支持CUDA 12.1，兼容RTX 4060 Ti等NVIDIA GPU
 # 
 # GPU安装说明：

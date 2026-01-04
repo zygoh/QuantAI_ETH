@@ -8,7 +8,7 @@
 3. 置信度阈值过滤
 4. 致命错误预防
 
-作者: QuantAI-ETH Team
+作者: QuantAI Team
 版本: v3.0
 """
 

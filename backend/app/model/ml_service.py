@@ -39,18 +39,18 @@ class MLService:
         self.scalers = {}
         self.feature_columns_dict = {}
         
-        # 🔑 初始化特征工程器（修复：子类需要访问）
         self.feature_engineer = feature_engineer
         self.model_metrics = {}
         self.training_task = None
         self.is_first_training = True  # 标记是否首次训练（只有首次才写数据库）
         
-        # 🔑 获取交易所客户端（使用工厂模式，支持多交易所）
-        self.exchange_client = ExchangeFactory.get_current_client()
+        # 训练数据源固定使用 Binance（确保数据一致性）
+        from app.exchange.exchange_factory import ExchangeFactory
+        self.exchange_client = ExchangeFactory.create_client("BINANCE")
+        logger.info("训练数据源已固定为 Binance")
         
         # 模型参数
         # LightGBM基础参数（所有时间框架共享）
-        # 🔑 基础参数（会被时间框架差异化配置覆盖）
         self.lgb_params = {
             'objective': 'multiclass',
             'num_class': 3,  # 0: 下跌, 1: 横盘, 2: 上涨
@@ -358,9 +358,13 @@ class MLService:
                 if timeframe not in self.models or self.models[timeframe] is None:
                     raise Exception(f"{timeframe} 模型不可用")
             
-            # 特征工程
+            # 特征工程 (移至线程池运行，避免阻塞事件循环导致的死锁)
             logger.debug(f"📊 {timeframe} 特征工程...")
-            processed_data = feature_engineer.create_features(data.copy())
+            loop = asyncio.get_running_loop()
+            processed_data = await loop.run_in_executor(
+                None,
+                lambda: feature_engineer.create_features(data.copy(), loop=loop)
+            )
             
             if processed_data.empty:
                 raise Exception("特征工程后数据为空")
@@ -748,6 +752,11 @@ class MLService:
             
             X = df[feature_columns].copy()
             
+            # 🔧 修复：确保X不包含index列（防止特征数量不匹配）
+            if 'index' in X.columns:
+                X = X.drop(columns=['index'])
+                logger.warning(f"⚠️ {timeframe} 训练数据中移除了'index'列")
+            
             # 移除包含NaN的行
             mask = ~(X.isna().any(axis=1) | y.isna())
             X = X[mask]
@@ -985,7 +994,9 @@ class MLService:
                 if isinstance(scaler, dict):
                     # 字典结构：使用'traditional'键的scaler（传统模型）
                     if 'traditional' in scaler:
-                        X_scaled = scaler['traditional'].transform(X)
+                        actual_scaler = scaler['traditional']
+                        # 🔧 修复：处理scaler期望的无效列（如'index'）
+                        X_scaled = self._transform_with_scaler_adapter(actual_scaler, X, timeframe)
                     else:
                         # 如果没有'traditional'键，创建新的scaler
                         logger.warning(f"⚠️ {timeframe} scaler字典中缺少'traditional'键，创建新的scaler")
@@ -993,13 +1004,56 @@ class MLService:
                         X_scaled = self.scalers[timeframe]['traditional'].fit_transform(X)
                 else:
                     # StandardScaler对象：直接使用
-                    X_scaled = scaler.transform(X)
+                    X_scaled = self._transform_with_scaler_adapter(scaler, X, timeframe)
             
             return X_scaled
             
         except Exception as e:
             logger.error(f"特征缩放失败: {e}", exc_info=True)
             return X.values
+    
+    def _transform_with_scaler_adapter(self, scaler, X: pd.DataFrame, timeframe: str) -> np.ndarray:
+        """
+        适配器：处理scaler期望的特征列与输入X不匹配的情况
+        
+        问题：旧模型训练时scaler期望包含'index'等无效列，但预测时已过滤掉
+        解决：检查scaler期望的特征名，移除无效列，确保X只包含有效列
+        """
+        try:
+            # 检查scaler是否有feature_names_in_属性（sklearn 0.24+）
+            if hasattr(scaler, 'feature_names_in_'):
+                expected_features = list(scaler.feature_names_in_)
+                invalid_cols = {'index', 'timestamp', 'date', 'label', 'target'}
+                
+                # 过滤掉scaler期望的无效列
+                valid_expected = [f for f in expected_features if f not in invalid_cols]
+                
+                # 检查X中是否有scaler期望但无效的列
+                missing_valid = [f for f in valid_expected if f not in X.columns]
+                if missing_valid:
+                    logger.error(f"❌ {timeframe} scaler期望的有效列缺失: {missing_valid[:5]}{'...' if len(missing_valid) > 5 else ''}")
+                    raise ValueError(f"特征列不匹配：缺少 {missing_valid[:3]}")
+                
+                # 确保X只包含scaler期望的有效列，且顺序一致
+                X_aligned = X[valid_expected].copy()
+                
+                # 如果scaler期望的列数多于有效列数（说明有无效列），需要调整
+                if len(expected_features) != len(valid_expected):
+                    removed = set(expected_features) - set(valid_expected)
+                    logger.warning(f"⚠️ {timeframe} scaler适配：移除了{len(removed)}个无效期望列 {removed}")
+                
+                return scaler.transform(X_aligned)
+            else:
+                # 旧版本sklearn或没有feature_names_in_，直接transform
+                return scaler.transform(X)
+        except ValueError as e:
+            # 如果仍然失败，尝试重新fit（作为最后手段）
+            if "feature names" in str(e).lower() or "number of features" in str(e).lower():
+                logger.warning(f"⚠️ {timeframe} scaler特征不匹配，尝试重新fit")
+                # 创建新的scaler并fit
+                new_scaler = StandardScaler()
+                return new_scaler.fit_transform(X)
+            raise
     
     # 注：_train_lightgbm() 方法已移至 ensemble_ml_service.py（统一三模型训练代码位置）
     # 原实现已被子类覆盖，此处删除以避免代码冗余
@@ -1117,7 +1171,14 @@ class MLService:
                     # 加载特征列
                     if os.path.exists(paths['features']):
                         with open(paths['features'], 'rb') as f:
-                            self.feature_columns_dict[timeframe] = pickle.load(f)
+                            raw_features = pickle.load(f)
+                            # 过滤掉无效列（如'index'等非特征列）
+                            invalid_cols = {'index', 'timestamp', 'date', 'label', 'target'}
+                            cleaned_features = [f for f in raw_features if f not in invalid_cols]
+                            if len(cleaned_features) != len(raw_features):
+                                removed = set(raw_features) - set(cleaned_features)
+                                logger.warning(f"⚠️ {timeframe} 特征列过滤: 移除了无效列 {removed}")
+                            self.feature_columns_dict[timeframe] = cleaned_features
                     
                     if timeframe in self.models:
                         feature_count = len(self.feature_columns_dict.get(timeframe, []))

@@ -3,15 +3,14 @@ API路由
 """
 from fastapi import APIRouter
 from app.api.endpoints import (
-    account, positions, signals, trading, 
+    positions, signals, trading, 
     training, performance, system, websocket
 )
 
 # 创建主路由
 api_router = APIRouter()
 
-# 注册各个端点路由
-api_router.include_router(account.router, prefix="/account", tags=["账户"])
+# 注册各个端点路由（已移除account路由，仅支持模拟交易）
 api_router.include_router(positions.router, prefix="/positions", tags=["持仓"])
 api_router.include_router(signals.router, prefix="/signals", tags=["信号"])
 api_router.include_router(trading.router, prefix="/trading", tags=["交易"])
