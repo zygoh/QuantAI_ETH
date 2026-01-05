@@ -734,64 +734,42 @@ class SignalGenerator:
     
     async def _get_current_price(self, symbol: str) -> Optional[float]:
         """
-        获取当前实时价格 - 严格模式，拒绝过时数据
+        获取当前实时价格 - 从WebSocket K线缓冲区获取
         
-        安全原则：宁可放弃信号，也不使用过时价格导致亏损
+        WebSocket实时订阅K线数据，kline_buffers中存储的是最新的实时价格
+        选择最短时间框架（3m）获取最新价格，因为它更新最频繁
         """
         try:
-            # 🔧 修复：将标准格式转换为交易所格式（如BTC/USDT -> BTCUSDT）
-            from app.exchange.mappers import SymbolMapper
-            exchange_symbol = SymbolMapper.to_exchange_format(symbol, settings.EXCHANGE_TYPE)
+            # 从K线缓冲区获取最新价格（WebSocket实时更新）
+            if not hasattr(self, 'kline_buffers') or not self.kline_buffers:
+                logger.error(f"❌ K线缓冲区未初始化，无法获取实时价格")
+                return None
             
-            # 方法1：从ticker缓存获取（WebSocket实时推送，有时间戳验证）
-            ticker_data = await cache_manager.get_market_data(exchange_symbol, "ticker")
-            if ticker_data and ticker_data.get('price'):
-                # 检查数据时效性（如果有时间戳）
-                ticker_time = ticker_data.get('timestamp')
-                if ticker_time:
-                    from datetime import datetime, timezone
-                    try:
-                        if isinstance(ticker_time, (int, float)):
-                            data_time = datetime.fromtimestamp(ticker_time / 1000, tz=timezone.utc)
-                        else:
-                            data_time = datetime.fromisoformat(str(ticker_time).replace('Z', '+00:00'))
-                        age_seconds = (datetime.now(timezone.utc) - data_time).total_seconds()
-                        if age_seconds > 60:  # 超过60秒视为过时
-                            logger.warning(f"⚠️ ticker数据过时 ({age_seconds:.0f}秒)，拒绝使用")
-                        else:
-                            price = float(ticker_data.get('price'))
-                            if price > 0:
-                                logger.debug(f"✓ ticker价格: {price} (延迟{age_seconds:.1f}秒)")
-                                return price
-                    except Exception:
-                        pass  # 时间戳解析失败，继续尝试其他方法
-                else:
-                    # 无时间戳但有价格，谨慎使用
-                    price = float(ticker_data.get('price'))
-                    if price > 0:
-                        logger.debug(f"✓ ticker价格: {price} (无时间戳)")
-                        return price
+            # 优先从最短时间框架（3m）获取最新价格，因为它更新最频繁
+            timeframes = ['3m', '5m', '15m']
+            for timeframe in timeframes:
+                if timeframe in self.kline_buffers:
+                    buffer_df = self.kline_buffers[timeframe]
+                    if buffer_df is not None and len(buffer_df) > 0:
+                        latest_price = float(buffer_df['close'].iloc[-1])
+                        if latest_price > 0:
+                            logger.debug(f"✓ 从{timeframe}缓冲区获取实时价格: {latest_price}")
+                            return latest_price
             
-            # 方法2：从API获取最新价格（同步请求，确保实时）
-            logger.debug(f"从API获取实时价格: {symbol}")
-            klines = self.exchange_client.get_klines_paginated(exchange_symbol, '1m', limit=1)
+            # 如果指定时间框架都没有，尝试从任意缓冲区获取
+            for timeframe, buffer_df in self.kline_buffers.items():
+                if buffer_df is not None and len(buffer_df) > 0:
+                    latest_price = float(buffer_df['close'].iloc[-1])
+                    if latest_price > 0:
+                        logger.debug(f"✓ 从{timeframe}缓冲区获取实时价格: {latest_price}")
+                        return latest_price
             
-            if klines and len(klines) > 0:
-                kline = klines[0]
-                if isinstance(kline, dict):
-                    price = float(kline.get('close', 0))
-                else:
-                    price = float(kline.close)
-                if price > 0:
-                    logger.debug(f"✓ API价格: {price}")
-                    return price
-            
-            # 所有方法失败 - 严格模式：不使用任何回退，直接放弃信号
-            logger.error(f"❌ 无法获取{symbol}实时价格，放弃本次信号（保护资金安全）")
+            # 所有缓冲区都为空
+            logger.error(f"❌ K线缓冲区为空，无法获取实时价格（WebSocket可能未连接）")
             return None
             
         except Exception as e:
-            logger.error(f"❌ 获取实时价格异常: {e}，放弃本次信号")
+            logger.error(f"❌ 获取实时价格异常: {e}，放弃本次信号", exc_info=True)
             return None
     
     # ✅ 已移除重复的 _calculate_position_size 方法

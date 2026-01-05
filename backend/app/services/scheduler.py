@@ -174,6 +174,11 @@ class TaskScheduler:
                 logger.warning("⚠️ 未找到已保存的Stacking集成模型文件，开始首次训练...")
                 logger.info("🎓 首次部署：立即执行模型训练（后续将在每周五晚上00:00自动训练）")
                 
+                # 🔥 训练前清理：数据库、Redis缓存、内存缓存
+                logger.info("🧹 训练前清理：开始清理数据库、Redis缓存和内存缓存...")
+                await self._cleanup_before_training()
+                logger.info("✅ 训练前清理完成")
+                
                 # 立即执行模型训练
                 task = self.tasks.get('model_training')
                 if task:
@@ -184,6 +189,111 @@ class TaskScheduler:
                 
         except Exception as e:
             logger.error(f"检查初始模型失败: {e}")
+    
+    async def _cleanup_before_training(self):
+        """训练前清理：数据库、Redis缓存、内存缓存"""
+        try:
+            from app.core.database import postgresql_manager
+            from app.core.cache import cache_manager
+            
+            logger.info("=" * 70)
+            logger.info("🧹 开始训练前清理...")
+            logger.info("=" * 70)
+            
+            # 1. 清理数据库（清空所有K线数据）
+            logger.info("📊 清理数据库：清空所有K线数据...")
+            await postgresql_manager.cleanup_old_data(days=0)
+            logger.info("✅ 数据库清理完成")
+            
+            # 2. 清理Redis缓存（清理所有相关缓存）
+            logger.info("💾 清理Redis缓存...")
+            cache_patterns = [
+                "market_data:*",
+                "prediction:*",
+                "signal:*",
+                "model_metrics:*",
+                "account_info",
+                "position_info",
+                "risk_metrics",
+                "system_status"
+            ]
+            
+            cleared_count = 0
+            for pattern in cache_patterns:
+                try:
+                    keys = []
+                    async for key in cache_manager.redis.client.scan_iter(match=pattern):
+                        keys.append(key)
+                    if keys:
+                        await cache_manager.redis.client.delete(*keys)
+                        cleared_count += len(keys)
+                        logger.debug(f"   清理缓存模式 {pattern}: {len(keys)}个键")
+                except Exception as e:
+                    logger.warning(f"   清理缓存模式 {pattern} 失败: {e}")
+            
+            logger.info(f"✅ Redis缓存清理完成（共清理{cleared_count}个键）")
+            
+            # 3. 清理内存缓存
+            logger.info("🧠 清理内存缓存...")
+            
+            # 3.1 清理信号生成器的内存缓存
+            if self.signal_generator:
+                if hasattr(self.signal_generator, 'feature_cache'):
+                    self.signal_generator.feature_cache.clear()
+                    logger.debug("   清理信号生成器特征缓存")
+                
+                if hasattr(self.signal_generator, 'feature_cache_time'):
+                    self.signal_generator.feature_cache_time.clear()
+                    logger.debug("   清理信号生成器特征缓存时间戳")
+                
+                if hasattr(self.signal_generator, 'kline_buffers'):
+                    self.signal_generator.kline_buffers.clear()
+                    logger.debug("   清理信号生成器K线缓冲区")
+                
+                if hasattr(self.signal_generator, 'cached_predictions'):
+                    self.signal_generator.cached_predictions.clear()
+                    logger.debug("   清理信号生成器预测结果缓存")
+                
+                if hasattr(self.signal_generator, 'last_signals'):
+                    self.signal_generator.last_signals.clear()
+                    logger.debug("   清理信号生成器最后信号缓存")
+                
+                logger.info("✅ 信号生成器内存缓存清理完成")
+            
+            # 3.2 清理ML服务的内存缓存
+            if self.ml_service:
+                if hasattr(self.ml_service, 'feature_cache'):
+                    self.ml_service.feature_cache.clear()
+                    logger.debug("   清理ML服务特征缓存")
+                
+                if hasattr(self.ml_service, 'feature_cache_time'):
+                    self.ml_service.feature_cache_time.clear()
+                    logger.debug("   清理ML服务特征缓存时间戳")
+                
+                # 清理模型相关缓存（如果有）
+                if hasattr(self.ml_service, 'ensemble_models'):
+                    # 不清空模型，只清理缓存数据
+                    logger.debug("   保留ML服务模型（不清空）")
+                
+                logger.info("✅ ML服务内存缓存清理完成")
+            
+            # 3.3 清理交易引擎的内存缓存（如果已初始化）
+            # 注意：交易引擎可能在此时还未初始化，所以使用可选清理
+            try:
+                from app.trading.trading_engine import TradingEngine
+                # 这里不直接访问trading_engine，因为可能还未初始化
+                # 清理逻辑会在交易引擎初始化时自动处理
+                logger.debug("   交易引擎缓存将在初始化时自动清理")
+            except Exception:
+                pass
+            
+            logger.info("=" * 70)
+            logger.info("✅ 训练前清理全部完成")
+            logger.info("=" * 70)
+            
+        except Exception as e:
+            logger.error(f"训练前清理失败: {e}", exc_info=True)
+            raise
     
     def _calculate_next_run_times(self):
         """计算下次运行时间（支持固定时间和间隔时间两种模式）"""

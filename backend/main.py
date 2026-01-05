@@ -92,9 +92,8 @@ async def lifespan(app: FastAPI):
         await init_database()
         logger.info("数据库初始化完成")
 
-        # 清理旧数据（必须在启动时完成，避免新旧数据混合）
-        await cleanup_database()
-        logger.info("数据库清理完成")
+        # 🔥 注意：数据库清理已移至模型检测逻辑中
+        # 如果检测到没有模型，会在训练前自动清理数据库、Redis缓存和内存缓存
 
         # 初始化服务
         data_service = DataService()
