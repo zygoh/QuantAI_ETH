@@ -1,15 +1,20 @@
 """
 信号相关API端点
 """
+# StdLib
 import logging
-from typing import Optional
 from datetime import datetime, timedelta
+from typing import Optional
+
+# Third-Party
+import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
-from app.api.models import SignalsResponse, TradingSignal, SignalRequest
+
+# Local App
 from app.api.dependencies import get_current_user
+from app.api.models import SignalRequest, SignalsResponse, TradingSignal
 from app.core.config import settings
 from app.core.database import postgresql_manager
-import pandas as pd
 
 logger = logging.getLogger(__name__)
 router = APIRouter()

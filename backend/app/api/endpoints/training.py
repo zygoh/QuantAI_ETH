@@ -1,10 +1,15 @@
 """
 训练相关API端点
 """
+# StdLib
 import logging
+
+# Third-Party
 from fastapi import APIRouter, Depends, HTTPException
-from app.api.models import TrainingResponse, TrainingRequest
+
+# Local App
 from app.api.dependencies import get_current_user
+from app.api.models import TrainingRequest, TrainingResponse
 
 logger = logging.getLogger(__name__)
 router = APIRouter()

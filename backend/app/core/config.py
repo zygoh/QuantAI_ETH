@@ -1,8 +1,12 @@
 """
 系统配置管理
 """
+# StdLib
+import logging
 import os
 from typing import Optional
+
+# Third-Party
 try:
     from pydantic_settings import BaseSettings
 except ImportError:
@@ -16,8 +20,8 @@ class Settings(BaseSettings):
     PORT: int = 8000
     DEBUG: bool = True
     
-    # 交易所选择配置（仅使用公共接口，无需API Key）
-    EXCHANGE_TYPE: str = "BINANCE"  # 支持: BINANCE, OKX, MOCK
+    # 信号系统：仅使用Binance公共接口获取市场数据（无需API Key）
+    # 注意：系统仅用于信号生成和虚拟交易，不进行实际交易
     
     # 代理配置（可选）
     USE_PROXY: bool = True  # 是否使用代理（REST API）
@@ -95,21 +99,15 @@ class Settings(BaseSettings):
     
     def validate_exchange_config(self) -> bool:
         """
-        验证交易所配置的完整性
+        验证交易所配置的完整性（信号系统仅使用Binance）
         
         Returns:
             配置是否有效
         """
-        import logging
         logger = logging.getLogger(__name__)
         
-        # 仅使用公共接口，无需API Key验证
-        if self.EXCHANGE_TYPE not in ["BINANCE", "OKX", "MOCK"]:
-            logger.warning(f"未知的交易所类型: {self.EXCHANGE_TYPE}，将使用默认值BINANCE")
-            self.EXCHANGE_TYPE = "BINANCE"
-            return False
-        
-        logger.info(f"✅ 交易所配置: {self.EXCHANGE_TYPE}（公共接口模式）")
+        # 信号系统固定使用Binance公共接口获取市场数据
+        logger.info(f"✅ 信号系统配置: 使用Binance公共接口（仅数据获取，无实际交易）")
         return True
     
     def validate_config(self):
@@ -177,7 +175,6 @@ settings = Settings()
 try:
     settings.validate_config()
 except ValueError as e:
-    import logging
     logger = logging.getLogger(__name__)
     logger.error(f"❌ 配置验证失败: {e}")
     raise

@@ -1,11 +1,16 @@
 """
 持仓相关API端点
 """
+# StdLib
 import logging
 from typing import Optional
+
+# Third-Party
 from fastapi import APIRouter, Depends, HTTPException, Query
-from app.api.models import PositionsResponse, PositionInfo
+
+# Local App
 from app.api.dependencies import get_current_user
+from app.api.models import PositionInfo, PositionsResponse
 from app.services.data_service import DataService
 from app.trading.position_manager import position_manager
 

@@ -10,15 +10,17 @@
 - 本模块不负责持仓状态管理（依赖 Binance API 实时查询）
 - 仓位计算已统一到此模块，其他模块不应重复实现
 """
-import logging
-from typing import Dict, List, Any, Optional
-from datetime import datetime, timedelta
-from dataclasses import dataclass
+# StdLib
 import asyncio
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional
 
+# Local App
+from app.core.cache import cache_manager
 from app.core.config import settings
 from app.core.database import postgresql_manager
-from app.core.cache import cache_manager
 from app.exchange.exchange_factory import ExchangeFactory
 
 logger = logging.getLogger(__name__)
@@ -301,20 +303,23 @@ class PositionManager:
             return 1.0
     
     async def _get_exposure_adjustment(self, symbol: str, available_balance: float) -> float:
-        """获取持仓暴露调整系数（持仓多→降仓位）"""
+        """
+        获取持仓暴露调整系数（信号系统：使用虚拟持仓计算）
+        
+        注意：信号系统不获取实际持仓，使用虚拟持仓计算暴露度
+        """
         try:
-            # 获取当前持仓
-            positions = self.exchange_client.get_position_info(symbol)
-            if not positions:
+            # 信号系统：从数据库获取虚拟持仓计算暴露度
+            virtual_positions = await postgresql_manager.get_open_virtual_positions(symbol)
+            if not virtual_positions:
                 return 1.0
             
-            # 计算当前持仓占用的保证金比例
+            # 计算当前虚拟持仓占用的价值
             total_position_value = 0.0
-            for pos in positions:
-                position_amt = abs(float(pos.get('positionAmt', 0)))
-                if position_amt > 0:
-                    entry_price = float(pos.get('entryPrice', 0))
-                    total_position_value += position_amt * entry_price
+            for pos in virtual_positions:
+                if pos.get('status') == 'OPEN':
+                    # quantity已经是USDT价值
+                    total_position_value += float(pos.get('quantity', 0))
             
             exposure_ratio = total_position_value / (available_balance * self.leverage + 1e-10)
             
@@ -369,48 +374,16 @@ class PositionManager:
     
     
     async def get_position(self, symbol: str) -> Optional[PositionInfo]:
-        """获取指定持仓"""
-        try:
-            # 先从缓存获取
-            position = self.positions.get(symbol)
-            
-            if position:
-                # 更新持仓信息
-                await self._update_position(position)
-                return position
-            
-            # 从API获取
-            positions = self.exchange_client.get_position_info(symbol)
-            
-            if positions:
-                pos_data = positions[0]
-                position_amt = float(pos_data.get('positionAmt', 0))
-                
-                if position_amt != 0:
-                    position = PositionInfo(
-                        symbol=symbol,
-                        side='LONG' if position_amt > 0 else 'SHORT',
-                        size=abs(position_amt),
-                        entry_price=float(pos_data.get('entryPrice', 0)),
-                        mark_price=float(pos_data.get('markPrice', 0)),
-                        unrealized_pnl=float(pos_data.get('unRealizedProfit', 0)),
-                        percentage=float(pos_data.get('percentage', 0)),
-                        margin_type=pos_data.get('marginType', 'cross'),
-                        leverage=int(pos_data.get('leverage', 1)),
-                        liquidation_price=float(pos_data.get('liquidationPrice', 0)),
-                        margin_ratio=0.0,
-                        created_at=datetime.now(),
-                        updated_at=datetime.now()
-                    )
-                    
-                    self.positions[symbol] = position
-                    return position
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"获取持仓失败: {e}")
-            return None
+        """
+        获取指定持仓（信号系统：仅返回虚拟持仓）
+        
+        注意：信号系统不获取实际持仓，所有持仓都是虚拟的
+        实际持仓信息应从虚拟仓位数据库获取
+        """
+        logger.debug(f"信号系统：get_position被调用（不支持实际持仓）symbol={symbol}")
+        # 信号系统：不获取实际持仓，返回None
+        # 虚拟持仓通过postgresql_manager.get_open_virtual_positions获取
+        return None
     
     async def _update_position(self, position: PositionInfo):
         """更新持仓信息"""

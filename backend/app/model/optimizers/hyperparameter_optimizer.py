@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from app.model.informer2_model import Informer2ForClassification
 from app.model.gmadl_loss import create_trade_loss
-from app.model.ml_service import MLService
+from app.model.base.ml_service import MLService
 from app.core.config import settings
 
 # 可选依赖：bitsandbytes（8-bit优化器）

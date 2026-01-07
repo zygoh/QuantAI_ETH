@@ -1,13 +1,20 @@
 """
 WebSocket相关API端点
 """
+# StdLib
 import asyncio
 import json
 import logging
 from typing import Dict, Set
+
+# Third-Party
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
+# Local App
 from app.api.models import WSMessage, WSPriceUpdate, WSSignalUpdate, WSOrderUpdate, WSRiskAlert, TradingSignal
 from app.core.cache import cache_manager
+from app.core.config import settings
+from app.exchange.mappers import SymbolMapper
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -271,9 +278,6 @@ async def price_push_task():
         try:
             if data_service and len(manager.active_connections) > 0:
                 # 获取最新价格
-                from app.core.config import settings
-                from app.exchange.mappers import SymbolMapper
-                
                 symbol_exchange = SymbolMapper.to_exchange_format(settings.SYMBOL, "BINANCE")
                 ticker_data = await cache_manager.get_market_data(symbol_exchange, "ticker")
                 

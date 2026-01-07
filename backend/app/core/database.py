@@ -2,20 +2,25 @@
 PostgreSQL + TimescaleDB 数据库管理
 完全替换 InfluxDB，保持接口兼容性
 """
+# StdLib
 import asyncio
+import json
 import logging
 import traceback
-from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-import pandas as pd
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy import text
-import redis.asyncio as redis
-import json
-import pytz
+from typing import Optional, List, Dict, Any
 
+# Third-Party
+import pandas as pd
+import pytz
+import redis.asyncio as redis
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+
+# Local App
 from app.core.config import settings
+from app.core.constants import VIRTUAL_OPEN_FEE_RATE, VIRTUAL_CLOSE_FEE_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -713,9 +718,7 @@ class PostgreSQLManager:
                         price_pnl = (entry_price - exit_price_decimal) * coin_amount
                     
                     # 🔑 计算手续费（模拟实际交易所费率）
-                    VIRTUAL_OPEN_FEE_RATE = Decimal('0.0002')   # 开仓手续费：0.02% (Maker)
-                    VIRTUAL_CLOSE_FEE_RATE = Decimal('0.0005')  # 平仓手续费：0.05% (Taker)
-                    
+                    # 使用与trading_engine.py一致的费率常量
                     open_position_value = quantity  # 开仓时的USDT价值
                     open_commission = open_position_value * VIRTUAL_OPEN_FEE_RATE
                     

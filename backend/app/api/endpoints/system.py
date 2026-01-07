@@ -1,15 +1,20 @@
 """
 系统相关API端点
 """
+# StdLib
 import logging
-from fastapi import APIRouter, Depends, HTTPException
-from app.api.models import SystemResponse, SystemStatus, SystemControlRequest
-from app.api.dependencies import get_current_user
-from app.services.health_monitor import health_monitor
-from app.core.config import settings
 import platform
 import sys
+
+# Third-Party
+from fastapi import APIRouter, Depends, HTTPException
+
+# Local App
+from app.api.dependencies import get_current_user
+from app.api.models import SystemControlRequest, SystemResponse, SystemStatus
 from app.core.cache import cache_manager
+from app.core.config import settings
+from app.services.health_monitor import health_monitor
 
 logger = logging.getLogger(__name__)
 router = APIRouter()

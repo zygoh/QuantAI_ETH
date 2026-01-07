@@ -14,10 +14,11 @@
 - trading_controller: 交易控制器
 """
 
-from app.trading.signal_generator import SignalGenerator, TradingSignal
+# Local App
 from app.trading.position_manager import PositionManager, position_manager
-from app.trading.trading_engine import TradingEngine, TradingMode
+from app.trading.signal_generator import SignalGenerator, TradingSignal
 from app.trading.trading_controller import TradingController
+from app.trading.trading_engine import TradingEngine, TradingMode
 
 __all__ = [
     "SignalGenerator",

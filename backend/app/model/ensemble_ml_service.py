@@ -2,19 +2,20 @@
 集成机器学习服务 - Stacking三模型融合
 """
 # Standard library imports
-import logging
 import gc
+import json
+import logging
+import os
+import pickle
+import shutil
+import tempfile
 import time
 import traceback
-import os
-import tempfile
-import shutil
-import json
 import warnings
-from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-import pickle
+from typing import Dict, Any, Optional, Tuple
 
 # Third-party imports
 import pandas as pd
@@ -31,15 +32,33 @@ from sklearn.preprocessing import StandardScaler
 from numpy.lib.format import open_memmap
 
 # Local application imports
-from app.model.ml_service import MLService
+from app.model.base.ml_service import MLService
 from app.core.config import settings
 from app.core.cache import cache_manager
-from app.model.hyperparameter_optimizer import HyperparameterOptimizer
+from app.model.optimizers.hyperparameter_optimizer import HyperparameterOptimizer
 from app.services.direction_consistency_checker import TradingDirectionConsistencyChecker, ConsistencyCheck
 from app.services.adaptive_frequency_controller import AdaptiveFrequencyController, FrequencyControl
 from app.model.model_stability_enhancer import ModelStabilityEnhancer
 from app.utils.helpers import format_signal_type
 from app.exchange.exchange_factory import ExchangeFactory
+from app.model.ensemble.informer_wrapper import InformerWrapper
+from app.model.ensemble.predictors import predict_xgboost
+from app.model.ensemble.trainers import (
+    train_lightgbm,
+    train_xgboost,
+    train_catboost,
+    train_informer2
+)
+from app.model.ensemble.model_managers import (
+    save_ensemble_models,
+    load_ensemble_models
+)
+from app.model.ensemble.utils import (
+    clear_gpu_memory,
+    monitor_gpu_memory,
+    prepare_features_labels_reuse,
+    create_sequence_input
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,72 +90,6 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
     logger.warning("⚠️ PyTorch未安装，Informer-2模型将不可用")
-
-
-class InformerWrapper:
-    """
-    包装Informer-2模型，提供predict_proba接口（支持序列输入）
-    
-    将类移到模块级别以支持pickle序列化
-    """
-    
-    def __init__(self, model, device):
-        """
-        初始化包装器
-        
-        Args:
-            model: Informer2ForClassification模型实例
-            device: PyTorch设备（'cuda'或'cpu'）
-        """
-        self.model = model
-        self.device = device
-    
-    def predict_proba(self, X_seq):
-        """
-        预测概率（兼容scikit-learn，支持序列输入）
-        
-        Args:
-            X_seq: NumPy数组 (n_samples, seq_len, n_features)
-        
-        Returns:
-            概率数组 (n_samples, n_classes)
-        """
-        self.model.eval()
-        with torch.no_grad():
-            # 🔥 内存优化：使用from_numpy避免数据复制，确保float32
-            if not isinstance(X_seq, torch.Tensor):
-                # 🔥 关键修复：确保数据是连续的numpy数组
-                if not isinstance(X_seq, np.ndarray):
-                    X_seq = np.asarray(X_seq, dtype=np.float32)
-                elif X_seq.dtype != np.float32:
-                    X_seq = X_seq.astype(np.float32)
-                
-                # 🔥 优化内存操作：先检查连续性，只在必要时copy
-                if not X_seq.flags['C_CONTIGUOUS']:
-                    X_seq = np.ascontiguousarray(X_seq)
-                    # 如果已经是连续的，直接使用from_numpy（避免copy）
-                    X_tensor = torch.from_numpy(X_seq).to(self.device)
-                else:
-                    # 连续内存，直接使用from_numpy（避免copy，节省延迟）
-                    X_tensor = torch.from_numpy(X_seq).to(self.device)
-            else:
-                X_tensor = X_seq.to(self.device)
-            
-            probs = self.model.predict_proba(X_tensor)
-            return probs.cpu().numpy()
-    
-    def predict(self, X_seq):
-        """
-        预测类别（兼容scikit-learn，支持序列输入）
-        
-        Args:
-            X_seq: NumPy数组 (n_samples, seq_len, n_features)
-        
-        Returns:
-            预测类别数组
-        """
-        probs = self.predict_proba(X_seq)
-        return np.argmax(probs, axis=1)
 
 
 class EnsembleMLService(MLService):
@@ -255,6 +208,8 @@ class EnsembleMLService(MLService):
                 logger.info(f"      💾 预期GPU内存节省: ~40-50% (6.3GB → 3.5GB)")
     
     def _predict_xgboost(self, model: xgb.XGBClassifier, X: np.ndarray, return_single: bool = False) -> tuple:
+        """XGBoost预测辅助方法（使用模块函数）"""
+        return predict_xgboost(model, X, return_single)
         """
         XGBoost预测辅助方法（修复设备不匹配问题）
         
@@ -405,50 +360,12 @@ class EnsembleMLService(MLService):
                 raise
     
     def clear_gpu_memory(self):
-        """
-        清理GPU内存
-        
-        功能：
-        - 清空PyTorch缓存
-        - 同步GPU操作
-        - 强制垃圾回收
-        - 记录清理状态
-        """
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            gc.collect()
-            
-            # 记录GPU内存状态
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory
-            gpu_used = torch.cuda.memory_allocated(0)
-            gpu_free = gpu_memory - gpu_used
-            logger.info(f"🧹 GPU内存已清理 (使用: {gpu_used/1024**3:.1f}GB, 可用: {gpu_free/1024**3:.1f}GB)")
-        else:
-            logger.info("🧹 CPU模式，无需清理GPU内存")
+        """清理GPU内存"""
+        clear_gpu_memory()
     
     def monitor_gpu_memory(self):
-        """
-        监控GPU内存使用情况
-        
-        Returns:
-            Dict: GPU内存状态信息
-        """
-        if torch.cuda.is_available():
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory
-            gpu_used = torch.cuda.memory_allocated(0)
-            gpu_free = gpu_memory - gpu_used
-            gpu_reserved = torch.cuda.memory_reserved(0)
-            
-            return {
-                'total': gpu_memory,
-                'used': gpu_used,
-                'free': gpu_free,
-                'reserved': gpu_reserved,
-                'usage_percent': (gpu_used / gpu_memory) * 100
-            }
-        else:
-            return {'error': 'GPU不可用'}
+        """监控GPU内存使用情况"""
+        return monitor_gpu_memory()
     
     async def _prepare_diverse_training_data(self, timeframe: str, days_multiplier: float = 1.0) -> pd.DataFrame:
         """
@@ -517,44 +434,8 @@ class EnsembleMLService(MLService):
             raise
     
     def _prepare_features_labels_reuse(self, df: pd.DataFrame, timeframe: str) -> Tuple[pd.DataFrame, pd.Series]:
-        """
-        准备特征和标签（复用已选择的特征列）
-        
-        用途：为XGBoost和CatBoost准备数据时，复用LightGBM已选择的特征列
-        
-        Args:
-            df: 包含label列的DataFrame
-            timeframe: 时间框架
-        
-        Returns:
-            (X, y): 特征DataFrame和标签Series
-        """
-        try:
-            # 使用已选择的特征列（LightGBM训练时已确定）
-            feature_columns = self.feature_columns_dict.get(timeframe, [])
-            
-            if not feature_columns:
-                logger.error(f"{timeframe} 特征列未找到，无法复用")
-                return pd.DataFrame(), pd.Series()
-            
-            # 🔧 防御性过滤：移除无效列
-            invalid_cols = {'index', 'timestamp', 'date', 'label', 'target'}
-            feature_columns = [f for f in feature_columns if f not in invalid_cols]
-            
-            X = df[feature_columns].copy()
-            y = df['label'].copy()
-            
-            # 移除包含NaN的行
-            mask = ~(X.isna().any(axis=1) | y.isna())
-            X = X[mask]
-            y = y[mask]
-            
-            
-            return X, y
-            
-        except Exception as e:
-            logger.error(f"准备特征和标签（复用）失败: {e}")
-            return pd.DataFrame(), pd.Series()
+        """准备特征和标签（复用已选择的特征列）"""
+        return prepare_features_labels_reuse(df, timeframe, self.feature_columns_dict)
     
     def _create_sequence_input(
         self,
@@ -562,6 +443,11 @@ class EnsembleMLService(MLService):
         seq_len: int,
         timeframe: str
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """构造序列输入（使用模块函数）"""
+        return create_sequence_input(
+            df, seq_len, timeframe, self.feature_columns_dict,
+            self.model_dir, getattr(self, 'use_sequence_memmap', False)
+        )
         """
         构造序列输入（用于Informer-2模型）- 内存优化版
         
@@ -777,31 +663,52 @@ class EnsembleMLService(MLService):
             data_lgb = self.feature_engineer.create_features(data_lgb)
             data_lgb = self._create_labels(data_lgb, timeframe=timeframe)
             X_lgb, y_lgb = self._prepare_features_labels(data_lgb, timeframe)
+            
+            # 检查数据是否为空
+            if len(X_lgb) == 0 or len(y_lgb) == 0:
+                raise ValueError(f"LightGBM特征数据为空（X={len(X_lgb)}, y={len(y_lgb)}），无法继续训练")
+            
             X_lgb_scaled = self._scale_features(X_lgb, timeframe, fit=True)
             
             # 处理XGBoost数据（复用同一个scaler）
             data_xgb = self.feature_engineer.create_features(data_xgb)
             data_xgb = self._create_labels(data_xgb, timeframe=timeframe)
             X_xgb, y_xgb = self._prepare_features_labels_reuse(data_xgb, timeframe)
-            X_xgb_scaled = self._scale_features(X_xgb, timeframe, fit=False)
+            
+            # 检查数据是否为空（如果为空会在后面回退）
+            if len(X_xgb) > 0 and len(y_xgb) > 0:
+                X_xgb_scaled = self._scale_features(X_xgb, timeframe, fit=False)
+            else:
+                X_xgb_scaled = None
             
             # 处理CatBoost数据（复用同一个scaler）
             data_cat = self.feature_engineer.create_features(data_cat)
             data_cat = self._create_labels(data_cat, timeframe=timeframe)
             X_cat, y_cat = self._prepare_features_labels_reuse(data_cat, timeframe)
-            X_cat_scaled = self._scale_features(X_cat, timeframe, fit=False)
+            
+            # 检查数据是否为空（如果为空会在后面回退）
+            if len(X_cat) > 0 and len(y_cat) > 0:
+                X_cat_scaled = self._scale_features(X_cat, timeframe, fit=False)
+            else:
+                X_cat_scaled = None
             
             logger.info(f"✅ 三份数据处理完成: LGB={len(X_lgb)}, XGB={len(X_xgb)}, CAT={len(X_cat)}")
             
             # 🔧 安全回退：如果差异化数据获取失败，使用LightGBM数据作为备份
-            if len(X_xgb) == 0:
+            if len(X_xgb) == 0 or X_xgb_scaled is None:
                 logger.warning(f"⚠️ XGBoost数据为空，回退使用LightGBM数据")
                 X_xgb, y_xgb = X_lgb.copy(), y_lgb.copy()
-                X_xgb_scaled = X_lgb_scaled.copy() if isinstance(X_lgb_scaled, np.ndarray) else X_lgb_scaled.copy()
-            if len(X_cat) == 0:
+                if isinstance(X_lgb_scaled, np.ndarray):
+                    X_xgb_scaled = X_lgb_scaled.copy()
+                else:
+                    X_xgb_scaled = X_lgb_scaled.copy()
+            if len(X_cat) == 0 or X_cat_scaled is None:
                 logger.warning(f"⚠️ CatBoost数据为空，回退使用LightGBM数据")
                 X_cat, y_cat = X_lgb.copy(), y_lgb.copy()
-                X_cat_scaled = X_lgb_scaled.copy() if isinstance(X_lgb_scaled, np.ndarray) else X_lgb_scaled.copy()
+                if isinstance(X_lgb_scaled, np.ndarray):
+                    X_cat_scaled = X_lgb_scaled.copy()
+                else:
+                    X_cat_scaled = X_lgb_scaled.copy()
             
             # 🔧 最终验证：确保LightGBM数据足够
             if len(X_lgb) < 100:
@@ -870,35 +777,68 @@ class EnsembleMLService(MLService):
                 logger.info(f"📊 {timeframe} 序列数据分割: 训练{len(X_seq_train)}条, 验证{len(X_seq_val)}条, 测试{len(X_seq_test)}条")
                 
                 # 🔑 关键修复：对齐传统模型的验证集和测试集到序列数据的长度
-                # 序列数据比原始数据少seq_len个样本，需要对齐
+                # 序列数据比原始数据少seq_len个样本，且可能因为NaN过滤导致长度不同，需要对齐
                 seq_val_len = len(X_seq_val)
                 seq_test_len = len(X_seq_test)
-                if seq_val_len < len(X_lgb_val) or seq_test_len < len(X_lgb_test):
-                    logger.warning(f"⚠️ 对齐数据集：传统模型 Val{len(X_lgb_val)}/Test{len(X_lgb_test)}条 → Informer-2 Val{seq_val_len}/Test{seq_test_len}条")
-                    # 取传统模型验证集的最后seq_val_len个样本（时间对齐）
-                    if isinstance(X_lgb_val, np.ndarray):
-                        X_lgb_val = X_lgb_val[-seq_val_len:]
-                        X_xgb_val = X_xgb_val[-seq_val_len:]
-                        X_cat_val = X_cat_val[-seq_val_len:]
-                        X_lgb_test = X_lgb_test[-seq_test_len:]
-                        X_xgb_test = X_xgb_test[-seq_test_len:]
-                        X_cat_test = X_cat_test[-seq_test_len:]
-                    else:
-                        X_lgb_val = X_lgb_val.iloc[-seq_val_len:]
-                        X_xgb_val = X_xgb_val.iloc[-seq_val_len:]
-                        X_cat_val = X_cat_val.iloc[-seq_val_len:]
-                        X_lgb_test = X_lgb_test.iloc[-seq_test_len:]
-                        X_xgb_test = X_xgb_test.iloc[-seq_test_len:]
-                        X_cat_test = X_cat_test.iloc[-seq_test_len:]
+                lgb_val_len = len(X_lgb_val)
+                lgb_test_len = len(X_lgb_test)
+                
+                # 🔑 无论序列数据是长还是短，都需要对齐到相同的长度
+                if seq_val_len != lgb_val_len or seq_test_len != lgb_test_len:
+                    logger.warning(f"⚠️ 对齐数据集：传统模型 Val{lgb_val_len}/Test{lgb_test_len}条 → Informer-2 Val{seq_val_len}/Test{seq_test_len}条")
+                    # 使用较小的长度作为对齐目标（保证所有模型都有数据）
+                    align_val_len = min(seq_val_len, lgb_val_len)
+                    align_test_len = min(seq_test_len, lgb_test_len)
                     
-                    y_lgb_val = y_lgb_val.iloc[-seq_val_len:]
-                    y_xgb_val = y_xgb_val.iloc[-seq_val_len:]
-                    y_cat_val = y_cat_val.iloc[-seq_val_len:]
-                    y_lgb_test = y_lgb_test.iloc[-seq_test_len:]
-                    y_xgb_test = y_xgb_test.iloc[-seq_test_len:]
-                    y_cat_test = y_cat_test.iloc[-seq_test_len:]
+                    # 对齐传统模型数据（取最后N个样本，保证时间对齐）
+                    if isinstance(X_lgb_val, np.ndarray):
+                        X_lgb_val = X_lgb_val[-align_val_len:]
+                        X_xgb_val = X_xgb_val[-align_val_len:]
+                        X_cat_val = X_cat_val[-align_val_len:]
+                        X_lgb_test = X_lgb_test[-align_test_len:]
+                        X_xgb_test = X_xgb_test[-align_test_len:]
+                        X_cat_test = X_cat_test[-align_test_len:]
+                    else:
+                        X_lgb_val = X_lgb_val.iloc[-align_val_len:]
+                        X_xgb_val = X_xgb_val.iloc[-align_val_len:]
+                        X_cat_val = X_cat_val.iloc[-align_val_len:]
+                        X_lgb_test = X_lgb_test.iloc[-align_test_len:]
+                        X_xgb_test = X_xgb_test.iloc[-align_test_len:]
+                        X_cat_test = X_cat_test.iloc[-align_test_len:]
+                    
+                    y_lgb_val = y_lgb_val.iloc[-align_val_len:]
+                    y_xgb_val = y_xgb_val.iloc[-align_val_len:]
+                    y_cat_val = y_cat_val.iloc[-align_val_len:]
+                    y_lgb_test = y_lgb_test.iloc[-align_test_len:]
+                    y_xgb_test = y_xgb_test.iloc[-align_test_len:]
+                    y_cat_test = y_cat_test.iloc[-align_test_len:]
+                    
+                    # 对齐序列数据（取最后N个样本，保证时间对齐）
+                    X_seq_val = X_seq_val[-align_val_len:]
+                    X_seq_test = X_seq_test[-align_test_len:]
+                    y_seq_val = y_seq_val[-align_val_len:]
+                    y_seq_test = y_seq_test[-align_test_len:]
+                    
+                    logger.info(f"   ✅ 对齐完成：验证集{align_val_len}条，测试集{align_test_len}条")
             
             logger.info(f"📊 {timeframe} 传统模型数据分割: 训练{len(X_lgb_train)}条, 验证{len(X_lgb_val)}条, 测试{len(X_lgb_test)}条")
+            
+            # 🔑 关键修复：训练前完整数据验证（避免训练中途失败）
+            logger.info(f"🔍 训练前数据完整性验证...")
+            validation_result = self._validate_training_data(
+                X_lgb_train, y_lgb_train, X_lgb_val, y_lgb_val, X_lgb_test, y_lgb_test,
+                X_xgb_train, y_xgb_train, X_xgb_val, y_xgb_val, X_xgb_test, y_xgb_test,
+                X_cat_train, y_cat_train, X_cat_val, y_cat_val, X_cat_test, y_cat_test,
+                X_seq_train, y_seq_train, X_seq_val, y_seq_val, X_seq_test, y_seq_test,
+                timeframe
+            )
+            
+            if not validation_result['valid']:
+                error_msg = f"❌ 训练前数据验证失败: {validation_result['error']}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            
+            logger.info(f"✅ 数据验证通过: {validation_result['summary']}")
             
             # 4️⃣ 训练Stacking集成模型（使用差异化数据 + 序列输入）
             logger.info(f"🚂 开始训练 {timeframe} Stacking集成（差异化数据）...")
@@ -921,6 +861,188 @@ class EnsembleMLService(MLService):
             logger.error(f"❌ {timeframe} 集成模型训练失败: {e}")
             logger.error(traceback.format_exc())
             raise
+    
+    def _validate_training_data(
+        self,
+        X_lgb_train, y_lgb_train, X_lgb_val, y_lgb_val, X_lgb_test, y_lgb_test,
+        X_xgb_train, y_xgb_train, X_xgb_val, y_xgb_val, X_xgb_test, y_xgb_test,
+        X_cat_train, y_cat_train, X_cat_val, y_cat_val, X_cat_test, y_cat_test,
+        X_seq_train, y_seq_train, X_seq_val, y_seq_val, X_seq_test, y_seq_test,
+        timeframe: str
+    ) -> Dict[str, Any]:
+        """
+        训练前完整数据验证（避免训练中途失败）
+        
+        验证内容：
+        1. 传统模型数据形状一致性
+        2. 序列数据形状一致性（如果启用）
+        3. 传统模型与序列数据对齐
+        4. 标签与特征数量匹配
+        5. 数据非空检查
+        
+        Returns:
+            Dict: {'valid': bool, 'error': str, 'summary': str}
+        """
+        try:
+            errors = []
+            warnings = []
+            
+            # 1. 传统模型数据形状一致性检查
+            logger.debug("   检查传统模型数据形状一致性...")
+            
+            # 训练集
+            lgb_train_len = len(X_lgb_train) if hasattr(X_lgb_train, '__len__') else X_lgb_train.shape[0]
+            xgb_train_len = len(X_xgb_train) if hasattr(X_xgb_train, '__len__') else X_xgb_train.shape[0]
+            cat_train_len = len(X_cat_train) if hasattr(X_cat_train, '__len__') else X_cat_train.shape[0]
+            
+            if lgb_train_len != xgb_train_len or lgb_train_len != cat_train_len:
+                errors.append(f"训练集长度不一致: LGB={lgb_train_len}, XGB={xgb_train_len}, CAT={cat_train_len}")
+            
+            if len(y_lgb_train) != lgb_train_len:
+                errors.append(f"训练集标签长度不匹配: X={lgb_train_len}, y={len(y_lgb_train)}")
+            
+            # 验证集
+            lgb_val_len = len(X_lgb_val) if hasattr(X_lgb_val, '__len__') else X_lgb_val.shape[0]
+            xgb_val_len = len(X_xgb_val) if hasattr(X_xgb_val, '__len__') else X_xgb_val.shape[0]
+            cat_val_len = len(X_cat_val) if hasattr(X_cat_val, '__len__') else X_cat_val.shape[0]
+            
+            if lgb_val_len != xgb_val_len or lgb_val_len != cat_val_len:
+                errors.append(f"验证集长度不一致: LGB={lgb_val_len}, XGB={xgb_val_len}, CAT={cat_val_len}")
+            
+            if len(y_lgb_val) != lgb_val_len:
+                errors.append(f"验证集标签长度不匹配: X={lgb_val_len}, y={len(y_lgb_val)}")
+            
+            # 测试集
+            lgb_test_len = len(X_lgb_test) if hasattr(X_lgb_test, '__len__') else X_lgb_test.shape[0]
+            xgb_test_len = len(X_xgb_test) if hasattr(X_xgb_test, '__len__') else X_xgb_test.shape[0]
+            cat_test_len = len(X_cat_test) if hasattr(X_cat_test, '__len__') else X_cat_test.shape[0]
+            
+            if lgb_test_len != xgb_test_len or lgb_test_len != cat_test_len:
+                errors.append(f"测试集长度不一致: LGB={lgb_test_len}, XGB={xgb_test_len}, CAT={cat_test_len}")
+            
+            if len(y_lgb_test) != lgb_test_len:
+                errors.append(f"测试集标签长度不匹配: X={lgb_test_len}, y={len(y_lgb_test)}")
+            
+            # 2. 序列数据形状一致性检查（如果启用）
+            if X_seq_train is not None:
+                logger.debug("   检查序列数据形状一致性...")
+                
+                seq_train_len = len(X_seq_train)
+                seq_val_len = len(X_seq_val) if X_seq_val is not None else 0
+                seq_test_len = len(X_seq_test) if X_seq_test is not None else 0
+                
+                if len(y_seq_train) != seq_train_len:
+                    errors.append(f"序列训练集标签长度不匹配: X={seq_train_len}, y={len(y_seq_train)}")
+                
+                if X_seq_val is not None and len(y_seq_val) != seq_val_len:
+                    errors.append(f"序列验证集标签长度不匹配: X={seq_val_len}, y={len(y_seq_val)}")
+                
+                if X_seq_test is not None and len(y_seq_test) != seq_test_len:
+                    errors.append(f"序列测试集标签长度不匹配: X={seq_test_len}, y={len(y_seq_test)}")
+                
+                # 3. 传统模型与序列数据对齐检查（关键：必须在训练前对齐）
+                logger.debug("   检查传统模型与序列数据对齐...")
+                
+                if seq_val_len != lgb_val_len:
+                    errors.append(
+                        f"❌ 致命错误：序列验证集未对齐！序列={seq_val_len}, 传统={lgb_val_len}。"
+                        f"这应该在数据分割阶段完成对齐，否则训练中途会失败。"
+                    )
+                
+                if seq_test_len != lgb_test_len:
+                    errors.append(
+                        f"❌ 致命错误：序列测试集未对齐！序列={seq_test_len}, 传统={lgb_test_len}。"
+                        f"这应该在数据分割阶段完成对齐，否则训练中途会失败。"
+                    )
+            
+            # 4. 数据非空检查
+            logger.debug("   检查数据非空...")
+            
+            if lgb_train_len == 0:
+                errors.append("训练集为空")
+            if lgb_val_len == 0:
+                errors.append("验证集为空")
+            if lgb_test_len == 0:
+                errors.append("测试集为空")
+            
+            if X_seq_train is not None:
+                if seq_train_len == 0:
+                    errors.append("序列训练集为空")
+                if seq_val_len == 0:
+                    errors.append("序列验证集为空")
+                if seq_test_len == 0:
+                    errors.append("序列测试集为空")
+            
+            # 5. 特征数量一致性检查
+            logger.debug("   检查特征数量一致性...")
+            
+            if hasattr(X_lgb_train, 'shape'):
+                lgb_n_features = X_lgb_train.shape[-1] if len(X_lgb_train.shape) > 1 else 1
+                xgb_n_features = X_xgb_train.shape[-1] if len(X_xgb_train.shape) > 1 else 1
+                cat_n_features = X_cat_train.shape[-1] if len(X_cat_train.shape) > 1 else 1
+                
+                if lgb_n_features != xgb_n_features or lgb_n_features != cat_n_features:
+                    errors.append(f"特征数量不一致: LGB={lgb_n_features}, XGB={xgb_n_features}, CAT={cat_n_features}")
+            
+            # 6. 标签值范围检查
+            logger.debug("   检查标签值范围...")
+            
+            for name, y_data in [('训练', y_lgb_train), ('验证', y_lgb_val), ('测试', y_lgb_test)]:
+                if hasattr(y_data, 'values'):
+                    unique_labels = set(y_data.values)
+                elif hasattr(y_data, '__iter__'):
+                    unique_labels = set(y_data)
+                else:
+                    continue
+                
+                invalid_labels = unique_labels - {0, 1, 2}
+                if invalid_labels:
+                    errors.append(f"{name}集标签包含非法值: {invalid_labels}（期望0,1,2）")
+            
+            # 汇总结果
+            if errors:
+                error_msg = "; ".join(errors)
+                return {
+                    'valid': False,
+                    'error': error_msg,
+                    'summary': f"发现{len(errors)}个错误",
+                    'errors': errors,
+                    'warnings': warnings
+                }
+            
+            # 生成摘要
+            summary_parts = [
+                f"传统模型: 训练{lgb_train_len}条, 验证{lgb_val_len}条, 测试{lgb_test_len}条"
+            ]
+            
+            if X_seq_train is not None:
+                summary_parts.append(
+                    f"序列数据: 训练{seq_train_len}条, 验证{seq_val_len}条, 测试{seq_test_len}条"
+                )
+                summary_parts.append("✅ 数据已对齐")
+            
+            if warnings:
+                for warning in warnings:
+                    logger.warning(f"   ⚠️ {warning}")
+            
+            return {
+                'valid': True,
+                'error': None,
+                'summary': " | ".join(summary_parts),
+                'errors': [],
+                'warnings': warnings
+            }
+            
+        except Exception as e:
+            logger.error(f"数据验证过程出错: {e}")
+            logger.error(traceback.format_exc())
+            return {
+                'valid': False,
+                'error': f"验证过程异常: {str(e)}",
+                'summary': "验证失败",
+                'errors': [str(e)],
+                'warnings': []
+            }
     
     def _train_stacking_diverse(
         self,
@@ -1095,10 +1217,10 @@ class EnsembleMLService(MLService):
             logger.info(f"验证集概率形状: lgb={lgb_pred_proba_val.shape}, xgb={xgb_pred_proba_val.shape}, cat={cat_pred_proba_val.shape}")
             logger.info(f"测试集概率形状: lgb={lgb_pred_proba_test.shape}, xgb={xgb_pred_proba_test.shape}, cat={cat_pred_proba_test.shape}")
             
-            # 🔑 验证形状一致性（验证集）
+            # 🔑 验证形状一致性（验证集 - 传统模型）
             assert lgb_pred_proba_val.shape == xgb_pred_proba_val.shape == cat_pred_proba_val.shape, \
                 f"验证集概率数组形状不一致: {lgb_pred_proba_val.shape} vs {xgb_pred_proba_val.shape} vs {cat_pred_proba_val.shape}"
-            # 🔑 验证形状一致性（测试集）
+            # 🔑 验证形状一致性（测试集 - 传统模型）
             assert lgb_pred_proba_test.shape == xgb_pred_proba_test.shape == cat_pred_proba_test.shape, \
                 f"测试集概率数组形状不一致: {lgb_pred_proba_test.shape} vs {xgb_pred_proba_test.shape} vs {cat_pred_proba_test.shape}"
             
@@ -1122,6 +1244,36 @@ class EnsembleMLService(MLService):
             xgb_pred_test = xgb_pred_raw_test.ravel()
             cat_pred_test = cat_pred_raw_test.ravel()
             
+            # 🔑 关键修复：训练前已验证数据对齐，这里只做最终确认（不应再出现对齐问题）
+            # 如果这里还出现不一致，说明训练前验证有遗漏，这是致命错误
+            if inf_pred_proba_val is not None:
+                if inf_pred_proba_val.shape[0] != lgb_pred_proba_val.shape[0]:
+                    error_msg = (
+                        f"❌ 致命错误：训练前验证遗漏！Informer-2验证集样本数({inf_pred_proba_val.shape[0]})"
+                        f"与传统模型({lgb_pred_proba_val.shape[0]})不一致。"
+                        f"这应该在训练前就被检测到，说明训练前验证逻辑有缺陷。"
+                    )
+                    logger.error(error_msg)
+                    raise ValueError(error_msg)
+            
+            if inf_pred_proba_test is not None:
+                if inf_pred_proba_test.shape[0] != lgb_pred_proba_test.shape[0]:
+                    error_msg = (
+                        f"❌ 致命错误：训练前验证遗漏！Informer-2测试集样本数({inf_pred_proba_test.shape[0]})"
+                        f"与传统模型({lgb_pred_proba_test.shape[0]})不一致。"
+                        f"这应该在训练前就被检测到，说明训练前验证逻辑有缺陷。"
+                    )
+                    logger.error(error_msg)
+                    raise ValueError(error_msg)
+            
+            # 🔑 最终确认：所有模型预测结果形状一致（训练前已验证，这里只是双重确认）
+            if inf_pred_proba_val is not None:
+                assert lgb_pred_proba_val.shape[0] == inf_pred_proba_val.shape[0], \
+                    f"训练前验证遗漏：验证集样本数不一致 lgb={lgb_pred_proba_val.shape[0]} vs inf={inf_pred_proba_val.shape[0]}"
+            if inf_pred_proba_test is not None:
+                assert lgb_pred_proba_test.shape[0] == inf_pred_proba_test.shape[0], \
+                    f"训练前验证遗漏：测试集样本数不一致 lgb={lgb_pred_proba_test.shape[0]} vs inf={inf_pred_proba_test.shape[0]}"
+            
             # 🔑 严格验证预测数组形状
             expected_shape_val = (len(y_lgb_val),)
             expected_shape_test = (len(y_lgb_test),)
@@ -1137,6 +1289,16 @@ class EnsembleMLService(MLService):
             # 🆕 生成元特征的辅助函数
             def _build_meta_features(lgb_proba, xgb_proba, cat_proba, inf_proba, lgb_pred, xgb_pred, cat_pred, y_labels, dataset_name):
                 """构建元特征"""
+                # 🔑 验证输入形状一致性
+                n_samples = lgb_proba.shape[0]
+                assert xgb_proba.shape[0] == n_samples, f"{dataset_name} xgb_proba样本数不一致: {xgb_proba.shape[0]} != {n_samples}"
+                assert cat_proba.shape[0] == n_samples, f"{dataset_name} cat_proba样本数不一致: {cat_proba.shape[0]} != {n_samples}"
+                assert lgb_pred.shape[0] == n_samples, f"{dataset_name} lgb_pred样本数不一致: {lgb_pred.shape[0]} != {n_samples}"
+                assert xgb_pred.shape[0] == n_samples, f"{dataset_name} xgb_pred样本数不一致: {xgb_pred.shape[0]} != {n_samples}"
+                assert cat_pred.shape[0] == n_samples, f"{dataset_name} cat_pred样本数不一致: {cat_pred.shape[0]} != {n_samples}"
+                if inf_proba is not None:
+                    assert inf_proba.shape[0] == n_samples, f"{dataset_name} inf_proba样本数不一致: {inf_proba.shape[0]} != {n_samples}"
+                
                 # 1. 模型一致性
                 agreement_bool = (lgb_pred == xgb_pred) & (xgb_pred == cat_pred)
                 agreement = agreement_bool.astype(float).reshape(-1, 1)
@@ -1416,7 +1578,6 @@ class EnsembleMLService(MLService):
             ]))
             
             # 🆕 交易经济性指标 - 使用Decimal确保金融计算精度
-            from decimal import Decimal, ROUND_HALF_UP
             signal_frequency_decimal = Decimal(str(signal_frequency))
             signal_accuracy_decimal = Decimal(str(signal_accuracy))
             
@@ -1690,232 +1851,29 @@ class EnsembleMLService(MLService):
             raise
     
     def _train_lightgbm(self, X_train: pd.DataFrame, y_train: pd.Series, timeframe: str, custom_params: Optional[Dict[str, Any]] = None):
-        """
-        训练LightGBM模型（覆盖父类方法，统一三模型训练代码位置）
-        
-        Args:
-            X_train: 训练特征
-            y_train: 训练标签
-            timeframe: 时间框架
-            custom_params: 自定义参数（Optuna优化后的参数，优先级最高）
-        """
-        try:
-            # 🎮 统一GPU内存管理：训练前清理
-            self.clear_gpu_memory()
-            
-            # 样本加权（有效样本数 × 时间衰减 × HOLD惩罚）
-            class_weights = self._compute_effective_sample_weights(y_train, timeframe)
-            time_decay = np.exp(-np.arange(len(X_train)) / (len(X_train) * 0.1))[::-1]
-            
-            # 🔑 HOLD类别降权（按HOLD占比自适应）
-            hold_ratio = float((y_train == 1).sum()) / max(len(y_train), 1)
-            if timeframe == '3m':
-                hold_weight = float(max(0.35, min(0.70, 0.80 - 0.6 * hold_ratio)))
-            else:
-                hold_weight = float(max(0.50, min(0.75, 0.85 - 0.5 * hold_ratio)))
-            hold_penalty = np.where(y_train == 1, hold_weight, 1.0)
-            
-            sample_weights = class_weights * time_decay * hold_penalty
-            
-            logger.info(f"✅ 样本加权已启用：有效样本数 × 时间衰减 × HOLD惩罚({hold_weight:.2f})")
-            
-            # 确定最终参数（优先级：custom_params > timeframe_params > base_params）
-            if custom_params:
-                params = custom_params
-                logger.info(f"🎯 使用Optuna优化参数")
-            else:
-                # 获取时间框架差异化参数
-                timeframe_params = self.lgb_params_by_timeframe.get(timeframe, {})
-                # 合并基础参数和差异化参数
-                params = {**self.lgb_params, **timeframe_params}
-            
-            # 🎮 启用GPU加速（如果配置启用）
-            if self.use_gpu:
-                params['device'] = 'gpu'
-                params['gpu_platform_id'] = 0
-                params['gpu_device_id'] = 0
-                logger.info(f"🚀 LightGBM GPU加速已启用")
-            
-            logger.info(f"📊 {timeframe} LightGBM参数: num_leaves={params.get('num_leaves')}, "
-                       f"reg_alpha={params.get('reg_alpha', 0)}, reg_lambda={params.get('reg_lambda', 0)}")
-            
-            # 创建并训练模型（params中已包含random_state=42）
-            model = lgb.LGBMClassifier(**params)
-            model.fit(X_train, y_train, sample_weight=sample_weights)
-            
-            # 🎮 统一GPU内存管理：训练后清理
-            self.clear_gpu_memory()
-            
-            return model
-            
-        except Exception as e:
-            logger.error(f"LightGBM训练失败: {e}")
-            # 🎮 统一GPU内存管理：异常时清理
-            self.clear_gpu_memory()
-            raise
+        """训练LightGBM模型（使用模块函数）"""
+        return train_lightgbm(
+            X_train, y_train, timeframe,
+            self.lgb_params, self.lgb_params_by_timeframe,
+            self.use_gpu, self._compute_effective_sample_weights,
+            custom_params
+        )
     
     def _train_xgboost(self, X_train: pd.DataFrame, y_train: pd.Series, timeframe: str, custom_params: Optional[Dict[str, Any]] = None):
-        """训练XGBoost模型（防过拟合 + GPU内存管理）"""
-        try:
-            # 🎮 统一GPU内存管理：训练前清理
-            self.clear_gpu_memory()
-            
-            # 样本加权（有效样本数 × 时间衰减 × HOLD惩罚）
-            class_weights = self._compute_effective_sample_weights(y_train, timeframe)
-            time_decay = np.exp(-np.arange(len(X_train)) / (len(X_train) * 0.1))[::-1]
-            
-            # 🔑 HOLD类别降权（按HOLD占比自适应）
-            hold_ratio = float((y_train == 1).sum()) / max(len(y_train), 1)
-            if timeframe == '3m':
-                hold_weight = float(max(0.35, min(0.70, 0.80 - 0.6 * hold_ratio)))
-            else:
-                hold_weight = float(max(0.50, min(0.75, 0.85 - 0.5 * hold_ratio)))
-            hold_penalty = np.where(y_train == 1, hold_weight, 1.0)
-            
-            sample_weights = class_weights * time_decay * hold_penalty
-            
-            # 🔑 时间框架差异化配置（仅3m/5m/15m）
-            if custom_params:
-                # 使用Optuna优化的参数
-                params = custom_params.copy()
-                logger.info(f"🎯 使用Optuna优化参数")
-            else:
-                # 使用默认参数（仅3m/5m/15m）
-                if timeframe == '15m':
-                    params = {
-                        'max_depth': 6,
-                        'learning_rate': 0.05,
-                        'n_estimators': 300,
-                        'reg_alpha': 0.3,
-                        'reg_lambda': 0.3
-                    }
-                elif timeframe == '5m':
-                    params = {
-                        'max_depth': 5,
-                        'learning_rate': 0.06,
-                        'n_estimators': 220,
-                        'reg_alpha': 0.5,
-                        'reg_lambda': 0.5
-                    }
-                else:  # 3m
-                    params = {
-                        'max_depth': 5,
-                        'learning_rate': 0.07,
-                        'n_estimators': 180,
-                        'reg_alpha': 0.6,
-                        'reg_lambda': 0.6
-                    }
-            
-            # 通用参数
-            params.update({
-                'objective': 'multi:softprob',
-                'num_class': 3,
-                'eval_metric': 'mlogloss',
-                'random_state': 42,
-                'subsample': 0.8,
-                'colsample_bytree': 0.8
-            })
-            
-            # 🎮 GPU加速（如果启用）
-            if self.use_gpu:
-                params['tree_method'] = 'hist'  # 新版本使用 hist
-                params['device'] = 'cuda'  # 使用 device 参数指定 GPU
-                logger.info(f"🚀 XGBoost GPU加速已启用")
-            else:
-                params['tree_method'] = 'hist'
-            
-            model = xgb.XGBClassifier(**params)
-            model.fit(X_train, y_train, sample_weight=sample_weights, verbose=False)
-            
-            # 🎮 统一GPU内存管理：训练后清理
-            self.clear_gpu_memory()
-            
-            return model
-            
-        except Exception as e:
-            logger.error(f"XGBoost训练失败: {e}")
-            # 🎮 统一GPU内存管理：异常时清理
-            self.clear_gpu_memory()
-            raise
+        """训练XGBoost模型（使用模块函数）"""
+        return train_xgboost(
+            X_train, y_train, timeframe,
+            self.use_gpu, self._compute_effective_sample_weights,
+            custom_params
+        )
     
     def _train_catboost(self, X_train: pd.DataFrame, y_train: pd.Series, timeframe: str, custom_params: Optional[Dict[str, Any]] = None):
-        """训练CatBoost模型（防过拟合 + GPU内存管理）"""
-        try:
-            # 🎮 统一GPU内存管理：训练前清理
-            self.clear_gpu_memory()
-            
-            # 样本加权（有效样本数 × 时间衰减 × HOLD惩罚）
-            class_weights = self._compute_effective_sample_weights(y_train, timeframe)
-            time_decay = np.exp(-np.arange(len(X_train)) / (len(X_train) * 0.1))[::-1]
-            
-            # 🔑 HOLD类别降权（按HOLD占比自适应）
-            hold_ratio = float((y_train == 1).sum()) / max(len(y_train), 1)
-            if timeframe == '3m':
-                hold_weight = float(max(0.35, min(0.70, 0.80 - 0.6 * hold_ratio)))
-            else:
-                hold_weight = float(max(0.50, min(0.75, 0.85 - 0.5 * hold_ratio)))
-            hold_penalty = np.where(y_train == 1, hold_weight, 1.0)
-            
-            sample_weights = class_weights * time_decay * hold_penalty
-            
-            # 🔑 时间框架差异化配置（仅3m/5m/15m）
-            if custom_params:
-                # 使用Optuna优化的参数
-                params = custom_params.copy()
-                logger.info(f"🎯 使用Optuna优化参数")
-            else:
-                # 使用默认参数（仅3m/5m/15m）
-                if timeframe == '15m':
-                    params = {
-                        'iterations': 300,
-                        'learning_rate': 0.05,
-                        'depth': 6,
-                        'l2_leaf_reg': 3.0
-                    }
-                elif timeframe == '5m':
-                    params = {
-                        'iterations': 220,
-                        'learning_rate': 0.06,
-                        'depth': 6,
-                        'l2_leaf_reg': 4.0
-                    }
-                else:  # 3m
-                    params = {
-                        'iterations': 180,
-                        'learning_rate': 0.07,
-                        'depth': 6,
-                        'l2_leaf_reg': 5.0
-                    }
-            
-            # 通用参数
-            params.update({
-                'loss_function': 'MultiClass',
-                'random_seed': 42,
-                'verbose': False,
-                'bootstrap_type': 'Bernoulli',
-                'subsample': 0.8,
-                'allow_writing_files': False
-            })
-            
-            # 🎮 GPU加速（如果启用）
-            if self.use_gpu:
-                params['task_type'] = 'GPU'
-                params['devices'] = '0'
-                logger.info(f"🚀 CatBoost GPU加速已启用")
-            
-            model = CatBoostClassifier(**params)
-            model.fit(X_train, y_train, sample_weight=sample_weights, verbose=False)
-            
-            # 🎮 统一GPU内存管理：训练后清理
-            self.clear_gpu_memory()
-            
-            return model
-            
-        except Exception as e:
-            logger.error(f"CatBoost训练失败: {e}")
-            # 🎮 统一GPU内存管理：异常时清理
-            self.clear_gpu_memory()
-            raise
+        """训练CatBoost模型（使用模块函数）"""
+        return train_catboost(
+            X_train, y_train, timeframe,
+            self.use_gpu, self._compute_effective_sample_weights,
+            custom_params
+        )
     
     def _train_informer2(self, X_seq_train: np.ndarray, y_seq_train: np.ndarray, timeframe: str, custom_params: Optional[Dict[str, Any]] = None):
         """
@@ -2815,155 +2773,57 @@ class EnsembleMLService(MLService):
             return {}
     
     def _save_ensemble_models(self, timeframe: str):
-        """
-        保存集成模型（生产级别：原子性保存 + 热部署）
-        
-        使用临时文件+原子性重命名，确保：
-        1. 保存过程中不影响正在使用的模型
-        2. 保存失败不会破坏现有模型
-        3. 保存成功后立即可用（热部署）
-        4. 旧模型自动备份到 models/old/YYYY-MM-DD_HH-MM-SS/
-        """
+        """保存集成模型（使用模块函数）"""
         try:
             models = self.ensemble_models[timeframe]
-            model_dir = Path(self.model_dir)
-            model_dir.mkdir(parents=True, exist_ok=True)
+            success = save_ensemble_models(
+                models, timeframe, self.model_dir,
+                self.scalers, self.feature_columns_dict
+            )
             
-            # 🔥 使用临时目录进行原子性保存
-            # 🔧 修复：处理SYMBOL中的/字符（如"ETH/USDT"），替换为_避免路径问题
-            safe_symbol = settings.SYMBOL.replace('/', '_')
-            
-            # 🔑 备份旧模型到 models/old/YYYY-MM-DD_HH-MM-SS/
-            old_model_files = []
-            backup_dir = None
-            if model_dir.exists():
-                # 查找现有的模型文件
-                pattern = f"{safe_symbol}_{timeframe}_*"
-                existing_files = list(model_dir.glob(pattern))
-                if existing_files:
-                    # 创建备份目录（使用当前时间戳）
-                    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-                    old_dir = model_dir.parent / 'old' / timestamp
-                    old_dir.mkdir(parents=True, exist_ok=True)
-                    backup_dir = old_dir
-                    
-                    # 备份所有相关文件
-                    for file_path in existing_files:
-                        backup_path = old_dir / file_path.name
-                        shutil.copy2(file_path, backup_path)
-                        old_model_files.append(file_path.name)
-                    
-                    if old_model_files:
-                        logger.info(f"📦 {timeframe} 旧模型已备份到: {old_dir} ({len(old_model_files)}个文件)")
-            
-            with tempfile.TemporaryDirectory(dir=model_dir) as temp_dir:
-                temp_path = Path(temp_dir)
-                saved_count = 0
-                
-                # 🔑 保存模型到临时目录
-                model_mapping = {
-                    'lgb': 'lgb',
-                    'xgb': 'xgb',
-                    'cat': 'cat',
-                    'meta': 'meta'
-                }
-                
-                for short_name in model_mapping:
-                    if short_name in models:
-                        temp_file = temp_path / f"{safe_symbol}_{timeframe}_{short_name}_model.pkl"
-                        temp_file.parent.mkdir(parents=True, exist_ok=True)
-                        with open(temp_file, 'wb') as f:
-                            pickle.dump(models[short_name], f)
-                        saved_count += 1
-                
-                # 保存Informer-2
-                if 'inf' in models and TORCH_AVAILABLE:
-                    temp_file = temp_path / f"{safe_symbol}_{timeframe}_inf_model.pt"
-                    temp_file.parent.mkdir(parents=True, exist_ok=True)
-                    with open(temp_file, 'wb') as f:
-                        pickle.dump(models['inf'], f)
-                    saved_count += 1
-                
-                # 保存scaler和特征列表
-                if timeframe in self.scalers:
-                    temp_file = temp_path / f"{safe_symbol}_{timeframe}_scaler.pkl"
-                    temp_file.parent.mkdir(parents=True, exist_ok=True)
-                    with open(temp_file, 'wb') as f:
-                        pickle.dump(self.scalers[timeframe], f)
-                    saved_count += 1
-                
-                if timeframe in self.feature_columns_dict:
-                    temp_file = temp_path / f"{safe_symbol}_{timeframe}_features.pkl"
-                    temp_file.parent.mkdir(parents=True, exist_ok=True)
-                    with open(temp_file, 'wb') as f:
-                        pickle.dump(self.feature_columns_dict[timeframe], f)
-                    saved_count += 1
-                
-                # 🔥 原子性移动：一次性替换所有文件
-                for temp_file in temp_path.glob(f"{safe_symbol}_{timeframe}_*"):
-                    target_file = model_dir / temp_file.name
-                    target_file.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(temp_file), str(target_file))
-                
-                logger.info(f"✅ {timeframe} 集成模型保存完成（{saved_count}个文件，原子性更新）")
-            
-            # 🔥 热部署：重新加载模型（确保使用最新模型）
-            logger.info(f"🔄 {timeframe} 开始热部署：重新加载模型...")
-            if self._load_ensemble_models(timeframe):
-                logger.info(f"✅ {timeframe} 热部署完成：新模型已生效")
-            else:
-                logger.warning(f"⚠️ {timeframe} 热部署失败：模型加载失败，但文件已保存")
-            
+            if success:
+                logger.info(f"{timeframe} 开始热部署：重新加载模型...")
+                if self._load_ensemble_models(timeframe):
+                    logger.info(f"{timeframe} 热部署完成：新模型已生效")
+                else:
+                    logger.warning(f"{timeframe} 热部署失败：模型加载失败，但文件已保存")
         except Exception as e:
             logger.error(f"保存集成模型失败: {e}")
             logger.error(traceback.format_exc())
     
     def _load_ensemble_models(self, timeframe: str) -> bool:
-        """加载集成模型（支持Informer-2）"""
+        """加载集成模型（使用模块函数）"""
         try:
-            model_dir = Path(self.model_dir)  # 使用父类的model_dir
-            models = {}
+            models = load_ensemble_models(
+                timeframe, self.model_dir,
+                self.scalers, self.feature_columns_dict
+            )
             
-            # 🔧 修复：处理SYMBOL中的/字符（如"ETH/USDT"），替换为_避免路径问题
-            # 必须与_save_ensemble_models中的逻辑保持一致
-            safe_symbol = settings.SYMBOL.replace('/', '_')
-            
-            # 🔑 加载传统模型（必需）
-            model_mapping = {
-                'lgb': 'lgb',
-                'xgb': 'xgb',
-                'cat': 'cat',
-                'meta': 'meta'
-            }
-            
-            # 检查必需模型文件是否存在
-            for short_name in model_mapping:
-                filepath = model_dir / f"{safe_symbol}_{timeframe}_{short_name}_model.pkl"
-                if not filepath.exists():
-                    logger.warning(f"⚠️ {timeframe} {short_name}模型文件不存在: {filepath}")
-                    # 🔧 增强诊断：列出实际存在的文件
-                    existing_files = list(model_dir.glob(f"*_{timeframe}_{short_name}_model.pkl"))
-                    if existing_files:
-                        logger.info(f"   发现类似文件: {existing_files}")
-                    return False
-            
-            # 加载所有传统模型
-            for short_name in model_mapping:
-                filepath = model_dir / f"{safe_symbol}_{timeframe}_{short_name}_model.pkl"
-                with open(filepath, 'rb') as f:
-                    models[short_name] = pickle.load(f)
-            
-            # 🤖 加载Informer-2模型（可选，如果存在）
-            if TORCH_AVAILABLE:
-                inf_filepath = model_dir / f"{safe_symbol}_{timeframe}_inf_model.pt"
-                if inf_filepath.exists():
-                    with open(inf_filepath, 'rb') as f:
-                        models['inf'] = pickle.load(f)
-                    logger.info(f"   ✅ Informer-2模型已加载")
+            if models is None:
+                return False
             
             self.ensemble_models[timeframe] = models
             
-            # 🔥 加载scaler和features（关键！预测时需要）
+            # 过滤无效特征列
+            if timeframe in self.feature_columns_dict:
+                invalid_cols = {'index', 'timestamp', 'date', 'label', 'target'}
+                raw_features = self.feature_columns_dict[timeframe]
+                cleaned_features = [f for f in raw_features if f not in invalid_cols]
+                if len(cleaned_features) != len(raw_features):
+                    removed = set(raw_features) - set(cleaned_features)
+                    logger.warning(f"{timeframe} 特征列过滤: 移除了无效列 {removed}")
+                self.feature_columns_dict[timeframe] = cleaned_features
+            
+            # 标记模型为就绪
+            self.models_ready[timeframe] = True
+            
+            logger.info(f"{timeframe} 集成模型加载完成（{len(models)}个模型）")
+            return True
+            
+        except Exception as e:
+            logger.error(f"加载集成模型失败: {e}")
+            logger.error(traceback.format_exc())
+            return False
             scaler_path = model_dir / f"{safe_symbol}_{timeframe}_scaler.pkl"
             if scaler_path.exists():
                 with open(scaler_path, 'rb') as f:

@@ -1,20 +1,23 @@
 """
 数据获取服务
 """
+# StdLib
 import asyncio
+import json
 import logging
 import random
-from typing import Dict, List, Any, Optional, Callable
-from datetime import datetime, timedelta
-import json
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional, Callable
 
+# Local App
+from app.core.cache import cache_manager
 from app.core.config import settings
 from app.core.database import postgresql_manager
-from app.core.cache import cache_manager
+from app.exchange.clients.binance.binance_client import binance_ws_client
 from app.exchange.exchange_factory import ExchangeFactory
-from app.exchange.mappers import SymbolMapper
+from app.exchange.mappers import SymbolMapper, IntervalMapper
 
 logger = logging.getLogger(__name__)
 
@@ -75,28 +78,19 @@ class DataService:
         try:
             logger.info("启动数据获取服务...")
             
-            # ✅ 显式输出交易所客户端初始化状态（确保日志可见）
-            exchange_type = settings.EXCHANGE_TYPE
-            logger.info(f"✅ {exchange_type}客户端初始化完成")
-            logger.info(f"   - 交易所类型: {exchange_type}")
+            # ✅ 信号系统：使用Binance公共接口获取市场数据
+            logger.info(f"✅ Binance客户端初始化完成（信号系统：仅数据获取）")
+            logger.info(f"   - 系统模式: 信号系统（虚拟交易，无实际下单）")
             
             # 🔥 保存当前事件循环（用于WebSocket回调）
             self.loop = asyncio.get_running_loop()
             
             # 测试API连接
             if not await self.exchange_client.test_connection():
-                raise Exception(f"{exchange_type} API连接失败")
+                raise Exception("Binance API连接失败（信号系统：仅数据获取）")
 
-            # 🔑 根据交易所类型初始化WebSocket客户端
-            if exchange_type == "BINANCE":
-                from app.exchange.binance_client import binance_ws_client
-                self.ws_client = binance_ws_client
-            elif exchange_type == "OKX":
-                from app.exchange.okx_client import OKXWebSocketClient
-                self.ws_client = OKXWebSocketClient()
-            else:
-                logger.warning(f"⚠️ {exchange_type}暂不支持WebSocket，仅使用REST API")
-                self.ws_client = None
+            # 🔑 信号系统：固定使用Binance WebSocket客户端
+            self.ws_client = binance_ws_client
             
             # 设置杠杆
             await self._setup_leverage()
@@ -277,7 +271,6 @@ class DataService:
                 is_closed = (str(confirm) == "1" or confirm == 1)  # confirm=1表示已完成
                 
                 # 计算close_time（OKX不提供，需要根据interval计算）
-                from app.exchange.mappers import IntervalMapper
                 okx_interval = IntervalMapper.to_exchange_format(interval, "OKX")
                 interval_ms = self._interval_to_ms(interval)
                 close_time = timestamp + interval_ms - 1
@@ -288,6 +281,24 @@ class DataService:
                 if close_price <= 0:
                     logger.error(f"❌ 收到无效OKX K线数据: {symbol} {interval} close={close_price}")
                     return
+                
+                # 🔑 关键修复：即使K线未完成，也要提取价格用于止损止盈监控
+                # 但只处理已完成的K线用于信号生成（避免重复预测）
+                if close_price > 0:
+                    # 从K线数据中提取价格并触发价格更新回调（用于止损止盈实时监控）
+                    # 注意：这里不检查is_closed，因为止损止盈需要实时监控，即使K线未完成
+                    if self.loop and self.price_callbacks:
+                        # 转换为标准格式的symbol
+                        standard_symbol = SymbolMapper.to_standard_format(symbol, "OKX")
+                        for callback in self.price_callbacks:
+                            try:
+                                future = asyncio.run_coroutine_threadsafe(
+                                    callback(standard_symbol, close_price),
+                                    self.loop
+                                )
+                                future.add_done_callback(lambda f: f.exception())
+                            except Exception as e:
+                                logger.error(f"执行价格更新回调失败: {e}", exc_info=True)
                 
                 # 创建K线数据对象
                 kline = KlineData(
@@ -307,9 +318,9 @@ class DataService:
                     is_closed=is_closed
                 )
                 
-                # 只处理已完成的K线
+                # 只处理已完成的K线用于信号生成
                 if not is_closed:
-                    logger.debug(f"⏸️ 跳过未完成OKX K线: {symbol} {interval}")
+                    logger.debug(f"⏸️ 跳过未完成OKX K线（信号生成）: {symbol} {interval}，但价格已用于止损止盈监控")
                     return
                 
             else:
@@ -328,9 +339,28 @@ class DataService:
                 # 🔑 增强日志验证（新增）
                 logger.debug(f"📥 收到Binance K线: {symbol} {interval} is_closed={is_closed} t={k.get('t')} c={k.get('c')}")
                 
-                # 只处理已完成的K线
+                # 🔑 关键修复：即使K线未完成，也要提取价格用于止损止盈监控
+                # 但只处理已完成的K线用于信号生成（避免重复预测）
+                close_price_temp = float(k.get('c', 0))
+                if close_price_temp > 0:
+                    # 从K线数据中提取价格并触发价格更新回调（用于止损止盈实时监控）
+                    # 注意：这里不检查is_closed，因为止损止盈需要实时监控，即使K线未完成
+                    if self.loop and self.price_callbacks:
+                        # 转换为标准格式的symbol
+                        standard_symbol = SymbolMapper.to_standard_format(symbol, "BINANCE")
+                        for callback in self.price_callbacks:
+                            try:
+                                future = asyncio.run_coroutine_threadsafe(
+                                    callback(standard_symbol, close_price_temp),
+                                    self.loop
+                                )
+                                future.add_done_callback(lambda f: f.exception())
+                            except Exception as e:
+                                logger.error(f"执行价格更新回调失败: {e}", exc_info=True)
+                
+                # 只处理已完成的K线用于信号生成
                 if not is_closed:
-                    logger.debug(f"⏸️ 跳过未完成Binance K线: {symbol} {interval}")
+                    logger.debug(f"⏸️ 跳过未完成Binance K线（信号生成）: {symbol} {interval}，但价格已用于止损止盈监控")
                     return
                 
                 # 已完成的K线
@@ -429,6 +459,10 @@ class DataService:
                             future.add_done_callback(lambda f: f.exception())
                         except Exception as e:
                             logger.error(f"   ❌ 回调 {idx+1} 调用失败: {e}")
+                
+                # 🔑 注意：价格更新回调已在K线数据处理的早期阶段触发（无论K线是否完成）
+                # 这样可以确保止损止盈能够实时监控价格变化
+                # 这里不再重复触发，避免重复调用
             else:
                 logger.warning("⚠️ 事件循环未初始化，跳过K线处理")
             

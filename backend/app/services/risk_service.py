@@ -1,21 +1,26 @@
 """
 风险管理服务
 """
+# StdLib
 import logging
-from typing import Dict, List, Any, Optional, Tuple
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
-import pandas as pd
-import numpy as np
-from scipy import stats
-from dataclasses import dataclass
+from typing import Dict, List, Any, Optional, Tuple
 
+# Third-Party
+import numpy as np
+import pandas as pd
+import ta
+from scipy import stats
+
+# Local App
+from app.core.cache import cache_manager
 from app.core.config import settings
 from app.core.database import postgresql_manager
-from app.core.cache import cache_manager
+from app.exchange.base_exchange_client import UnifiedKlineData
+from app.exchange.exchange_factory import ExchangeFactory
 from app.services.data_service import DataService
 from app.trading.position_manager import position_manager
-from app.exchange.exchange_factory import ExchangeFactory
-import ta
 
 logger = logging.getLogger(__name__)
 
@@ -619,7 +624,6 @@ class RiskService:
             # 1. 获取最近的K线数据计算ATR（使用5m主时间框架）
             # ✅ 统一使用分页方法（limit=100时自动调用单次获取，不影响性能，支持多交易所）
             # 🔥 静态方法中不能使用self，使用ExchangeFactory获取客户端
-            from app.exchange.exchange_factory import ExchangeFactory
             exchange_client = ExchangeFactory.get_current_client()
             klines = exchange_client.get_klines_paginated(
                 symbol=symbol,
@@ -633,9 +637,6 @@ class RiskService:
             
             # 2. 计算ATR（14周期）
             # 🔧 修复：将UnifiedKlineData对象转换为字典
-            from dataclasses import asdict
-            from app.exchange.base_exchange_client import UnifiedKlineData
-            
             klines_dict = []
             for kline in klines:
                 if isinstance(kline, UnifiedKlineData):

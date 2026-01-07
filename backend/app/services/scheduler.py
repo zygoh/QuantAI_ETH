@@ -1,21 +1,29 @@
 """
 任务调度器
 """
+# StdLib
 import asyncio
 import logging
-from typing import Dict, List, Any, Optional, Callable
-from datetime import datetime, timedelta, time as dt_time
-import schedule
-from dataclasses import dataclass
-import pytz
 import os
+from dataclasses import dataclass
+from datetime import datetime, timedelta, time as dt_time
+from typing import Dict, List, Any, Optional, Callable
 
+# Third-Party
+import pytz
+import schedule
+from sqlalchemy import text
+
+# Local App
+from app.core.cache import cache_manager
 from app.core.config import settings
-from app.model.ml_service import MLService
+from app.core.database import postgresql_manager
+from app.model.base.ml_service import MLService
 from app.services.data_service import DataService
 from app.services.historical_data import historical_data_manager
 from app.services.health_monitor import health_monitor
-from app.core.cache import cache_manager
+from app.trading.position_manager import position_manager
+from app.trading.trading_engine import TradingEngine
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +44,7 @@ class ScheduledTask:
 class TaskScheduler:
     """任务调度器"""
     
-    def __init__(self, ml_service: MLService, data_service: DataService, signal_generator=None):
+    def __init__(self, ml_service: MLService, data_service: DataService, signal_generator: Optional[Any] = None):
         self.ml_service = ml_service
         self.data_service = data_service
         self.signal_generator = signal_generator  # 🔥 添加signal_generator引用
@@ -143,20 +151,14 @@ class TaskScheduler:
         except Exception as e:
             logger.error(f"停止调度器失败: {e}")
     
-    async def _check_initial_model_training(self):
-        """检查是否需要立即进行首次模型训练"""
+    async def _check_model_exists(self) -> bool:
+        """检查模型是否存在（不执行训练）"""
         try:
-            # 检查是否存在Stacking集成模型文件（4个模型：lgb, xgb, cat, meta）
             model_dir = "models"
-            has_model = False
-            
-            # 🔧 修复：处理SYMBOL中的/字符（如"ETH/USDT"），替换为_避免路径问题
-            # 必须与ensemble_ml_service中的逻辑保持一致
             safe_symbol = settings.SYMBOL.replace('/', '_')
             
             if os.path.exists(model_dir):
                 for timeframe in settings.TIMEFRAMES:
-                    # 🔧 检查Stacking集成的4个模型文件
                     required_models = ['lgb', 'xgb', 'cat', 'meta']
                     timeframe_has_all_models = True
                     
@@ -167,17 +169,32 @@ class TaskScheduler:
                             break
                     
                     if timeframe_has_all_models:
-                        has_model = True
-                        break
+                        return True
+            
+            return False
+        except Exception as e:
+            logger.error(f"检查模型存在性失败: {e}")
+            return False
+    
+    async def _check_initial_model_training(self):
+        """检查是否需要立即进行首次模型训练"""
+        try:
+            # 检查是否存在Stacking集成模型文件（4个模型：lgb, xgb, cat, meta）
+            has_model = await self._check_model_exists()
             
             if not has_model:
                 logger.warning("⚠️ 未找到已保存的Stacking集成模型文件，开始首次训练...")
                 logger.info("🎓 首次部署：立即执行模型训练（后续将在每周五晚上00:00自动训练）")
                 
-                # 🔥 训练前清理：数据库、Redis缓存、内存缓存
-                logger.info("🧹 训练前清理：开始清理数据库、Redis缓存和内存缓存...")
-                await self._cleanup_before_training()
-                logger.info("✅ 训练前清理完成")
+                # 🔥 注意：数据库清理已在main.py中完成（在初始化WebSocket之前）
+                # 这里只清理内存缓存（因为WebSocket已经初始化）
+                if self.signal_generator:
+                    if hasattr(self.signal_generator, 'kline_buffers'):
+                        self.signal_generator.kline_buffers.clear()
+                        logger.debug("   清理信号生成器K线缓冲区")
+                    if hasattr(self.signal_generator, 'feature_cache'):
+                        self.signal_generator.feature_cache.clear()
+                        logger.debug("   清理信号生成器特征缓存")
                 
                 # 立即执行模型训练
                 task = self.tasks.get('model_training')
@@ -193,9 +210,6 @@ class TaskScheduler:
     async def _cleanup_before_training(self):
         """训练前清理：数据库、Redis缓存、内存缓存"""
         try:
-            from app.core.database import postgresql_manager
-            from app.core.cache import cache_manager
-            
             logger.info("=" * 70)
             logger.info("🧹 开始训练前清理...")
             logger.info("=" * 70)
@@ -279,13 +293,9 @@ class TaskScheduler:
             
             # 3.3 清理交易引擎的内存缓存（如果已初始化）
             # 注意：交易引擎可能在此时还未初始化，所以使用可选清理
-            try:
-                from app.trading.trading_engine import TradingEngine
-                # 这里不直接访问trading_engine，因为可能还未初始化
-                # 清理逻辑会在交易引擎初始化时自动处理
-                logger.debug("   交易引擎缓存将在初始化时自动清理")
-            except Exception:
-                pass
+            # 这里不直接访问trading_engine，因为可能还未初始化
+            # 清理逻辑会在交易引擎初始化时自动处理
+            logger.debug("   交易引擎缓存将在初始化时自动清理")
             
             logger.info("=" * 70)
             logger.info("✅ 训练前清理全部完成")
@@ -536,10 +546,6 @@ class TaskScheduler:
     async def _run_daily_pnl_report(self):
         """运行虚拟交易每日盈亏统计（每天00:05执行）"""
         try:
-            from app.trading.position_manager import position_manager
-            from app.core.database import postgresql_manager
-            from datetime import datetime, timedelta
-            
             logger.info("📊 开始虚拟交易每日盈亏统计")
             
             # 获取昨天的日期

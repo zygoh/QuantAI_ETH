@@ -1,31 +1,36 @@
 """
 Binance API客户端
 """
+# StdLib
 import asyncio
-import logging
-import traceback
-from typing import Optional, List, Dict, Any, Callable
-from datetime import datetime, timedelta
-from dataclasses import dataclass
-from enum import Enum
-import json
-import time
-import hmac
 import hashlib
-import requests
+import hmac
+import json
+import logging
 import os
 import ssl
+import time
+import traceback
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Optional, List, Dict, Any, Callable
+
+# Third-Party
+import requests
+import websocket
 from binance.um_futures import UMFutures
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
-import websocket
 
+# Local App
 from app.core.config import settings
 from app.exchange.base_exchange_client import (
     BaseExchangeClient,
     UnifiedKlineData,
-    UnifiedTickerData,
-    UnifiedOrderData
+    UnifiedOrderData,
+    UnifiedTickerData
 )
+from app.exchange.mappers import SymbolMapper
 
 logger = logging.getLogger(__name__)
 
@@ -501,7 +506,6 @@ class BinanceClient(BaseExchangeClient):
             symbols = exchange_info.get('symbols', [])
             
             # 将标准格式转换为 Binance 格式
-            from app.exchange.mappers import SymbolMapper
             exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
             
             for symbol_info in symbols:
@@ -525,7 +529,6 @@ class BinanceClient(BaseExchangeClient):
         """获取K线数据"""
         try:
             # 将标准格式转换为 Binance 格式
-            from app.exchange.mappers import SymbolMapper
             exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
             
             if limit > 1000:
@@ -701,7 +704,6 @@ class BinanceClient(BaseExchangeClient):
         """获取实时价格（24hr ticker）"""
         try:
             # 将标准格式转换为 Binance 格式
-            from app.exchange.mappers import SymbolMapper
             exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
             
             ticker = self.client.ticker_price(symbol=exchange_symbol)
@@ -719,11 +721,21 @@ class BinanceClient(BaseExchangeClient):
             return None
     
     def get_account_info(self) -> Dict[str, Any]:
-        """获取账户信息（仅公共接口，返回空）"""
+        """
+        获取账户信息（信号系统：不支持实际交易，返回空）
+        
+        注意：本系统为信号系统，仅用于虚拟交易和信号生成，不进行实际交易
+        """
+        logger.debug("信号系统：get_account_info被调用（不支持实际交易，返回空）")
         return {}
     
     def get_position_info(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        """获取持仓信息（仅公共接口，返回空）"""
+        """
+        获取持仓信息（信号系统：不支持实际交易，返回空）
+        
+        注意：本系统为信号系统，仅用于虚拟交易和信号生成，不进行实际交易
+        """
+        logger.debug("信号系统：get_position_info被调用（不支持实际交易，返回空）")
         return []
     
     def place_order(
@@ -740,23 +752,50 @@ class BinanceClient(BaseExchangeClient):
         callback_rate: Optional[float] = None,
         working_type: str = "MARK_PRICE"
     ) -> Dict[str, Any]:
-        """下单（仅公共接口，返回空）"""
+        """
+        下单（信号系统：不支持实际交易，返回空）
+        
+        注意：本系统为信号系统，仅用于虚拟交易和信号生成，不进行实际交易
+        所有订单操作应在trading_engine中通过虚拟交易实现
+        """
+        logger.warning(f"信号系统：place_order被调用（不支持实际交易）symbol={symbol}, side={side}, type={order_type}")
+        logger.warning("   提示：请使用trading_engine的虚拟交易功能")
         return {}
     
     def cancel_order(self, symbol: str, order_id: str) -> Dict[str, Any]:
-        """撤销订单（仅公共接口，返回空）"""
+        """
+        撤销订单（信号系统：不支持实际交易，返回空）
+        
+        注意：本系统为信号系统，仅用于虚拟交易和信号生成，不进行实际交易
+        """
+        logger.warning(f"信号系统：cancel_order被调用（不支持实际交易）symbol={symbol}, order_id={order_id}")
         return {}
     
     def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-        """获取未成交订单（仅公共接口，返回空）"""
+        """
+        获取未成交订单（信号系统：不支持实际交易，返回空）
+        
+        注意：本系统为信号系统，仅用于虚拟交易和信号生成，不进行实际交易
+        """
+        logger.debug("信号系统：get_open_orders被调用（不支持实际交易，返回空）")
         return []
     
     def change_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
-        """修改杠杆倍数（仅公共接口，返回空）"""
+        """
+        修改杠杆倍数（信号系统：不支持实际交易，返回空）
+        
+        注意：本系统为信号系统，仅用于虚拟交易和信号生成，不进行实际交易
+        """
+        logger.warning(f"信号系统：change_leverage被调用（不支持实际交易）symbol={symbol}, leverage={leverage}")
         return {}
     
     def change_margin_type(self, symbol: str, margin_type: str) -> Dict[str, Any]:
-        """修改保证金模式（仅公共接口，返回空）"""
+        """
+        修改保证金模式（信号系统：不支持实际交易，返回空）
+        
+        注意：本系统为信号系统，仅用于虚拟交易和信号生成，不进行实际交易
+        """
+        logger.warning(f"信号系统：change_margin_type被调用（不支持实际交易）symbol={symbol}, margin_type={margin_type}")
         return {}
     
 
@@ -1220,7 +1259,6 @@ class BinanceWebSocketClient:
         
         try:
             # 🔧 修复: 转换符号
-            from app.exchange.mappers import SymbolMapper
             exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
             
             self.ws_client.kline(symbol=exchange_symbol, interval=interval, id=1)
@@ -1238,7 +1276,6 @@ class BinanceWebSocketClient:
         
         try:
             # 🔧 修复: 转换符号
-            from app.exchange.mappers import SymbolMapper
             exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
             
             self.ws_client.ticker(symbol=exchange_symbol, id=2)
@@ -1251,7 +1288,6 @@ class BinanceWebSocketClient:
         """订阅K线数据"""
         try:
             # 🔧 修复: 使用映射后的符号构造 stream_name
-            from app.exchange.mappers import SymbolMapper
             exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
             
             stream_name = f"{exchange_symbol.lower()}@kline_{interval}"
@@ -1275,7 +1311,6 @@ class BinanceWebSocketClient:
         """订阅价格变动数据"""
         try:
             # 🔧 修复: 使用映射后的符号构造 stream_name
-            from app.exchange.mappers import SymbolMapper
             exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
             
             stream_name = f"{exchange_symbol.lower()}@ticker"

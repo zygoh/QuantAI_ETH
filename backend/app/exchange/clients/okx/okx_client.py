@@ -4,22 +4,25 @@ OKX交易所API客户端（基于python-okx 0.4.0 SDK）
 使用官方python-okx SDK处理认证、签名和API调用
 保持BaseExchangeClient统一接口，提供数据格式转换层
 """
-import logging
-import time
+# StdLib
 import asyncio
-import websocket
+import json
+import logging
 import ssl
 import threading
-import json
-from typing import List, Dict, Any, Optional, Callable
+import time
 from datetime import datetime
+from typing import List, Dict, Any, Optional, Callable
 
-# 导入httpx用于异常处理
+# Third-Party
+import websocket
+# 导入httpx用于异常处理 - 可选依赖
 try:
     import httpx
 except ImportError:
     httpx = None
 
+# Local App
 from app.core.config import settings
 from app.exchange.base_exchange_client import (
     BaseExchangeClient,
@@ -37,14 +40,14 @@ from app.exchange.exceptions import (
 )
 from app.exchange.mappers import SymbolMapper, IntervalMapper
 
-# 导入python-okx SDK
 logger = logging.getLogger(__name__)
 
+# 导入python-okx SDK - 可选依赖
 try:
     import okx.Account as AccountModule
     import okx.MarketData as MarketDataModule
-    import okx.Trade as TradeModule
     import okx.PublicData as PublicDataModule
+    import okx.Trade as TradeModule
     
     # 尝试导入异常类
     try:

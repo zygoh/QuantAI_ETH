@@ -13,33 +13,26 @@ class SymbolMapper:
     """交易对格式转换器（动态转换，无需硬编码）"""
     
     @classmethod
-    def to_exchange_format(cls, symbol: str, exchange_type: str) -> str:
-        """将标准格式转换为交易所格式"""
-        exchange_type = exchange_type.upper()
+    def to_exchange_format(cls, symbol: str, exchange_type: str = "BINANCE") -> str:
+        """
+        将标准格式转换为交易所格式（信号系统：固定使用Binance）
         
-        if exchange_type == "BINANCE":
-            return symbol.replace("/", "")
-        elif exchange_type == "OKX":
-            return symbol.replace("/", "-") + "-SWAP"
-        else:
-            logger.warning(f"未知的交易所类型: {exchange_type}")
-            return symbol
+        注意：exchange_type参数保留以保持API兼容性，但信号系统固定使用Binance
+        """
+        # 信号系统：固定使用Binance格式
+        return symbol.replace("/", "")
     
     @classmethod
-    def to_standard_format(cls, symbol: str, exchange_type: str) -> str:
-        """将交易所格式转换为标准格式"""
-        exchange_type = exchange_type.upper()
+    def to_standard_format(cls, symbol: str, exchange_type: str = "BINANCE") -> str:
+        """
+        将交易所格式转换为标准格式（信号系统：固定使用Binance）
         
-        if exchange_type == "BINANCE":
-            if "USDT" in symbol:
-                base = symbol.replace("USDT", "")
-                return f"{base}/USDT"
-        elif exchange_type == "OKX":
-            if symbol.endswith("-SWAP"):
-                symbol = symbol[:-5]
-            return symbol.replace("-", "/")
-        
-        logger.warning(f"无法转换交易对格式: {symbol} ({exchange_type})")
+        注意：exchange_type参数保留以保持API兼容性，但信号系统固定使用Binance
+        """
+        # 信号系统：固定使用Binance格式转换
+        if "USDT" in symbol:
+            base = symbol.replace("USDT", "")
+            return f"{base}/USDT"
         return symbol
 
 
@@ -113,7 +106,7 @@ class IntervalMapper:
             return interval
     
     @classmethod
-    def to_standard_format(cls, interval: str, exchange_type: str) -> str:
+    def to_standard_format(cls, interval: str, exchange_type: str = "BINANCE") -> str:
         """
         将交易所格式转换为标准格式
         

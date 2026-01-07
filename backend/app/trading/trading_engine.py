@@ -1,26 +1,27 @@
 """
 交易执行引擎
 """
+# StdLib
 import asyncio
 import logging
-from typing import Dict, List, Any, Optional
-from datetime import datetime, timedelta
-from dataclasses import dataclass
-from enum import Enum
-from decimal import Decimal, ROUND_HALF_UP
+import random
 import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
+from enum import Enum
+from typing import Dict, List, Any, Optional
 
-from app.core.config import settings
-from app.core.database import postgresql_manager
+# Local App
 from app.core.cache import cache_manager
+from app.core.config import settings
+from app.core.constants import VIRTUAL_OPEN_FEE_RATE, VIRTUAL_CLOSE_FEE_RATE
+from app.core.database import postgresql_manager
 from app.exchange.exchange_factory import ExchangeFactory
+from app.trading.position_manager import position_manager
 from app.trading.signal_generator import TradingSignal
 
 logger = logging.getLogger(__name__)
-
-# 🎯 虚拟交易手续费配置（模拟实际交易所费率）- 使用Decimal确保精度
-VIRTUAL_OPEN_FEE_RATE = Decimal('0.0002')   # 开仓手续费：0.02% (Maker)
-VIRTUAL_CLOSE_FEE_RATE = Decimal('0.0005')  # 平仓手续费：0.05% (Taker)
 
 class OrderSide(Enum):
     """订单方向"""
@@ -311,111 +312,30 @@ class TradingEngine:
         reduce_only: bool = False,
         metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """下单"""
-        try:
-            # 生成客户端订单ID
-            from app.core.config import settings
-            symbol_base = settings.SYMBOL.split('/')[0]
-            client_order_id = f"{symbol_base}_TRADING_{int(datetime.now().timestamp() * 1000)}"
-            
-            # 调用交易所API下单
-            api_result = self.exchange_client.place_order(
-                symbol=symbol,
-                side=side.value,
-                order_type=order_type.value,
-                quantity=quantity,
-                price=price,
-                reduce_only=reduce_only,
-                stop_price=stop_price
-            )
-            
-            if not api_result:
-                return {
-                    'success': False,
-                    'message': 'API下单失败'
-                }
-            
-            # 创建订单对象
-            order = Order(
-                order_id=str(api_result.get('orderId', '')),
-                client_order_id=client_order_id,
-                symbol=symbol,
-                side=side,
-                type=order_type,
-                quantity=quantity,
-                price=price,
-                stop_price=stop_price,
-                status=OrderStatus(api_result.get('status', 'NEW')),
-                filled_quantity=float(api_result.get('executedQty', 0)),
-                remaining_quantity=quantity - float(api_result.get('executedQty', 0)),
-                avg_price=float(api_result.get('avgPrice', 0)),
-                commission=0.0,  # 手续费稍后计算
-                created_at=int(datetime.now().timestamp() * 1000),  # ✅ 毫秒时间戳
-                updated_at=int(datetime.now().timestamp() * 1000),  # ✅ 毫秒时间戳
-                metadata=metadata or {}
-            )
-            
-            # 保存订单
-            self.orders[order.order_id] = order
-            await self._save_order(order)
-            
-            # 更新交易计数
-            self._update_trade_count()
-            
-            logger.info(f"下单成功: {symbol} {side.value} {quantity}")
-            
-            return {
-                'success': True,
-                'message': '下单成功',
-                'order': order
-            }
-            
-        except Exception as e:
-            logger.error(f"下单失败: {e}")
-            return {
-                'success': False,
-                'message': f"下单失败: {str(e)}"
-            }
+        """
+        下单（信号系统：仅支持虚拟交易）
+        
+        注意：本系统为信号系统，不进行实际交易
+        此方法仅用于兼容性，实际下单应通过虚拟交易实现
+        """
+        logger.warning(f"信号系统：place_order被调用（不支持实际交易）symbol={symbol}, side={side.value}")
+        logger.warning("   提示：请使用_execute_virtual_trade进行虚拟交易")
+        return {
+            'success': False,
+            'message': '信号系统不支持实际交易，请使用虚拟交易功能'
+        }
     
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
-        """撤销订单"""
-        try:
-            order = self.orders.get(order_id)
-            
-            if not order:
-                return {
-                    'success': False,
-                    'message': '订单不存在'
-                }
-            
-            # 调用API撤销订单
-            api_result = self.exchange_client.cancel_order(order.symbol, order.order_id)
-            
-            if api_result:
-                # 更新订单状态
-                order.status = OrderStatus.CANCELED
-                order.updated_at = int(datetime.now().timestamp() * 1000)  # ✅ 毫秒时间戳
-                
-                await self._save_order(order)
-                
-                logger.info(f"撤销订单成功: {order_id}")
-                
-                return {
-                    'success': True,
-                    'message': '撤销订单成功'
-                }
-            else:
-                return {
-                    'success': False,
-                    'message': 'API撤销订单失败'
-                }
-            
-        except Exception as e:
-            logger.error(f"撤销订单失败: {e}")
-            return {
-                'success': False,
-                'message': f"撤销订单失败: {str(e)}"
-            }
+        """
+        撤销订单（信号系统：仅支持虚拟交易）
+        
+        注意：本系统为信号系统，不进行实际交易
+        """
+        logger.warning(f"信号系统：cancel_order被调用（不支持实际交易）order_id={order_id}")
+        return {
+            'success': False,
+            'message': '信号系统不支持实际交易，请使用虚拟交易功能'
+        }
     
     async def _set_stop_loss_take_profit(
         self, 
@@ -471,23 +391,14 @@ class TradingEngine:
             logger.error(f"设置止损止盈失败: {e}")
     
     async def _cancel_stop_orders(self, symbol: str):
-        """取消止损止盈订单"""
-        try:
-            # 获取未成交订单
-            open_orders = self.exchange_client.get_open_orders(symbol)
-            
-            for order_data in open_orders:
-                order_type = order_data.get('type', '')
-                
-                if order_type in ['STOP_MARKET', 'TAKE_PROFIT_MARKET']:
-                    order_id = order_data.get('orderId')
-                    if order_id:
-                        self.exchange_client.cancel_order(symbol, str(order_id))
-            
-            logger.info(f"止损止盈订单已取消: {symbol}")
-            
-        except Exception as e:
-            logger.error(f"取消止损止盈订单失败: {e}")
+        """
+        取消止损止盈订单（信号系统：虚拟订单无需取消）
+        
+        注意：信号系统使用虚拟订单，止损止盈通过价格监控自动触发平仓
+        无需手动取消订单
+        """
+        logger.debug(f"信号系统：_cancel_stop_orders被调用（虚拟订单无需取消）symbol={symbol}")
+        # 信号系统：虚拟订单的止损止盈通过_on_price_update自动处理，无需手动取消
     
     async def _execute_virtual_trade(self, signal: TradingSignal) -> Dict[str, Any]:
         """执行虚拟交易（信号模式）"""
@@ -574,7 +485,6 @@ class TradingEngine:
                         
                         # 🔑 更新虚拟账户余额（平仓后）
                         net_pnl_float = float(net_pnl.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP))
-                        from app.trading.position_manager import position_manager
                         await position_manager.update_virtual_balance(net_pnl_float)
                         
                         # 创建平仓虚拟订单
@@ -601,7 +511,7 @@ class TradingEngine:
                         # 执行数据库平仓操作
                         await postgresql_manager.close_virtual_position(pos['id'], current_price)
                         
-                        # 保存平仓订单
+                        # 🔑 修复：订单表只在平仓时创建记录（包含完整的开仓和平仓信息）
                         await postgresql_manager.write_order_data(close_order)
                         
                         # 📊 详细日志输出
@@ -619,9 +529,6 @@ class TradingEngine:
                     
                     logger.info(f"✅ 平仓完成: 共平仓{len(open_positions)}个仓位，总盈亏: {float(total_closed_pnl):+.2f} USDT")
                     logger.info("=" * 70)
-                    
-                    # 🔑 打印历史统计
-                    await self._print_virtual_positions_statistics(symbol)
             
             # 创建新的虚拟仓位
             # 🔑 position_size 现在直接是USDT价值
@@ -643,28 +550,11 @@ class TradingEngine:
             position_value = Decimal(str(signal.position_size))
             open_commission = position_value * VIRTUAL_OPEN_FEE_RATE
             
-            # 创建虚拟开仓订单
-            # 🔥 将Decimal转换为float用于存储
-            current_price_decimal = Decimal(str(current_price))
-            order_data = {
-                'order_id': None,
-                'symbol': symbol,
-                'side': 'BUY' if signal.signal_type == 'LONG' else 'SELL',
-                'type': 'MARKET',
-                'status': 'FILLED',
-                'quantity': float(position_value.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)),
-                'price': float(current_price_decimal.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)),
-                'filled_quantity': float(position_value.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)),
-                'commission': float(open_commission.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP)),  # 开仓手续费 0.02%
-                'timestamp': int(datetime.now().timestamp() * 1000),  # ✅ 毫秒时间戳
-                'is_virtual': True,
-                'signal_id': signal_id,
-                'position_id': position_id,  # 🔑 关联虚拟仓位ID
-                'order_action': 'OPEN',  # 🔑 明确标识为开仓订单
-                'entry_price': float(current_price_decimal.quantize(Decimal('0.00000001'), rounding=ROUND_HALF_UP))
-            }
+            # 🔑 注意：开仓手续费不在开仓时扣除，而是在平仓时与平仓手续费一起结算
+            # 平仓时的净盈亏 = 价差盈亏 - 开仓手续费 - 平仓手续费
+            # 这样避免重复扣除手续费
             
-            await postgresql_manager.write_order_data(order_data)
+            # 🔑 修复：订单表只在平仓时创建，不在开仓时创建（避免开仓订单记录）
             
             # 📊 详细日志输出
             logger.info("=" * 70)
@@ -672,7 +562,7 @@ class TradingEngine:
             logger.info(f"   方向: {signal.signal_type}")
             logger.info(f"   开仓金额: {float(position_value):.2f} USDT")
             logger.info(f"   开仓价格: {float(current_price_decimal):.2f}")
-            logger.info(f"   开仓手续费: {float(open_commission):.4f} USDT (0.02%)")
+            logger.info(f"   开仓手续费: {float(open_commission):.4f} USDT (0.02%，平仓时结算)")
             logger.info(f"   止损价格: {signal.stop_loss:.2f}")
             logger.info(f"   止盈价格: {signal.take_profit:.2f}")
             logger.info(f"   信号置信度: {signal.confidence:.4f}")
@@ -680,6 +570,9 @@ class TradingEngine:
             
             # 🔑 刷新虚拟仓位缓存
             await self._refresh_virtual_positions_cache(symbol)
+            
+            # 🔑 修复：在开仓后打印虚拟仓位历史统计
+            await self._print_virtual_positions_statistics(symbol)
             
             return {
                 'success': True,
@@ -740,7 +633,6 @@ class TradingEngine:
                 total_pnl += net_pnl_float
                 
                 # 🔑 更新虚拟账户余额（平仓后）
-                from app.trading.position_manager import position_manager
                 await position_manager.update_virtual_balance(net_pnl_float)
                 
                 # 创建平仓虚拟订单
@@ -776,9 +668,6 @@ class TradingEngine:
             
             # 🔑 刷新虚拟仓位缓存
             await self._refresh_virtual_positions_cache(symbol)
-            
-            # 🔑 打印历史统计
-            await self._print_virtual_positions_statistics(symbol)
             
             return {
                 'success': True,
@@ -857,7 +746,6 @@ class TradingEngine:
             pnl_percent_float = float(pnl_percent.quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP))
             
             # 🔑 更新虚拟账户余额（平仓后）
-            from app.trading.position_manager import position_manager
             await position_manager.update_virtual_balance(net_pnl_float)
             
             # 记录平仓订单
@@ -884,15 +772,15 @@ class TradingEngine:
             
             await postgresql_manager.write_order_data(order_data)
             
+            # 🔑 确保止损/止盈订单状态已更新（如果存在相关订单）
+            # 信号系统：虚拟订单状态已通过write_order_data记录，无需额外更新
+            
             logger.info(f"✅ 虚拟平仓: {symbol} {pos['side']} {pos['quantity']:.2f} USDT @{current_price:.2f}")
             logger.info(f"   {reason}")
             logger.info(f"   触发类型: {trigger_type or 'UNKNOWN'}")
             logger.info(f"   开仓价: {pos['entry_price']:.2f} → 平仓价: {current_price:.2f}")
             logger.info(f"   净盈亏: ${net_pnl:+.2f} ({pnl_percent:+.2f}%)")
-            logger.info(f"   订单已记录: position_id={pos_id}, order_action=CLOSE")
-            
-            # 🔑 打印历史统计
-            await self._print_virtual_positions_statistics(symbol)
+            logger.info(f"   订单已记录: position_id={pos_id}, order_action=CLOSE, status=FILLED")
             
             # 🔑 缓存刷新由调用方统一处理（避免多次刷新）
             
@@ -979,34 +867,16 @@ class TradingEngine:
             return None
     
     async def _load_orders_and_positions(self):
-        """加载订单和持仓"""
+        """
+        加载订单和持仓（信号系统：仅加载虚拟订单）
+        
+        注意：信号系统不加载实际订单，所有订单都是虚拟的
+        """
         try:
-            # 从API获取未成交订单
-            open_orders = self.exchange_client.get_open_orders()
-            
-            for order_data in open_orders:
-                order = Order(
-                    order_id=str(order_data['orderId']),
-                    client_order_id=order_data.get('clientOrderId', ''),
-                    symbol=order_data['symbol'],
-                    side=OrderSide(order_data['side']),
-                    type=OrderType(order_data['type']),
-                    quantity=float(order_data['origQty']),
-                    price=float(order_data['price']) if order_data['price'] else None,
-                    stop_price=float(order_data['stopPrice']) if order_data.get('stopPrice') else None,
-                    status=OrderStatus(order_data['status']),
-                    filled_quantity=float(order_data['executedQty']),
-                    remaining_quantity=float(order_data['origQty']) - float(order_data['executedQty']),
-                    avg_price=float(order_data.get('avgPrice', 0)),
-                    commission=0.0,
-                    created_at=order_data['time'],        # ✅ Binance原始时间戳
-                    updated_at=order_data['updateTime'],  # ✅ Binance原始时间戳
-                    metadata={}
-                )
-                
-                self.orders[order.order_id] = order
-            
-            logger.info(f"加载了{len(self.orders)}个未成交订单")
+            # 信号系统：不加载实际订单，所有订单都是虚拟的
+            # 虚拟订单从数据库加载（通过虚拟仓位管理）
+            logger.info("信号系统：跳过实际订单加载（仅使用虚拟订单）")
+            self.orders = {}  # 清空实际订单缓存
             
         except Exception as e:
             logger.error(f"加载订单和持仓失败: {e}")
@@ -1051,7 +921,6 @@ class TradingEngine:
                 return
             
             # 🔥 添加调试日志（每100次价格更新记录一次，避免日志过多）
-            import random
             if random.random() < 0.01:  # 1%的概率记录调试日志
                 logger.debug(f"📊 价格更新检查: {symbol} @{price:.2f}, 虚拟仓位数: {len(positions)}")
             

@@ -11,19 +11,24 @@
 - 仓位计算已委托给 position_manager（避免重复代码）
 - 信号生成基于缓存的预测结果，避免重复预测
 """
+# StdLib
 import asyncio
 import logging
 import time
-from typing import Dict, List, Any, Optional
-from datetime import datetime, timedelta
 from dataclasses import dataclass
-import pandas as pd
-import numpy as np
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional
 
+# Third-Party
+import numpy as np
+import pandas as pd
+import ta
+
+# Local App
 from app.core.config import settings
 from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
-from app.model.ml_service import MLService
+from app.model.base.ml_service import MLService
 from app.services.data_service import DataService, KlineData
 from app.exchange.exchange_factory import ExchangeFactory
 from app.utils.helpers import format_signal_type
@@ -1076,7 +1081,6 @@ class SignalGenerator:
                     
                     # 计算ADX（使用ta库，与feature_engineering保持一致）
                     try:
-                        import ta  # 与feature_engineering.py保持一致
                         adx_indicator = ta.trend.ADXIndicator(
                             df_buffer['high'], 
                             df_buffer['low'], 

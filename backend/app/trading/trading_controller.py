@@ -1,20 +1,22 @@
 """
 交易控制器
 """
+# StdLib
 import asyncio
 import logging
-from typing import Dict, List, Any, Optional
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from dataclasses import dataclass
+from typing import Dict, List, Any, Optional
 
-from app.core.config import settings
+# Local App
 from app.core.cache import cache_manager
-from app.trading.trading_engine import TradingEngine, TradingMode
-from app.trading.signal_generator import SignalGenerator, TradingSignal
-from app.trading.position_manager import position_manager
-from app.model.ml_service import MLService
+from app.core.config import settings
+from app.model.base.ml_service import MLService
 from app.services.data_service import DataService
+from app.trading.position_manager import position_manager
+from app.trading.signal_generator import SignalGenerator, TradingSignal
+from app.trading.trading_engine import TradingEngine, TradingMode
 
 logger = logging.getLogger(__name__)
 

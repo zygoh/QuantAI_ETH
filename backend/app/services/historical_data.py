@@ -1,14 +1,20 @@
 """
 历史数据获取和管理
 """
+# StdLib
 import asyncio
 import logging
-from typing import List, Dict, Any, Optional
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+
+# Third-Party
 import pandas as pd
 
+# Local App
 from app.core.config import settings
 from app.core.database import postgresql_manager
+from app.exchange.base_exchange_client import UnifiedKlineData
 from app.exchange.exchange_factory import ExchangeFactory
 
 logger = logging.getLogger(__name__)
@@ -92,7 +98,6 @@ class HistoricalDataManager:
             )
             
             # 🔧 修复：将UnifiedKlineData对象转换为字典
-            from dataclasses import asdict, is_dataclass
             processed_klines = []
             for k in all_klines:
                 if is_dataclass(k):
@@ -132,9 +137,6 @@ class HistoricalDataManager:
         """批量写入K线数据（优化：一次性写入，避免循环调用）"""
         try:
             # 🔧 修复：将UnifiedKlineData对象转换为字典
-            from dataclasses import asdict
-            from app.exchange.base_exchange_client import UnifiedKlineData
-            
             klines_with_meta = []
             for kline in klines:
                 if isinstance(kline, UnifiedKlineData):
@@ -242,8 +244,6 @@ class HistoricalDataManager:
             
             if klines:
                 # 🔧 修复：将UnifiedKlineData对象转换为字典
-                from dataclasses import asdict
-                from app.exchange.base_exchange_client import UnifiedKlineData
                 
                 klines_dict = []
                 for kline in klines:

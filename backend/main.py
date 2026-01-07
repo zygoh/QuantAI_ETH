@@ -92,9 +92,62 @@ async def lifespan(app: FastAPI):
         await init_database()
         logger.info("数据库初始化完成")
 
-        # 🔥 注意：数据库清理已移至模型检测逻辑中
-        # 如果检测到没有模型，会在训练前自动清理数据库、Redis缓存和内存缓存
-
+        # 🔥 检查模型是否存在，如果不存在则在初始化WebSocket之前清理数据库
+        from app.services.scheduler import TaskScheduler
+        from app.core.database import postgresql_manager
+        from app.core.cache import cache_manager
+        import os
+        
+        # 检查模型是否存在（不创建服务实例）
+        model_dir = "models"
+        has_model = False
+        safe_symbol = settings.SYMBOL.replace('/', '_')
+        
+        if os.path.exists(model_dir):
+            for timeframe in settings.TIMEFRAMES:
+                required_models = ['lgb', 'xgb', 'cat', 'meta']
+                timeframe_has_all_models = True
+                
+                for model_name in required_models:
+                    model_file = os.path.join(model_dir, f"{safe_symbol}_{timeframe}_{model_name}_model.pkl")
+                    if not os.path.exists(model_file):
+                        timeframe_has_all_models = False
+                        break
+                
+                if timeframe_has_all_models:
+                    has_model = True
+                    break
+        
+        # 如果未找到模型，在初始化WebSocket之前清理数据库
+        if not has_model:
+            logger.warning("⚠️ 未找到已保存的Stacking集成模型文件，需要训练")
+            logger.info("🧹 训练前清理：开始清理数据库、Redis缓存（在初始化WebSocket之前）...")
+            
+            # 清理数据库
+            await postgresql_manager.cleanup_old_data(days=0)
+            logger.info("✅ 数据库清理完成")
+            
+            # 清理Redis缓存
+            cache_patterns = [
+                "market_data:*",
+                "prediction:*",
+                "signal:*",
+                "model_metrics:*"
+            ]
+            cleared_count = 0
+            for pattern in cache_patterns:
+                try:
+                    keys = []
+                    async for key in cache_manager.redis.client.scan_iter(match=pattern):
+                        keys.append(key)
+                    if keys:
+                        await cache_manager.redis.client.delete(*keys)
+                        cleared_count += len(keys)
+                except Exception as e:
+                    logger.warning(f"   清理缓存模式 {pattern} 失败: {e}")
+            logger.info(f"✅ Redis缓存清理完成（共清理{cleared_count}个键）")
+            logger.info("✅ 训练前清理完成")
+        
         # 初始化服务
         data_service = DataService()
         ml_service = ensemble_ml_service  # 🆕 使用Stacking集成ML服务
@@ -117,7 +170,7 @@ async def lifespan(app: FastAPI):
         system.set_services(trading_controller, scheduler)
         websocket.set_services(data_service, signal_generator, trading_controller)
 
-        # 启动数据服务
+        # 启动数据服务（此时WebSocket数据缓冲区将被初始化）
         await data_service.start()
         logger.info("数据服务启动完成")
 

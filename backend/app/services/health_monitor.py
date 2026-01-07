@@ -2,17 +2,22 @@
 系统健康监控服务
 每5分钟自动检查系统健康状态
 """
+# StdLib
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Dict, Any
+
+# Third-Party
 import pandas as pd
 
+# Local App
+from app.core.cache import cache_manager
 from app.core.config import settings
 from app.core.database import postgresql_manager
-from app.core.cache import cache_manager
+from app.exchange.clients.binance.binance_client import binance_ws_client
 from app.exchange.exchange_factory import ExchangeFactory
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -528,7 +533,7 @@ class HealthMonitor:
                 'healthy': healthy,
                 'ws_connected': ws_connected,
                 'rest_connected': rest_connected,
-                'exchange_type': settings.EXCHANGE_TYPE,
+                'exchange_type': 'BINANCE',  # 信号系统固定使用Binance
                 'message': 'OK' if healthy else f'WebSocket: {"✅" if ws_connected else "❌"}, REST: {"✅" if rest_connected else "❌"}'
             }
             

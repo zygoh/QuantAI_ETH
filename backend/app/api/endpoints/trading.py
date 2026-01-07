@@ -1,10 +1,15 @@
 """
 交易相关API端点
 """
+# StdLib
 import logging
+
+# Third-Party
 from fastapi import APIRouter, Depends, HTTPException
-from app.api.models import TradingResponse, TradeRequest, TradingModeRequest
+
+# Local App
 from app.api.dependencies import get_current_user
+from app.api.models import TradeRequest, TradingModeRequest, TradingResponse
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)

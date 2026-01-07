@@ -1,31 +1,37 @@
 """
 机器学习服务
 """
+# StdLib
 import asyncio
-import logging
-import pickle
-import os
 import gc
+import logging
+import os
+import pickle
 import time
 import traceback
-from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timedelta
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split, TimeSeriesSplit
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
-from sklearn.feature_selection import SelectFromModel
-import lightgbm as lgb
-import joblib
+from typing import Dict, List, Any, Optional, Tuple
 
+# Third-Party
+import joblib
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+from sklearn.feature_selection import SelectFromModel
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.model_selection import TimeSeriesSplit, train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+# Local App
+from app.core.cache import cache_manager
 from app.core.config import settings
 from app.core.database import postgresql_manager
-from app.core.cache import cache_manager
-from app.model.feature_engineering import feature_engineer
-from app.services.data_service import DataService
-from app.utils.helpers import format_signal_type
 from app.exchange.exchange_factory import ExchangeFactory
+from app.model.base.utils import (
+    compute_effective_sample_weights,
+    prepare_features_labels
+)
+from app.model.feature_engineering import feature_engineer
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +51,8 @@ class MLService:
         self.is_first_training = True  # 标记是否首次训练（只有首次才写数据库）
         
         # 训练数据源固定使用 Binance（确保数据一致性）
-        from app.exchange.exchange_factory import ExchangeFactory
-        self.exchange_client = ExchangeFactory.create_client("BINANCE")
-        logger.info("训练数据源已固定为 Binance")
+        self.exchange_client = ExchangeFactory.get_current_client()
+        logger.info("训练数据源已固定为 Binance（信号系统：仅数据获取）")
         
         # 模型参数
         # LightGBM基础参数（所有时间框架共享）
@@ -73,47 +78,6 @@ class MLService:
             'is_unbalance': True  # 自动处理不平衡类别
         }
 
-    def _compute_effective_sample_weights(self, y: pd.Series, timeframe: str) -> np.ndarray:
-        """使用有效样本数(Effective Number of Samples)计算样本权重，缓解极端类别不平衡。
-        参考: Class-Balanced Loss Based on Effective Number of Samples (Cui et al., CVPR 2019)
-
-        Args:
-            y: 标签Series或ndarray，取值{0: SHORT, 1: HOLD, 2: LONG}
-            timeframe: 时间框架（用于可选的时间框架敏感调节）
-
-        Returns:
-            每个样本的权重向量（与y等长）
-        """
-        try:
-            y_np = y.values if hasattr(y, 'values') else y
-            classes = np.array([0, 1, 2])
-            counts = np.array([(y_np == c).sum() for c in classes], dtype=np.float64)
-            total = max(int(len(y_np)), 1)
-
-            # 避免零计数
-            counts = np.maximum(counts, 1.0)
-
-            # beta按样本规模自适应，样本越多beta越接近1
-            # 为防止过强权重，设置时间框架敏感的上限
-            base_beta = 0.999
-            if timeframe == '3m':
-                beta = min(base_beta, 1.0 - 1.0 / (total + 1))
-            else:
-                beta = min(0.995, 1.0 - 1.0 / (total + 1))
-
-            effective_num = (1.0 - np.power(beta, counts)) / (1.0 - beta)
-            class_weights = 1.0 / effective_num
-            class_weights = class_weights / class_weights.sum() * len(classes)
-
-            # 将类别权重映射为样本权重
-            weight_map = {c: class_weights[i] for i, c in enumerate(classes)}
-            sample_weights = np.array([weight_map[int(label)] for label in y_np], dtype=np.float64)
-
-            return sample_weights
-        except Exception:
-            logger.error("有效样本数权重计算失败，降级到均等权重")
-            return np.ones(len(y))
-        
         # ✅ 差异化配置：防止过拟合的保守策略（仅3m/5m/15m）
         self.lgb_params_by_timeframe = {
             '3m': {
@@ -146,6 +110,10 @@ class MLService:
                 'gpu_platform_id': 0,
                 'gpu_device_id': 0
             })
+    
+    def _compute_effective_sample_weights(self, y: pd.Series, timeframe: str) -> np.ndarray:
+        """使用有效样本数计算样本权重（使用模块函数）"""
+        return compute_effective_sample_weights(y, timeframe)
         
         # 模型文件路径（每个时间框架独立）
         self.model_dir = "models"
@@ -300,7 +268,7 @@ class MLService:
             train_data_with_timeframe['timeframe'] = timeframe
             
             # 特征工程
-            train_data = feature_engineer.create_features(train_data)
+            train_data = self.feature_engineer.create_features(train_data)
             
             if train_data.empty:
                 raise Exception(f"{timeframe} 特征工程后数据为空")
@@ -363,7 +331,7 @@ class MLService:
             loop = asyncio.get_running_loop()
             processed_data = await loop.run_in_executor(
                 None,
-                lambda: feature_engineer.create_features(data.copy(), loop=loop)
+                lambda: self.feature_engineer.create_features(data.copy(), loop=loop)
             )
             
             if processed_data.empty:
@@ -711,17 +679,13 @@ class MLService:
             return df
     
     def _prepare_features_labels(self, df: pd.DataFrame, timeframe: str) -> Tuple[pd.DataFrame, pd.Series]:
-        """准备特征和标签（多时间框架独立特征）
-        
-        Args:
-            df: 包含label列的DataFrame
-            timeframe: 时间框架（必需）
-            
-        Returns:
-            (X, y): 特征DataFrame和标签Series
-        """
+        """准备特征和标签（使用模块函数）"""
         try:
-            # 排除非特征列
+            # 检查label列是否存在
+            if 'label' not in df.columns:
+                logger.error(f"{timeframe} DataFrame中缺少'label'列，无法准备训练数据")
+                raise ValueError(f"{timeframe} DataFrame中缺少'label'列")
+            
             exclude_cols = [
                 'timestamp', 'datetime', 'open', 'high', 'low', 'close', 
                 'volume', 'quote_volume', 'label', 'next_return'
@@ -729,50 +693,33 @@ class MLService:
             
             feature_cols = [col for col in df.columns if col not in exclude_cols]
             
-            # 🔑 先提取标签（特征选择需要用到）
             y = df['label'].copy()
             
-            # 为每个时间框架选择独立的重要特征（基于模型的两阶段选择）
             if timeframe not in self.feature_columns_dict or not self.feature_columns_dict[timeframe]:
-                # 🆕 智能特征选择：基于LightGBM重要性的两阶段选择
                 selected_features = self._select_features_intelligent(
                     df[feature_cols], 
                     y, 
                     timeframe
                 )
                 self.feature_columns_dict[timeframe] = selected_features
-                logger.info(f"✅ {timeframe} 特征选择完成: {len(selected_features)}/{len(feature_cols)} 个特征")
+                logger.info(f"{timeframe} 特征选择完成: {len(selected_features)}/{len(feature_cols)} 个特征")
             
             feature_columns = self.feature_columns_dict[timeframe]
             
-            # 🔧 修复：检查特征列是否为空
             if not feature_columns or len(feature_columns) == 0:
-                logger.error(f"❌ {timeframe} 特征列为空，无法继续训练")
+                logger.error(f"{timeframe} 特征列为空，无法继续训练")
                 raise Exception(f"{timeframe} 特征选择失败：没有可用特征")
             
-            X = df[feature_columns].copy()
+            # 创建包含特征列和label列的DataFrame，供prepare_features_labels使用
+            X_with_label = df[feature_columns + ['label']].copy()
             
-            # 🔧 修复：确保X不包含index列（防止特征数量不匹配）
-            if 'index' in X.columns:
-                X = X.drop(columns=['index'])
-                logger.warning(f"⚠️ {timeframe} 训练数据中移除了'index'列")
+            if 'index' in X_with_label.columns:
+                X_with_label = X_with_label.drop(columns=['index'])
+                logger.warning(f"{timeframe} 训练数据中移除了'index'列")
             
-            # 移除包含NaN的行
-            mask = ~(X.isna().any(axis=1) | y.isna())
-            X = X[mask]
-            y = y[mask]
-            
-            # 🔧 修复：检查特征数据是否为空
-            if X.empty or len(X) == 0:
-                logger.error(f"❌ {timeframe} 特征数据为空（过滤NaN后），无法继续训练")
-                raise Exception(f"{timeframe} 特征数据为空")
-            
-            logger.info(f"特征数量: {len(feature_columns)}, 样本数量: {len(X)}")
-            
-            return X, y
-            
+            return prepare_features_labels(X_with_label, feature_columns)
         except Exception as e:
-            logger.error(f"准备特征和标签失败: {e}")
+            logger.error(f"准备特征和标签失败: {e}", exc_info=True)
             return pd.DataFrame(), pd.Series()
     
     def _select_features_intelligent(
@@ -912,7 +859,7 @@ class MLService:
             # 降级方案：使用简单的top_n选择
             logger.warning(f"⚠️ 降级到简单特征选择...")
             top_n = {'3m': 100, '5m': 100, '15m': 100}.get(timeframe, 80)
-            feature_importance = feature_engineer.get_feature_importance(X)
+            feature_importance = self.feature_engineer.get_feature_importance(X)
             selected = list(feature_importance.keys())[:top_n]
             return selected
     

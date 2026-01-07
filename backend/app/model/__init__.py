@@ -22,9 +22,9 @@
 - model_stability_enhancer: 模型稳定性增强
 """
 
-# 注意：这些导入在迁移完成后才可用
-# from app.model.ml_service import MLService
-# from app.model.ensemble_ml_service import EnsembleMLService, ensemble_ml_service
-# from app.model.feature_engineering import FeatureEngineer, feature_engineer
+# 模块化架构导入
+from app.model.base.ml_service import MLService
+from app.model.ensemble_ml_service import EnsembleMLService
+from app.model.feature_engineering import FeatureEngineer, feature_engineer
 
 __version__ = "1.0.0"
