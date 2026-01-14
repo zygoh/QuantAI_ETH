@@ -18,7 +18,6 @@ class Settings(BaseSettings):
     # 服务器配置
     HOST: str = "0.0.0.0"
     PORT: int = 8000
-    DEBUG: bool = True
     
     # 信号系统：仅使用Binance公共接口获取市场数据（无需API Key）
     # 注意：系统仅用于信号生成和虚拟交易，不进行实际交易
@@ -32,8 +31,8 @@ class Settings(BaseSettings):
     
     # 交易配置
     SYMBOL: str = "BTC/USDT"  # 使用标准格式，系统会自动转换为交易所格式
-    LEVERAGE: int = 20
-    CONFIDENCE_THRESHOLD: float = 0.35  # 降低到0.35以增加信号数量（81%准确率下合理阈值）
+    LEVERAGE: int = 50  # 🔥 提高杠杆到50倍
+    CONFIDENCE_THRESHOLD: float = 0.45  # 🔥 提高阈值到0.45以提高信号质量（目标胜率>50%）
     
     # 交易模式配置
     TRADING_MODE: str = "SIGNAL_ONLY"  # 默认交易模式：SIGNAL_ONLY（信号模式/虚拟交易）或 AUTO（自动交易/实盘）
@@ -56,7 +55,6 @@ class Settings(BaseSettings):
     
     # 机器学习配置
     # 注意：模型训练由scheduler统一管理（每天00:01执行）
-    TRAINING_SPLIT: float = 0.8  # 训练集/验证集分割比例
     USE_GMADL_LOSS: bool = False  # 生产默认使用稳定的交叉熵损失
     GMADL_ALPHA: float = 1.0
     GMADL_BETA: float = 0.5

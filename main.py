@@ -31,8 +31,8 @@ from app.core.database import init_database, cleanup_database, close_database
 log_dir = "logs"
 os.makedirs(log_dir, exist_ok=True)
 
-# 日志文件路径
-log_file = os.path.join(log_dir, "trading_system.log")
+# 日志文件路径（使用配置文件）
+log_file = os.path.join(log_dir, settings.LOG_FILE)
 
 # 配置日志格式
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -92,11 +92,68 @@ async def lifespan(app: FastAPI):
         await init_database()
         logger.info("数据库初始化完成")
 
+        # 🔥 系统启动时清理数据库和缓存（确保干净启动）
+        from app.core.database import cleanup_database, postgresql_manager, redis_manager
+        from app.core.cache import cache_manager
+        from app.trading.position_manager import position_manager
+        
+        logger.info("=" * 70)
+        logger.info("🧹 系统启动清理：清理数据库和缓存...")
+        logger.info("=" * 70)
+        
+        # 1. 清理数据库（所有交易相关表）
+        try:
+            await cleanup_database()
+        except Exception as e:
+            logger.error(f"❌ 数据库清理失败: {e}", exc_info=True)
+            # 不阻止启动，但记录错误
+        
+        # 2. 清理Redis缓存
+        try:
+            cache_patterns = [
+                "market_data:*",
+                "prediction:*",
+                "signal:*",
+                "model_metrics:*",
+                "account_info",
+                "position_info",
+                "risk_metrics",
+                "system_status",
+                "virtual_account:*",
+                "recent_trades:*",
+                "system:trading_mode"
+            ]
+            
+            cleared_count = 0
+            for pattern in cache_patterns:
+                try:
+                    keys = []
+                    async for key in cache_manager.redis.client.scan_iter(match=pattern):
+                        keys.append(key)
+                    if keys:
+                        await cache_manager.redis.client.delete(*keys)
+                        cleared_count += len(keys)
+                        logger.debug(f"   清理缓存模式 {pattern}: {len(keys)}个键")
+                except Exception as e:
+                    logger.warning(f"   清理缓存模式 {pattern} 失败: {e}")
+            
+            logger.info(f"✅ Redis缓存清理完成（共清理{cleared_count}个键）")
+        except Exception as e:
+            logger.error(f"❌ Redis缓存清理失败: {e}", exc_info=True)
+            # 不阻止启动，但记录错误
+        
+        # 3. 重置虚拟账户余额
+        try:
+            await position_manager.reset_virtual_balance()
+            logger.info("✅ 虚拟账户余额已重置")
+        except Exception as e:
+            logger.error(f"❌ 虚拟账户余额重置失败: {e}", exc_info=True)
+        
+        logger.info("✅ 系统启动清理完成")
+        logger.info("=" * 70)
+
         # 🔥 检查模型是否存在，如果不存在则在初始化WebSocket之前清理数据库
         from app.services.scheduler import TaskScheduler
-        from app.core.database import postgresql_manager
-        from app.core.cache import cache_manager
-        import os
         
         # 检查模型是否存在（不创建服务实例）
         model_dir = "models"
@@ -200,11 +257,15 @@ async def lifespan(app: FastAPI):
         logger.info("健康监控服务启动完成（检查时间: 每天00:00）")
 
         # 启动WebSocket推送任务
-        from app.api.endpoints.websocket import start_websocket_tasks, on_signal_generated, on_risk_alert
+        from app.api.endpoints.websocket import start_websocket_tasks, on_risk_alert
         await start_websocket_tasks()
 
-        # 注册回调函数
-        signal_generator.add_signal_callback(on_signal_generated)
+        # 🔥 修复：移除重复的回调注册
+        # trading_controller已经注册了_on_signal_generated回调，这里不需要再注册
+        # on_signal_generated只用于WebSocket推送，不执行交易（避免重复开仓）
+        # signal_generator.add_signal_callback(on_signal_generated)  # 已移除，避免重复执行
+        
+        # 注册回撤监控回调（用于WebSocket推送）
         drawdown_monitor.add_alert_callback(on_risk_alert)
 
         logger.info("系统启动完成")

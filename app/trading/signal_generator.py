@@ -81,15 +81,23 @@ class SignalGenerator:
         self.feature_cache_time: Dict[str, float] = {}  # {cache_key: timestamp}
         self.feature_cache_ttl = 300  # 特征缓存5分钟
         
-        # 止损止盈参数（中频交易策略：更紧的止损，保持止盈）
-        self.stop_loss_pct = 0.015  # 1.5%止损（中频快速止损，减少风险）
-        self.take_profit_pct = 0.04   # 4%止盈（让利润奔跑）
+        # 🔥 优化止损止盈参数（提高盈亏比）
+        self.stop_loss_pct = 0.012  # 1.2%止损（收紧止损，减少单笔亏损）
+        self.take_profit_pct = 0.036  # 3.6%止盈（目标盈亏比 3:1）
         
         # WebSocket 数据缓冲区（存储实时K线数据）
         self.kline_buffers: Dict[str, pd.DataFrame] = {}  # {timeframe: DataFrame}
         
         # 🔥 信号缓存：每个时间框架独立缓存预测结果
         self.cached_predictions: Dict[str, Dict[str, Any]] = {}  # {timeframe: prediction}
+        self.cached_predictions_time: Dict[str, float] = {}  # {timeframe: timestamp} 缓存时间
+        
+        # 🔥 信号缓存过期时间（秒）- 根据时间框架设置不同的TTL
+        self.prediction_cache_ttl: Dict[str, int] = {
+            '3m': 300,   # 3分钟K线：5分钟过期
+            '5m': 600,   # 5分钟K线：10分钟过期
+            '15m': 1200  # 15分钟K线：20分钟过期
+        }
         
         # 🔒 安全保护：前5个信号仅记录，不交易（仅首次部署时启用）
         self.warmup_signals = 5  # 预热信号数量
@@ -237,6 +245,7 @@ class SignalGenerator:
             if prediction:
                 # 缓存该时间框架的预测结果
                 self.cached_predictions[timeframe] = prediction
+                self.cached_predictions_time[timeframe] = time.time()  # 🔥 记录缓存时间
                 
                 # 更新最后预测时间（用于统计）
                 self.last_prediction_time[timeframe] = time.time()
@@ -450,15 +459,28 @@ class SignalGenerator:
                 logger.debug("❌ 信号缓存为空")
                 return None
             
+            # 🔥 修复：检查缓存是否过期，过滤掉过期的预测
+            current_time = time.time()
+            valid_predictions = {}
+            for timeframe, prediction in self.cached_predictions.items():
+                cache_time = self.cached_predictions_time.get(timeframe, 0)
+                ttl = self.prediction_cache_ttl.get(timeframe, 600)  # 默认10分钟
+                
+                if current_time - cache_time <= ttl:
+                    valid_predictions[timeframe] = prediction
+                else:
+                    logger.warning(f"⚠️ {timeframe} 预测已过期（缓存时间超过{ttl}秒），跳过")
+            
             # 如果不是所有时间框架都有预测，可以继续（使用已有的）
             # ✅ 5m是主时间框架，必须要有；其他时间框架（3m、15m）是辅助的，有则用，无则忽略
-            if '5m' not in self.cached_predictions:
-                logger.warning("❌ 缺少5m主信号，无法合成")
+            if '5m' not in valid_predictions:
+                logger.warning("❌ 缺少5m主信号（可能已过期），无法合成")
                 return None
             
             # 合成信号（合成过程中的日志已在_synthesize_signal中输出）
             # 只要有5m信号就可以合成，其他时间框架（3m、15m）有则用，无则忽略（辅助作用）
-            signal = await self._synthesize_signal(symbol, self.cached_predictions)
+            # 🔥 使用有效的预测（已过滤过期的）
+            signal = await self._synthesize_signal(symbol, valid_predictions)
             
             # 如果没有信号（HOLD或其他原因），直接返回
             # _synthesize_signal 内部已经记录了详细日志
@@ -470,9 +492,8 @@ class SignalGenerator:
                 logger.info(f"❌ 置信度不足: {signal.confidence:.4f} < {self.confidence_threshold}")
                 return None
             
-            # 检查信号去重（去重检查中的日志已在_should_send_signal中输出）
-            if not await self._should_send_signal(symbol, signal.signal_type):
-                return None
+            # 🔥 信号去重检查已移到_synthesize_signal中（在增强过滤器之后）
+            # 这样只有通过所有过滤器的信号才会检查去重，更合理
             
             return signal
             
@@ -671,6 +692,12 @@ class SignalGenerator:
                 logger.info(f"❌ 信号被过滤: {filter_result['reason']}")
                 return None
             
+            # 🔥 优化：在获取当前价格之前检查信号去重，避免不必要的API调用和计算
+            # 这样只有真正有效且不重复的信号才会继续后续的昂贵操作（获取价格、计算止损止盈、计算仓位）
+            if not await self._should_send_signal(symbol, signal_type):
+                logger.info(f"⏸️ 信号重复，不生成交易信号: {signal_type}（已跳过价格获取和仓位计算）")
+                return None
+            
             # 获取当前价格
             current_price = await self._get_current_price(symbol)
             if not current_price:
@@ -710,11 +737,31 @@ class SignalGenerator:
                 is_virtual=is_virtual_mode  # 动态根据 Redis 中的模式决定
             )
             
-            logger.debug(f"💰 仓位大小: {position_size:.2f} USDT @ {current_price:.2f}")
+            # 🔥 改为INFO级别，确保能看到仓位计算过程
+            logger.info(f"💰 仓位大小: {position_size:.2f} USDT @ {current_price:.2f}")
+            
+            # 🔥 修复并发问题：立即缓存信号（在创建信号对象之前），防止多个K线数据同时到达时生成重复信号
+            # 注意：信号去重检查已经在获取价格之前完成，这里缓存的是已经通过去重检查的信号
+            signal_timestamp = datetime.now()
+            signal_cache_data = {
+                'signal_type': signal_type,
+                'confidence': confidence,
+                'entry_price': current_price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'position_size': position_size,
+                'timestamp': signal_timestamp.isoformat()
+            }
+            await cache_manager.set_trading_signal(
+                symbol,
+                signal_cache_data,
+                expire=None  # 不过期，只在新信号产生时覆盖
+            )
+            logger.debug(f"🔒 信号已立即缓存（防止并发重复）: {signal_type}")
             
             # 创建信号对象
             signal = TradingSignal(
-                timestamp=datetime.now(),
+                timestamp=signal_timestamp,
                 symbol=symbol,
                 signal_type=signal_type,
                 confidence=confidence,
@@ -833,20 +880,9 @@ class SignalGenerator:
             # 存储信号到数据库
             await self._save_signal(signal)
             
-            # 缓存信号（不设置过期时间，用于信号去重）
-            await cache_manager.set_trading_signal(
-                signal.symbol,
-                {
-                    'signal_type': signal.signal_type,
-                    'confidence': signal.confidence,
-                    'entry_price': signal.entry_price,
-                    'stop_loss': signal.stop_loss,
-                    'take_profit': signal.take_profit,
-                    'position_size': signal.position_size,
-                    'timestamp': signal.timestamp.isoformat()
-                },
-                expire=None  # 不过期，只在新信号产生时覆盖
-            )
+            # 🔥 注意：信号已在_synthesize_signal中立即缓存（防止并发问题）
+            # 这里不再重复缓存，但保留代码作为注释说明
+            # await cache_manager.set_trading_signal(...)  # 已在_synthesize_signal中缓存
             
             # 通知回调函数（发送给交易引擎）
             if not self.signal_callbacks:
@@ -1033,39 +1069,12 @@ class SignalGenerator:
                 except Exception as e:
                     logger.debug(f"量能检查失败（跳过此过滤）: {e}")
             
-            # 5. 信号频率限制（动态限制，基于主时间框架）
-            # 超短线策略需要在保持灵活性的同时避免过度交易
-            try:
-                # 🔑 基于时间框架的动态限制策略
-                # 计算逻辑：1小时内的K线数 × 合理触发率
-                timeframe_limits = {
-                    '3m': 8,   # 3m: 1小时20个K线 × 40% = 8个信号
-                    '5m': 6,   # 5m: 1小时12个K线 × 50% = 6个信号（主时间框架）
-                    '15m': 3   # 15m: 1小时4个K线 × 75% = 3个信号
-                }
-                
-                # 使用主时间框架（5m）的限制
-                main_timeframe = '5m'  # 当前系统主时间框架
-                max_signals_per_hour = timeframe_limits.get(main_timeframe, 6)
-                
-                # 查询最近1小时的信号
-                recent_signals = await self.get_recent_signals(
-                    symbol, 
-                    hours=1, 
-                    limit=max_signals_per_hour + 2  # 多查2个用于准确判断
-                )
-                
-                if len(recent_signals) >= max_signals_per_hour:
-                    return {
-                        'pass': False, 
-                        'reason': f'信号频率过高（1小时内已有{len(recent_signals)}个，{main_timeframe}限制{max_signals_per_hour}个）'
-                    }
-                
-                # 调试日志：显示当前信号频率状态
-                logger.debug(f"✓ 信号频率检查通过: {len(recent_signals)}/{max_signals_per_hour} ({main_timeframe})")
-                
-            except Exception as e:
-                logger.debug(f"信号频率检查失败（跳过此过滤）: {e}")
+            # 5. 🔥 已移除信号频率限制
+            # 原因：
+            # 1. 系统已有ADX检测震荡行情，会自动过滤不适合的信号
+            # 2. 与上一个信号相同的话也不会产生新的交易信号（已有重复信号检查）
+            # 3. 频率限制会导致错过盈利机会，反而增加亏损风险
+            # 4. 开仓时会自动平掉现有仓位，确保始终只有一个OPEN仓位
             
             # 6. 🆕 市场状态过滤（Market Regime Filtering）
             # 根据ADX指标判断市场状态，过滤不匹配的信号
@@ -1092,9 +1101,9 @@ class SignalGenerator:
                         if pd.isna(current_adx) or np.isinf(current_adx):
                             raise ValueError("ADX计算结果无效")
                         
-                        # 市场状态判断阈值
-                        TRENDING_THRESHOLD = 25  # ADX >= 25: 趋势市场
-                        RANGING_THRESHOLD = 20   # ADX <= 20: 震荡市场
+                        # 🔥 提高市场状态判断阈值（更严格过滤震荡市场）
+                        TRENDING_THRESHOLD = 30  # ADX >= 30: 趋势市场（从25提高到30）
+                        RANGING_THRESHOLD = 25   # ADX <= 25: 震荡市场（从20提高到25）
                         
                         # 判断市场状态
                         if current_adx >= TRENDING_THRESHOLD:

@@ -28,7 +28,15 @@ class SymbolMapper:
         将交易所格式转换为标准格式（信号系统：固定使用Binance）
         
         注意：exchange_type参数保留以保持API兼容性，但信号系统固定使用Binance
+        
+        Examples:
+            - "BTCUSDT" -> "BTC/USDT"
+            - "BTC/USDT" -> "BTC/USDT" (已经是标准格式，保持不变)
         """
+        # 🔥 修复：如果已经是标准格式（包含 /），直接返回
+        if "/" in symbol:
+            return symbol
+        
         # 信号系统：固定使用Binance格式转换
         if "USDT" in symbol:
             base = symbol.replace("USDT", "")

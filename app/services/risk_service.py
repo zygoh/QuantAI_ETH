@@ -604,11 +604,11 @@ class RiskService:
         confidence: float
     ) -> Dict[str, float]:
         """
-        动态止损止盈计算（优化目标：盈亏比1.8:1+）
+        动态止损止盈计算（优化目标：盈亏比3:1）
         
         基于ATR（Average True Range）的自适应止损止盈：
-        - 止损：1.5倍ATR
-        - 止盈：根据置信度调整（高置信度4倍ATR，低置信度3倍ATR）
+        - 止损：1.2倍ATR（收紧止损，减少单笔亏损）
+        - 止盈：根据置信度调整（高置信度3倍ATR，低置信度2.5倍ATR）
         - 跟踪止损：1倍ATR距离
         
         Args:
@@ -662,35 +662,27 @@ class RiskService:
             
             logger.info(f"📊 当前ATR: {current_atr:.2f} ({current_atr/entry_price*100:.2f}%)")
             
-            # 3. 根据信号类型计算止损止盈
+            # 3. 🔥 优化止损止盈计算（提高盈亏比到3:1）
             if signal_type == 'LONG':
                 # 做多：止损在下方，止盈在上方
-                stop_loss = entry_price - (current_atr * 1.5)
+                # 🔥 收紧止损：从1.5倍ATR降到1.2倍ATR
+                stop_loss = entry_price - (current_atr * 1.2)
                 
-                # 根据置信度调整止盈倍数
-                if confidence > 0.7:
-                    take_profit = entry_price + (current_atr * 4.0)  # 高置信度：1:2.67盈亏比
-                    logger.debug(f"  高置信度({confidence:.2f})：使用4倍ATR止盈")
-                elif confidence > 0.5:
-                    take_profit = entry_price + (current_atr * 3.5)  # 中置信度：1:2.33
-                    logger.debug(f"  中置信度({confidence:.2f})：使用3.5倍ATR止盈")
-                else:
-                    take_profit = entry_price + (current_atr * 3.0)  # 低置信度：1:2
-                    logger.debug(f"  低置信度({confidence:.2f})：使用3倍ATR止盈")
+                # 🔥 统一使用3.6倍ATR止盈，确保盈亏比3:1（1.2 * 3 = 3.6）
+                take_profit = entry_price + (current_atr * 3.6)  # 盈亏比3:1
+                logger.debug(f"  置信度({confidence:.2f})：使用3.6倍ATR止盈（盈亏比3:1）")
                 
                 # 跟踪止损初始距离
                 trailing_stop_distance = current_atr * 1.0
                 
             elif signal_type == 'SHORT':
                 # 做空：止损在上方，止盈在下方
-                stop_loss = entry_price + (current_atr * 1.5)
+                # 🔥 收紧止损：从1.5倍ATR降到1.2倍ATR
+                stop_loss = entry_price + (current_atr * 1.2)
                 
-                if confidence > 0.7:
-                    take_profit = entry_price - (current_atr * 4.0)
-                elif confidence > 0.5:
-                    take_profit = entry_price - (current_atr * 3.5)
-                else:
-                    take_profit = entry_price - (current_atr * 3.0)
+                # 🔥 统一使用3.6倍ATR止盈，确保盈亏比3:1（1.2 * 3 = 3.6）
+                take_profit = entry_price - (current_atr * 3.6)  # 盈亏比3:1
+                logger.debug(f"  置信度({confidence:.2f})：使用3.6倍ATR止盈（盈亏比3:1）")
                 
                 trailing_stop_distance = current_atr * 1.0
             else:
@@ -740,12 +732,8 @@ class RiskService:
         try:
             stop_loss_pct = 0.015  # 1.5%
             
-            if confidence > 0.7:
-                take_profit_pct = 0.040  # 4%，盈亏比1:2.67
-            elif confidence > 0.5:
-                take_profit_pct = 0.035  # 3.5%，盈亏比1:2.33
-            else:
-                take_profit_pct = 0.030  # 3%，盈亏比1:2
+            # 🔥 统一使用3:1盈亏比（所有置信度级别）
+            take_profit_pct = 0.045  # 4.5%，盈亏比1:3
             
             if signal_type == 'LONG':
                 stop_loss = entry_price * (1 - stop_loss_pct)

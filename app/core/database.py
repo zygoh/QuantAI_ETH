@@ -263,7 +263,7 @@ class PostgreSQLManager:
                 """))
                 
                 # 11. 添加表和字段注释（orders表）- 每个COMMENT语句单独执行
-                await conn.execute(text("COMMENT ON TABLE orders IS '订单表：存储所有订单（包括虚拟订单和实盘订单），支持虚拟交易模式（SIGNAL_ONLY）和实盘交易模式（AUTO）'"))
+                await conn.execute(text("COMMENT ON TABLE orders IS '订单表：存储所有订单（包括虚拟订单和实盘订单），支持虚拟交易模式（SIGNAL_ONLY）和实盘交易模式（AUTO）。注意：虚拟订单只在平仓时创建（order_action=CLOSE），开仓时只创建virtual_positions记录'"))
                 await conn.execute(text("COMMENT ON COLUMN orders.id IS '主键ID'"))
                 await conn.execute(text("COMMENT ON COLUMN orders.order_id IS '交易所订单ID（实盘订单）'"))
                 await conn.execute(text("COMMENT ON COLUMN orders.symbol IS '交易对'"))
@@ -279,7 +279,7 @@ class PostgreSQLManager:
                 await conn.execute(text("COMMENT ON COLUMN orders.is_virtual IS '是否为虚拟订单（SIGNAL_ONLY模式）'"))
                 await conn.execute(text("COMMENT ON COLUMN orders.signal_id IS '关联的信号ID'"))
                 await conn.execute(text("COMMENT ON COLUMN orders.position_id IS '关联的虚拟仓位ID（用于关联同一仓位的开仓和平仓订单）'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.order_action IS '订单动作：OPEN（开仓）, CLOSE（平仓）'"))
+                await conn.execute(text("COMMENT ON COLUMN orders.order_action IS '订单动作：OPEN（开仓，仅实盘订单）, CLOSE（平仓，虚拟订单只在平仓时创建）'"))
                 await conn.execute(text("COMMENT ON COLUMN orders.entry_price IS '开仓价格（虚拟订单）'"))
                 await conn.execute(text("COMMENT ON COLUMN orders.exit_price IS '平仓价格（虚拟订单）'"))
                 await conn.execute(text("COMMENT ON COLUMN orders.pnl IS '盈亏金额（虚拟订单）'"))
@@ -460,10 +460,21 @@ class PostgreSQLManager:
                     })
             
             order_type_str = "虚拟订单" if order.get('is_virtual') else "实盘订单"
-            logger.debug(f"写入{order_type_str}: {order['symbol']} {order['side']}")
+            order_action = order.get('order_action', 'UNKNOWN')
+            position_id = order.get('position_id')
+            entry_price = order.get('entry_price', 0)
+            exit_price = order.get('exit_price', 0)
+            pnl_val = order.get('pnl', 0)
+            pnl_pct = order.get('pnl_percent', 0)
+            
+            if order_action == 'CLOSE' and position_id:
+                logger.info(f"✅ 写入{order_type_str}成功: {order['symbol']} {order['side']} (order_action={order_action}, position_id={position_id}) | 开仓价={entry_price:.2f} → 平仓价={exit_price:.2f} | PnL={pnl_val:+.2f} USDT ({pnl_pct:+.2f}%)")
+            else:
+                logger.info(f"✅ 写入{order_type_str}成功: {order['symbol']} {order['side']} (order_action={order_action}, position_id={position_id}) | 价格={order.get('price', 0):.2f} | 数量={order.get('quantity', 0):.2f}")
             
         except Exception as e:
-            logger.error(f"写入订单数据失败: {e}")
+            logger.error(f"❌ 写入订单数据失败: {e}", exc_info=True)
+            logger.error(f"   订单详情: symbol={order.get('symbol')}, side={order.get('side')}, order_action={order.get('order_action')}, position_id={order.get('position_id')}")
             raise
     
     async def query_kline_data(
@@ -673,7 +684,7 @@ class PostgreSQLManager:
                     })
                     
                     position_id = result.scalar()
-                    logger.info(f"创建虚拟仓位: {position['symbol']} {position['side']} @{position['entry_price']}")
+                    logger.info(f"✅ 创建虚拟仓位 #{position_id}: {position['symbol']} {position['side']} @{position['entry_price']:.2f} | 数量={position['quantity']:.2f} USDT | 止损={position.get('stop_loss', 0):.2f} | 止盈={position.get('take_profit', 0):.2f}")
                     return position_id
             
         except Exception as e:
@@ -755,7 +766,7 @@ class PostgreSQLManager:
                         'pnl_percent': pnl_percent_float
                     })
                     
-                    logger.info(f"平掉虚拟仓位 #{position_id}: {row[1]} PnL={pnl:.2f} ({pnl_percent:+.2f}%)")
+                    logger.info(f"✅ 平掉虚拟仓位 #{position_id}: {row[1]} {side} | 开仓价={entry_price:.2f} → 平仓价={exit_price_decimal:.2f} | 数量={quantity:.2f} USDT | PnL={pnl_float:+.2f} USDT ({pnl_percent_float:+.2f}%)")
                     
         except Exception as e:
             logger.error(f"平掉虚拟仓位失败: {e}")
@@ -768,7 +779,7 @@ class PostgreSQLManager:
                 if symbol:
                     query = text("""
                         SELECT id, symbol, side, entry_price, quantity, entry_time,
-                               stop_loss, take_profit, signal_id
+                               stop_loss, take_profit, signal_id, status
                         FROM virtual_positions
                         WHERE status = 'OPEN' AND symbol = :symbol
                         ORDER BY entry_time DESC
@@ -777,7 +788,7 @@ class PostgreSQLManager:
                 else:
                     query = text("""
                         SELECT id, symbol, side, entry_price, quantity, entry_time,
-                               stop_loss, take_profit, signal_id
+                               stop_loss, take_profit, signal_id, status
                         FROM virtual_positions
                         WHERE status = 'OPEN'
                         ORDER BY entry_time DESC
@@ -796,7 +807,8 @@ class PostgreSQLManager:
                         'entry_time': row[5],
                         'stop_loss': float(row[6]) if row[6] else 0,
                         'take_profit': float(row[7]) if row[7] else 0,
-                        'signal_id': row[8]
+                        'signal_id': row[8],
+                        'status': row[9] if row[9] else 'OPEN'  # 🔥 添加status字段
                     })
                 
                 return positions
@@ -840,7 +852,7 @@ class PostgreSQLManager:
     
     async def get_virtual_positions_statistics(self, symbol: str = None) -> Dict[str, Any]:
         """
-        获取虚拟仓位历史统计数据
+        获取虚拟仓位历史统计数据（从orders表查询）
         
         Args:
             symbol: 交易对符号（可选，不传则统计所有）
@@ -857,50 +869,68 @@ class PostgreSQLManager:
             - max_loss: 最大单笔亏损
             - avg_hold_time_minutes: 平均持仓时间（分钟）
             - avg_signal_delay_seconds: 信号产生到开仓的平均延迟（秒）
-            - recent_trades: 最近10笔交易详情
+            - recent_trades: 最近10笔交易详情（最近交易为上一笔交易）
         """
         try:
             async with self.SessionLocal() as session:
+                # 从orders表查询虚拟订单的平仓订单（CLOSE）
+                # 🔥 修复：支持标准格式和交易所格式的symbol匹配
                 if symbol:
+                    # 尝试标准格式和交易所格式（例如 BTC/USDT 和 BTCUSDT）
+                    standard_symbol = symbol.replace('/', '').upper()
+                    exchange_symbol = symbol
+                    
                     query = text("""
                         SELECT 
-                            vp.id,
-                            vp.symbol,
-                            vp.side,
-                            vp.entry_price,
-                            vp.exit_price,
-                            vp.quantity,
+                            o.id,
+                            o.symbol,
+                            o.side,
+                            o.entry_price,
+                            o.exit_price,
+                            o.quantity,
+                            o.timestamp as exit_time,
+                            o.pnl,
+                            o.pnl_percent,
+                            o.signal_id,
+                            o.position_id,
+                            ts.timestamp as signal_time,
                             vp.entry_time,
-                            vp.exit_time,
-                            vp.pnl,
-                            vp.pnl_percent,
-                            vp.signal_id,
-                            ts.timestamp as signal_time
-                        FROM virtual_positions vp
-                        LEFT JOIN trading_signals ts ON vp.signal_id = ts.id::text
-                        WHERE vp.status = 'CLOSED' AND vp.symbol = :symbol
-                        ORDER BY vp.exit_time DESC
+                            vp.side as position_side
+                        FROM orders o
+                        LEFT JOIN trading_signals ts ON o.signal_id = ts.id::text
+                        LEFT JOIN virtual_positions vp ON o.position_id = vp.id
+                        WHERE o.is_virtual = true 
+                            AND o.order_action = 'CLOSE'
+                            AND (o.symbol = :symbol OR o.symbol = :standard_symbol)
+                        ORDER BY o.timestamp DESC
                     """)
-                    result = await session.execute(query, {'symbol': symbol})
+                    result = await session.execute(query, {
+                        'symbol': exchange_symbol,
+                        'standard_symbol': standard_symbol
+                    })
                 else:
                     query = text("""
                         SELECT 
-                            vp.id,
-                            vp.symbol,
-                            vp.side,
-                            vp.entry_price,
-                            vp.exit_price,
-                            vp.quantity,
+                            o.id,
+                            o.symbol,
+                            o.side,
+                            o.entry_price,
+                            o.exit_price,
+                            o.quantity,
+                            o.timestamp as exit_time,
+                            o.pnl,
+                            o.pnl_percent,
+                            o.signal_id,
+                            o.position_id,
+                            ts.timestamp as signal_time,
                             vp.entry_time,
-                            vp.exit_time,
-                            vp.pnl,
-                            vp.pnl_percent,
-                            vp.signal_id,
-                            ts.timestamp as signal_time
-                        FROM virtual_positions vp
-                        LEFT JOIN trading_signals ts ON vp.signal_id = ts.id::text
-                        WHERE vp.status = 'CLOSED'
-                        ORDER BY vp.exit_time DESC
+                            vp.side as position_side
+                        FROM orders o
+                        LEFT JOIN trading_signals ts ON o.signal_id = ts.id::text
+                        LEFT JOIN virtual_positions vp ON o.position_id = vp.id
+                        WHERE o.is_virtual = true 
+                            AND o.order_action = 'CLOSE'
+                        ORDER BY o.timestamp DESC
                     """)
                     result = await session.execute(query)
                 
@@ -932,8 +962,8 @@ class PostgreSQLManager:
                 recent_trades = []
                 
                 for row in rows:
-                    pnl = float(row[8]) if row[8] else 0.0
-                    pnl_percent = float(row[9]) if row[9] else 0.0
+                    pnl = float(row[7]) if row[7] else 0.0
+                    pnl_percent = float(row[8]) if row[8] else 0.0
                     
                     total_pnl += pnl
                     
@@ -944,23 +974,27 @@ class PostgreSQLManager:
                         loss_count += 1
                         max_loss = min(max_loss, pnl)
                     
-                    entry_time = row[6]
-                    exit_time = row[7]
+                    # 持仓时间：从virtual_positions表获取entry_time，从orders表获取exit_time（timestamp）
+                    entry_time = row[12]  # vp.entry_time
+                    exit_time = row[6]    # o.timestamp (exit_time)
                     if entry_time and exit_time:
                         hold_time = (exit_time - entry_time).total_seconds() / 60
                         hold_times.append(hold_time)
                     
-                    signal_time = row[11]
+                    # 信号延迟：信号时间到开仓时间的延迟
+                    signal_time = row[11]  # ts.timestamp
                     if signal_time and entry_time:
                         delay = (entry_time - signal_time).total_seconds()
                         if delay >= 0:
                             signal_delays.append(delay)
                     
+                    # 最近10笔交易
                     if len(recent_trades) < 10:
                         recent_trades.append({
                             'id': row[0],
                             'symbol': row[1],
                             'side': row[2],
+                            'position_side': row[13] if row[13] else row[2],  # 使用position_side或order side
                             'entry_price': float(row[3]) if row[3] else 0.0,
                             'exit_price': float(row[4]) if row[4] else 0.0,
                             'quantity': float(row[5]) if row[5] else 0.0,
@@ -1110,9 +1144,42 @@ async def init_database():
 
 async def cleanup_database():
     """清理数据库（清空所有数据，确保启动后数据完全是最新的）"""
-    # days=0 表示清空所有K线数据
-    await postgresql_manager.cleanup_old_data(days=0)
-    logger.info("数据库清理完成（已清空所有数据）")
+    try:
+        logger.info("🧹 开始系统启动清理...")
+        
+        async with postgresql_manager.SessionLocal() as session:
+            async with session.begin():
+                # 1. 清空所有K线数据
+                logger.info("📊 清理K线数据...")
+                await session.execute(text("TRUNCATE TABLE klines"))
+                logger.info("✅ K线数据清理完成")
+                
+                # 2. 清空虚拟仓位表
+                logger.info("📊 清理虚拟仓位数据...")
+                await session.execute(text("TRUNCATE TABLE virtual_positions CASCADE"))
+                # 🔥 修复问题3：重置序列号，确保ID从1开始
+                await session.execute(text("ALTER SEQUENCE virtual_positions_id_seq RESTART WITH 1"))
+                logger.info("✅ 虚拟仓位数据清理完成（序列号已重置）")
+                
+                # 3. 清空订单表
+                logger.info("📊 清理订单数据...")
+                await session.execute(text("TRUNCATE TABLE orders"))
+                # 🔥 修复问题3：重置序列号，确保ID从1开始
+                await session.execute(text("ALTER SEQUENCE orders_id_seq RESTART WITH 1"))
+                logger.info("✅ 订单数据清理完成（序列号已重置）")
+                
+                # 4. 清空交易信号表
+                logger.info("📊 清理交易信号数据...")
+                await session.execute(text("TRUNCATE TABLE trading_signals"))
+                # 🔥 修复问题3：重置序列号，确保ID从1开始
+                await session.execute(text("ALTER SEQUENCE trading_signals_id_seq RESTART WITH 1"))
+                logger.info("✅ 交易信号数据清理完成（序列号已重置）")
+        
+        logger.info("✅ 数据库清理完成（已清空所有交易相关数据，序列号已重置）")
+        
+    except Exception as e:
+        logger.error(f"❌ 数据库清理失败: {e}", exc_info=True)
+        raise
 
 
 async def close_database():

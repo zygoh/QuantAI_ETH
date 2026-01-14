@@ -58,9 +58,11 @@ class WebSocketErrorType(Enum):
 
 class ExponentialBackoffReconnector:
     """
-    指数退避重连策略
+    智能重连策略
     
-    实现智能重连策略，避免频繁重连导致服务端封禁
+    实现重连策略：
+    - 前3次：使用指数退避策略重连
+    - 3次之后：每隔2分钟重连一次，不再限制次数
     """
     
     def __init__(self):
@@ -68,7 +70,8 @@ class ExponentialBackoffReconnector:
         self.initial_delay = settings.WS_RECONNECT_INITIAL_DELAY
         self.max_delay = settings.WS_RECONNECT_MAX_DELAY
         self.backoff_factor = settings.WS_RECONNECT_BACKOFF_FACTOR
-        self.max_retries = settings.WS_RECONNECT_MAX_RETRIES
+        self.max_initial_retries = 3  # 前3次使用指数退避
+        self.periodic_retry_interval = 120.0  # 3次之后每隔2分钟（120秒）重连一次
         
         self.current_delay = self.initial_delay
         self.retry_count = 0
@@ -76,28 +79,34 @@ class ExponentialBackoffReconnector:
         self.connection_start_time: Optional[datetime] = None
         
         logger.info(f"🔧 重连器初始化: 初始延迟={self.initial_delay}s, 最大延迟={self.max_delay}s, 退避因子={self.backoff_factor}")
+        logger.info(f"   前{self.max_initial_retries}次使用指数退避，之后每隔{self.periodic_retry_interval}秒重连一次")
     
     def calculate_next_delay(self) -> float:
         """
-        计算下次重连延迟（指数退避）
+        计算下次重连延迟
         
         Returns:
             下次重连延迟（秒）
         """
-        delay = min(
-            self.initial_delay * (self.backoff_factor ** self.retry_count),
-            self.max_delay
-        )
+        if self.retry_count < self.max_initial_retries:
+            # 前3次：使用指数退避
+            delay = min(
+                self.initial_delay * (self.backoff_factor ** self.retry_count),
+                self.max_delay
+            )
+        else:
+            # 3次之后：固定为2分钟
+            delay = self.periodic_retry_interval
         return delay
     
     def should_retry(self) -> bool:
         """
-        检查是否应该继续重试
+        检查是否应该继续重试（始终返回True，不再限制次数）
         
         Returns:
-            是否应该重试
+            是否应该重试（始终为True）
         """
-        return self.retry_count < self.max_retries
+        return True  # 不再限制重连次数
     
     def on_reconnect_attempt(self) -> float:
         """
@@ -109,7 +118,10 @@ class ExponentialBackoffReconnector:
         self.retry_count += 1
         self.current_delay = self.calculate_next_delay()
         
-        logger.info(f"🔄 重连尝试 {self.retry_count}/{self.max_retries}, 延迟: {self.current_delay:.1f}秒")
+        if self.retry_count <= self.max_initial_retries:
+            logger.info(f"🔄 重连尝试 {self.retry_count}/{self.max_initial_retries} (指数退避阶段), 延迟: {self.current_delay:.1f}秒")
+        else:
+            logger.info(f"🔄 重连尝试 {self.retry_count} (周期性重连阶段), 延迟: {self.current_delay:.1f}秒 (每2分钟)")
         
         return self.current_delay
     
@@ -163,7 +175,10 @@ class ExponentialBackoffReconnector:
         
         self._add_history(record)
         
-        logger.error(f"❌ 重连失败 (尝试 {self.retry_count}/{self.max_retries}): {error_type.value}")
+        if self.retry_count <= self.max_initial_retries:
+            logger.error(f"❌ 重连失败 (尝试 {self.retry_count}/{self.max_initial_retries}): {error_type.value}")
+        else:
+            logger.error(f"❌ 重连失败 (尝试 {self.retry_count}, 周期性重连阶段): {error_type.value}")
         logger.error(f"   错误信息: {str(error)[:200]}")
     
     def reset(self):
@@ -1050,14 +1065,7 @@ class BinanceWebSocketClient:
         logger.warning(f"🔄 重连任务开始执行...")
         
         try:
-            # 🔥 检查是否应该继续重试
-            if not self.reconnector.should_retry():
-                logger.error(f"❌ 已达到最大重连次数 ({self.reconnector.max_retries})，停止重连")
-                self.is_reconnecting = False
-                self.is_running = False
-                return
-            
-            # 🔥 计算并等待重连延迟（指数退避）
+            # 🔥 计算并等待重连延迟（前3次指数退避，之后每2分钟）
             delay = self.reconnector.on_reconnect_attempt()
             logger.info(f"⏱️ 等待 {delay:.1f} 秒后开始重连...")
             await asyncio.sleep(delay)
@@ -1107,16 +1115,16 @@ class BinanceWebSocketClient:
             # 🔄 重连失败后，再次尝试重连
             self.is_reconnecting = False  # 释放锁，允许下次重连
             
-            # 再次调度重连任务（如果还在运行且未超过最大次数）
-            if self.is_running and self.loop and self.reconnect_count < self.max_reconnect_attempts:
-                logger.info(f"📅 调度下次重连... (还剩 {self.max_reconnect_attempts - self.reconnect_count} 次机会)")
+            # 再次调度重连任务（如果还在运行）
+            if self.is_running and self.loop:
+                if self.reconnector.retry_count <= self.reconnector.max_initial_retries:
+                    remaining = self.reconnector.max_initial_retries - self.reconnector.retry_count
+                    logger.info(f"📅 调度下次重连... (前3次阶段，还剩 {remaining} 次)")
+                else:
+                    logger.info(f"📅 调度下次重连... (周期性重连阶段，每2分钟)")
                 future = asyncio.run_coroutine_threadsafe(self._reconnect(), self.loop)
                 self.reconnect_task = future
                 logger.info("✅ 下次重连任务已提交")
-            elif self.reconnect_count >= self.max_reconnect_attempts:
-                logger.error("❌ ❌ ❌ 已达到最大重连次数，停止重连尝试 ❌ ❌ ❌")
-                logger.error("   系统将继续运行，但WebSocket数据流已中断")
-                self.is_running = False
             else:
                 logger.error(f"❌ 无法调度重连: is_running={self.is_running}, loop={self.loop is not None}")
     

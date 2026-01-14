@@ -129,7 +129,7 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 
 -- 表注释
-COMMENT ON TABLE orders IS '订单表：存储所有订单（包括虚拟订单和实盘订单），支持虚拟交易模式（SIGNAL_ONLY）和实盘交易模式（AUTO）';
+COMMENT ON TABLE orders IS '订单表：存储所有订单（包括虚拟订单和实盘订单），支持虚拟交易模式（SIGNAL_ONLY）和实盘交易模式（AUTO）。注意：虚拟订单只在平仓时创建（order_action=CLOSE），开仓时只创建virtual_positions记录';
 
 -- 字段注释
 COMMENT ON COLUMN orders.id IS '主键ID';
@@ -147,7 +147,7 @@ COMMENT ON COLUMN orders.created_at IS '记录创建时间';
 COMMENT ON COLUMN orders.is_virtual IS '是否为虚拟订单（SIGNAL_ONLY模式）';
 COMMENT ON COLUMN orders.signal_id IS '关联的信号ID';
 COMMENT ON COLUMN orders.position_id IS '关联的虚拟仓位ID（用于关联同一仓位的开仓和平仓订单）';
-COMMENT ON COLUMN orders.order_action IS '订单动作：OPEN（开仓）, CLOSE（平仓）';
+COMMENT ON COLUMN orders.order_action IS '订单动作：OPEN（开仓，仅实盘订单）, CLOSE（平仓，虚拟订单只在平仓时创建）';
 COMMENT ON COLUMN orders.entry_price IS '开仓价格（虚拟订单）';
 COMMENT ON COLUMN orders.exit_price IS '平仓价格（虚拟订单）';
 COMMENT ON COLUMN orders.pnl IS '盈亏金额（虚拟订单）';

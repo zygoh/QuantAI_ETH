@@ -16,7 +16,6 @@ import pandas as pd
 from app.core.cache import cache_manager
 from app.core.config import settings
 from app.core.database import postgresql_manager
-from app.trading.position_manager import position_manager
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +48,12 @@ class DrawdownMonitor:
         self.is_running = False
         self.monitor_task = None
         
-        # 回撤阈值设置
-        self.warning_threshold = 0.05    # 5%警告
-        self.critical_threshold = 0.10   # 10%严重
-        self.emergency_threshold = 0.15  # 15%紧急
+        # 回撤阈值设置（基于配置的MAX_DRAWDOWN_LIMIT）
+        # 使用配置的最大回撤限制，按比例设置三级阈值
+        max_dd = settings.MAX_DRAWDOWN_LIMIT  # 默认0.15 (15%)
+        self.warning_threshold = max_dd * 0.33    # 约5%警告
+        self.critical_threshold = max_dd * 0.67   # 约10%严重
+        self.emergency_threshold = max_dd          # 15%紧急（等于配置值）
         
         # 监控参数
         self.check_interval = 60  # 检查间隔（秒）

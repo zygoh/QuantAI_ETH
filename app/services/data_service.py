@@ -227,247 +227,274 @@ class DataService:
     
     def _on_kline_data(self, data: Any, symbol: Optional[str] = None, interval: Optional[str] = None):
         """
-        处理K线数据（支持Binance和OKX格式）
+        处理K线数据（WebSocket回调入口）
+        
+        处理流程：
+        1. 解析原始数据为统一格式（KlineData）
+        2. 提取实时收盘价用于止盈止损监听（每次消息都执行）
+        3. 只处理已完成的K线用于信号生成
         
         Args:
-            data: K线数据，格式因交易所而异：
-                  - Binance: {"e":"kline", "k":{...}} 或 {"data": {...}}
-                  - OKX: [[timestamp, open, high, low, close, volume, quote_volume, is_closed], ...]
-            symbol: 交易对（OKX格式需要，Binance格式从data中提取）
-            interval: 时间框架（OKX格式需要，Binance格式从data中提取）
+            data: K线数据，格式因交易所而异
+            symbol: 交易对（OKX格式需要）
+            interval: 时间框架（OKX格式需要）
         """
         try:
-            logger.debug(f"📥 _on_kline_data被调用: data类型={type(data)}, symbol={symbol}, interval={interval}, data长度={len(data) if isinstance(data, list) else 'N/A'}")
+            # ═══════════════════════════════════════════════════════════════════
+            # 步骤1：解析原始数据为统一格式
+            # ═══════════════════════════════════════════════════════════════════
+            parsed = self._parse_kline_data(data, symbol, interval)
+            if parsed is None:
+                return
             
-            # 🔥 自动检测数据格式：OKX格式是数组，Binance格式是字典
-            if isinstance(data, list):
-                # OKX格式：数组格式
-                if not symbol or not interval:
-                    logger.error("❌ OKX格式K线数据缺少symbol或interval参数")
-                    return
-                
-                if not data or len(data) == 0:
-                    logger.debug("❌ OKX K线数据为空")
-                    return
-                
-                # 取最新的一条K线（数组第一个元素）
-                kline_array = data[0] if isinstance(data[0], list) else data
-                
-                if len(kline_array) < 9:
-                    logger.error(f"❌ OKX K线数组长度不足: {len(kline_array)} < 9")
-                    return
-                
-                # 🔥 OKX格式：[timestamp, open, high, low, close, volume, volCcyQuote, volCcy, confirm]
-                # 注意：数组有9个元素，confirm是最后一个（索引8），confirm=1表示K线已完成
-                timestamp = int(kline_array[0])
-                open_price = float(kline_array[1])
-                high_price = float(kline_array[2])
-                low_price = float(kline_array[3])
-                close_price = float(kline_array[4])
-                volume = float(kline_array[5])
-                quote_volume = float(kline_array[6])  # volCcyQuote
-                # kline_array[7] 是 volCcy（另一个字段，我们不需要）
-                confirm = kline_array[8]  # OKX使用confirm字段（索引8）
-                is_closed = (str(confirm) == "1" or confirm == 1)  # confirm=1表示已完成
-                
-                # 计算close_time（OKX不提供，需要根据interval计算）
-                okx_interval = IntervalMapper.to_exchange_format(interval, "OKX")
-                interval_ms = self._interval_to_ms(interval)
-                close_time = timestamp + interval_ms - 1
-                
-                logger.debug(f"✅ 处理OKX K线: {symbol} {interval} is_closed={is_closed} close={close_price}")
-                
-                # 验证数据
-                if close_price <= 0:
-                    logger.error(f"❌ 收到无效OKX K线数据: {symbol} {interval} close={close_price}")
-                    return
-                
-                # 🔑 关键修复：即使K线未完成，也要提取价格用于止损止盈监控
-                # 但只处理已完成的K线用于信号生成（避免重复预测）
-                if close_price > 0:
-                    # 从K线数据中提取价格并触发价格更新回调（用于止损止盈实时监控）
-                    # 注意：这里不检查is_closed，因为止损止盈需要实时监控，即使K线未完成
-                    if self.loop and self.price_callbacks:
-                        # 转换为标准格式的symbol
-                        standard_symbol = SymbolMapper.to_standard_format(symbol, "OKX")
-                        for callback in self.price_callbacks:
-                            try:
-                                future = asyncio.run_coroutine_threadsafe(
-                                    callback(standard_symbol, close_price),
-                                    self.loop
-                                )
-                                future.add_done_callback(lambda f: f.exception())
-                            except Exception as e:
-                                logger.error(f"执行价格更新回调失败: {e}", exc_info=True)
-                
-                # 创建K线数据对象
-                kline = KlineData(
-                    symbol=symbol,
-                    interval=interval,
-                    open_time=timestamp,
-                    close_time=close_time,
-                    open_price=open_price,
-                    high_price=high_price,
-                    low_price=low_price,
-                    close_price=close_price,
-                    volume=volume,
-                    quote_volume=quote_volume,
-                    trades=0,  # OKX不提供
-                    taker_buy_base_volume=0.0,  # OKX不提供
-                    taker_buy_quote_volume=0.0,  # OKX不提供
-                    is_closed=is_closed
-                )
-                
-                # 只处理已完成的K线用于信号生成
-                if not is_closed:
-                    logger.debug(f"⏸️ 跳过未完成OKX K线（信号生成）: {symbol} {interval}，但价格已用于止损止盈监控")
-                    return
-                
-            else:
-                # Binance格式：字典格式
-                kline_data = data.get('data', data) if isinstance(data, dict) else data
-                
-                k = kline_data.get('k', {}) if isinstance(kline_data, dict) else {}
-                if not k:
-                    logger.debug("❌ WebSocket消息无k字段（非Binance格式）")
-                    return
-                
-                symbol = k.get('s', 'UNKNOWN')
-                interval = k.get('i', 'UNKNOWN')
-                is_closed = k.get('x', False)
-                
-                # 🔑 增强日志验证（新增）
-                logger.debug(f"📥 收到Binance K线: {symbol} {interval} is_closed={is_closed} t={k.get('t')} c={k.get('c')}")
-                
-                # 🔑 关键修复：即使K线未完成，也要提取价格用于止损止盈监控
-                # 但只处理已完成的K线用于信号生成（避免重复预测）
-                close_price_temp = float(k.get('c', 0))
-                if close_price_temp > 0:
-                    # 从K线数据中提取价格并触发价格更新回调（用于止损止盈实时监控）
-                    # 注意：这里不检查is_closed，因为止损止盈需要实时监控，即使K线未完成
-                    if self.loop and self.price_callbacks:
-                        # 转换为标准格式的symbol
-                        standard_symbol = SymbolMapper.to_standard_format(symbol, "BINANCE")
-                        for callback in self.price_callbacks:
-                            try:
-                                future = asyncio.run_coroutine_threadsafe(
-                                    callback(standard_symbol, close_price_temp),
-                                    self.loop
-                                )
-                                future.add_done_callback(lambda f: f.exception())
-                            except Exception as e:
-                                logger.error(f"执行价格更新回调失败: {e}", exc_info=True)
-                
-                # 只处理已完成的K线用于信号生成
-                if not is_closed:
-                    logger.debug(f"⏸️ 跳过未完成Binance K线（信号生成）: {symbol} {interval}，但价格已用于止损止盈监控")
-                    return
-                
-                # 已完成的K线
-                logger.debug(f"✅ 处理Binance K线: {symbol} {interval} close={k.get('c')}")
-                
-                # ✅ 关键修复：数据质量验证（防止close/volume为0）- 增强诊断
-                close_price = float(k['c'])
-                volume = float(k['v'])
-                open_price = float(k['o'])
-                high_price = float(k['h'])
-                low_price = float(k['l'])
-                
-                # ✅ 详细诊断：记录原始接收到的数据
-                logger.debug(f"📥 原始Binance K线数据: {symbol} {interval}")
-                logger.debug(f"   open={open_price}, high={high_price}, low={low_price}, close={close_price}, volume={volume}")
-                logger.debug(f"   时间戳: t={k.get('t')}, T={k.get('T')}, is_closed={is_closed}")
-                
-                # ✅ 关键诊断：检查V和Q字段是否存在（taker buy volume）
-                has_V = 'V' in k
-                has_Q = 'Q' in k
-                V_value = k.get('V', None)
-                Q_value = k.get('Q', None)
-                logger.debug(f"   taker_buy字段检查: V存在={has_V}, Q存在={has_Q}, V值={V_value}, Q值={Q_value}")
-                logger.debug(f"   k对象所有字段: {list(k.keys())}")
-                if not has_V or not has_Q:
-                    logger.warning(f"⚠️ Binance WebSocket K线数据缺少taker_buy字段: V={has_V}, Q={has_Q}")
-                    logger.warning(f"   可用字段: {list(k.keys())}")
-                    logger.warning(f"   完整k对象: {k}")
-                
-                # 验证价格数据
-                if close_price <= 0:
-                    logger.error(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                    logger.error(f"❌ 收到无效Binance K线数据: {symbol} {interval} close={close_price}（价格不应为0或负数）")
-                    logger.error(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                    logger.error(f"   完整K线数据:")
-                    logger.error(f"      open={open_price}, high={high_price}, low={low_price}, close={close_price}")
-                    logger.error(f"      volume={volume}, quote_volume={k.get('q', 'N/A')}")
-                    logger.error(f"      trades={k.get('n', 'N/A')}, is_closed={is_closed}")
-                    logger.error(f"      时间戳: t={k.get('t')}, T={k.get('T')}")
-                    logger.error(f"   原始JSON数据（前1000字符）: {str(k)[:1000]}")
-                    logger.error(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                    return  # 跳过无效数据
-                
-                if volume < 0:
-                    logger.warning(f"⚠️ 收到异常Binance K线数据: {symbol} {interval} volume={volume}（成交量不应为负数）")
-                    logger.warning(f"   完整数据: o={open_price}, h={high_price}, l={low_price}, c={close_price}, v={volume}")
-                    volume = 0  # 设为0而不是负数
-                
-                # ✅ 详细诊断：检查数据合理性
-                if close_price < low_price or close_price > high_price:
-                    logger.warning(f"⚠️ 价格数据异常: close={close_price}不在[low={low_price}, high={high_price}]范围内")
-                
-                if high_price < low_price:
-                    logger.error(f"❌ 价格数据严重异常: high={high_price} < low={low_price}")
-                
-                if volume == 0:
-                    logger.debug(f"   ℹ️ volume=0（可能是极低流动性时段，但会导致pct_change产生inf）")
-                
-                # 创建K线数据对象（保留Binance原始时间戳，不转换）
-                kline = KlineData(
-                    symbol=symbol,
-                    interval=interval,
-                    open_time=k['t'],  # ✅ 保留毫秒时间戳（整数）
-                    close_time=k['T'],  # ✅ 保留毫秒时间戳（整数）
-                    open_price=open_price,
-                    high_price=high_price,
-                    low_price=low_price,
-                    close_price=close_price,
-                    volume=volume,
-                    quote_volume=float(k['q']),
-                    trades=int(k['n']),
-                    taker_buy_base_volume=float(k.get('V', 0)),  # ✅ 主动买入量
-                    taker_buy_quote_volume=float(k.get('Q', 0)),  # ✅ 主动买入额
-                    is_closed=True  # 🔑 K线已完成（只处理已完成的K线）
-                )
+            # 解构统一格式数据
+            unified_symbol = parsed['symbol']
+            unified_interval = parsed['interval']
+            is_closed = parsed['is_closed']
+            close_price = parsed['close_price']
+            open_price = parsed['open_price']
+            high_price = parsed['high_price']
+            low_price = parsed['low_price']
+            volume = parsed['volume']
+            quote_volume = parsed['quote_volume']
+            open_time = parsed['open_time']
+            close_time = parsed['close_time']
+            trades = parsed['trades']
+            taker_buy_base_volume = parsed['taker_buy_base_volume']
+            taker_buy_quote_volume = parsed['taker_buy_quote_volume']
+            exchange_type = parsed['exchange_type']
             
-            # 🔥 直接通知回调函数（signal_generator），不需要额外处理
-            # 删除了不必要的Redis缓存和数据库写入
-            if self.loop:
-                if not self.data_callbacks:
-                    logger.warning("⚠️ 没有注册的数据回调函数，K线数据将被丢弃")
-                else:
-                    # 🔥 只在K线完成时记录INFO，其他时候用DEBUG
-                    if kline.is_closed:
-                        logger.info(f"📤 通知 {len(self.data_callbacks)} 个数据回调: {kline.symbol} {kline.interval} ✅已完成")
-                    else:
-                        logger.debug(f"📤 通知 {len(self.data_callbacks)} 个数据回调: {kline.symbol} {kline.interval} ⏳进行中")
-                    for idx, callback in enumerate(self.data_callbacks):
-                        try:
-                            logger.debug(f"   调用回调 {idx+1}/{len(self.data_callbacks)}: {callback.__name__ if hasattr(callback, '__name__') else type(callback).__name__}")
-                            future = asyncio.run_coroutine_threadsafe(
-                                callback(kline),
-                                self.loop
-                            )
-                            # ✅ 注册回调处理异常，避免 "Future exception was never retrieved"
-                            future.add_done_callback(lambda f: f.exception())
-                        except Exception as e:
-                            logger.error(f"   ❌ 回调 {idx+1} 调用失败: {e}")
-                
-                # 🔑 注意：价格更新回调已在K线数据处理的早期阶段触发（无论K线是否完成）
-                # 这样可以确保止损止盈能够实时监控价格变化
-                # 这里不再重复触发，避免重复调用
-            else:
-                logger.warning("⚠️ 事件循环未初始化，跳过K线处理")
+            # ═══════════════════════════════════════════════════════════════════
+            # 步骤2：提取实时收盘价用于止盈止损监听（每次消息都执行）
+            # ═══════════════════════════════════════════════════════════════════
+            self._trigger_price_callbacks(unified_symbol, close_price, exchange_type)
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # 步骤3：只处理已完成的K线用于信号生成
+            # ═══════════════════════════════════════════════════════════════════
+            if not is_closed:
+                logger.debug(f"⏸️ 跳过未完成K线（信号生成）: {unified_symbol} {unified_interval}，价格已用于止盈止损监控")
+                return
+            
+            # 创建K线数据对象（只有已完成的K线才会到这里）
+            kline = KlineData(
+                symbol=unified_symbol,
+                interval=unified_interval,
+                open_time=open_time,
+                close_time=close_time,
+                open_price=open_price,
+                high_price=high_price,
+                low_price=low_price,
+                close_price=close_price,
+                volume=volume,
+                quote_volume=quote_volume,
+                trades=trades,
+                taker_buy_base_volume=taker_buy_base_volume,
+                taker_buy_quote_volume=taker_buy_quote_volume,
+                is_closed=True
+            )
+            
+            # 通知信号生成器
+            self._notify_data_callbacks(kline)
             
         except Exception as e:
             logger.error(f"❌ 处理K线数据失败: {e}", exc_info=True)
+    
+    def _parse_kline_data(self, data: Any, symbol: Optional[str], interval: Optional[str]) -> Optional[Dict[str, Any]]:
+        """
+        解析原始K线数据为统一格式
+        
+        支持格式：
+        - Binance: {"e":"kline", "k":{...}} 或 {"data": {...}}
+        - OKX: [[timestamp, open, high, low, close, volume, quote_volume, volCcy, confirm], ...]
+        
+        Returns:
+            统一格式的字典，或 None（解析失败）
+        """
+        # 自动检测数据格式
+        if isinstance(data, list):
+            return self._parse_okx_kline(data, symbol, interval)
+        else:
+            return self._parse_binance_kline(data)
+    
+    def _parse_okx_kline(self, data: list, symbol: Optional[str], interval: Optional[str]) -> Optional[Dict[str, Any]]:
+        """解析OKX K线数据"""
+        if not symbol or not interval:
+            logger.error("❌ OKX格式K线数据缺少symbol或interval参数")
+            return None
+        
+        if not data or len(data) == 0:
+            logger.debug("❌ OKX K线数据为空")
+            return None
+        
+        kline_array = data[0] if isinstance(data[0], list) else data
+        
+        if len(kline_array) < 9:
+            logger.error(f"❌ OKX K线数组长度不足: {len(kline_array)} < 9")
+            return None
+        
+        # OKX格式：[timestamp, open, high, low, close, volume, volCcyQuote, volCcy, confirm]
+        timestamp = int(kline_array[0])
+        open_price = float(kline_array[1])
+        high_price = float(kline_array[2])
+        low_price = float(kline_array[3])
+        close_price = float(kline_array[4])
+        volume = float(kline_array[5])
+        quote_volume = float(kline_array[6])
+        confirm = kline_array[8]
+        is_closed = (str(confirm) == "1" or confirm == 1)
+        
+        # 计算close_time
+        interval_ms = self._interval_to_ms(interval)
+        close_time = timestamp + interval_ms - 1
+        
+        # 验证数据
+        if close_price <= 0:
+            logger.error(f"❌ 收到无效OKX K线数据: {symbol} {interval} close={close_price}")
+            return None
+        
+        logger.debug(f"📥 OKX K线: {symbol} {interval} is_closed={is_closed} close={close_price:.2f}")
+        
+        return {
+            'symbol': symbol,
+            'interval': interval,
+            'is_closed': is_closed,
+            'open_price': open_price,
+            'high_price': high_price,
+            'low_price': low_price,
+            'close_price': close_price,
+            'volume': volume,
+            'quote_volume': quote_volume,
+            'open_time': timestamp,
+            'close_time': close_time,
+            'trades': 0,
+            'taker_buy_base_volume': 0.0,
+            'taker_buy_quote_volume': 0.0,
+            'exchange_type': 'OKX'
+        }
+    
+    def _parse_binance_kline(self, data: dict) -> Optional[Dict[str, Any]]:
+        """解析Binance K线数据"""
+        kline_data = data.get('data', data) if isinstance(data, dict) else data
+        
+        k = kline_data.get('k', {}) if isinstance(kline_data, dict) else {}
+        if not k:
+            logger.debug("❌ WebSocket消息无k字段")
+            return None
+        
+        symbol = k.get('s', 'UNKNOWN')
+        interval = k.get('i', 'UNKNOWN')
+        is_closed = k.get('x', False)
+        
+        open_price = float(k.get('o', 0))
+        high_price = float(k.get('h', 0))
+        low_price = float(k.get('l', 0))
+        close_price = float(k.get('c', 0))
+        volume = float(k.get('v', 0))
+        quote_volume = float(k.get('q', 0))
+        
+        # 验证数据
+        if close_price <= 0:
+            logger.error(f"❌ 收到无效Binance K线数据: {symbol} {interval} close={close_price}")
+            return None
+        
+        if volume < 0:
+            logger.warning(f"⚠️ 成交量为负数: {symbol} {interval} volume={volume}")
+            volume = 0
+        
+        logger.debug(f"📥 Binance K线: {symbol} {interval} is_closed={is_closed} close={close_price:.2f}")
+        
+        return {
+            'symbol': symbol,
+            'interval': interval,
+            'is_closed': is_closed,
+            'open_price': open_price,
+            'high_price': high_price,
+            'low_price': low_price,
+            'close_price': close_price,
+            'volume': volume,
+            'quote_volume': quote_volume,
+            'open_time': k.get('t', 0),
+            'close_time': k.get('T', 0),
+            'trades': int(k.get('n', 0)),
+            'taker_buy_base_volume': float(k.get('V', 0)),
+            'taker_buy_quote_volume': float(k.get('Q', 0)),
+            'exchange_type': 'BINANCE'
+        }
+    
+    def _trigger_price_callbacks(self, symbol: str, close_price: float, exchange_type: str):
+        """
+        触发价格回调（用于止盈止损监控）
+        
+        每次WebSocket消息都会调用，使用实时收盘价检查止盈止损
+        
+        Args:
+            symbol: 交易对符号
+            close_price: 实时收盘价（当前最新价格）
+            exchange_type: 交易所类型
+        """
+        if close_price <= 0:
+            return
+        
+        if not self.loop:
+            logger.warning("⚠️ 事件循环未初始化，无法触发价格更新回调")
+            return
+        
+        if not self.price_callbacks:
+            return  # 没有回调函数，静默返回
+        
+        # 🔥 触发计数器（用于验证实际触发频率）
+        if not hasattr(self, '_price_callback_count'):
+            self._price_callback_count = {}
+        count_key = f"{symbol}_count"
+        self._price_callback_count[count_key] = self._price_callback_count.get(count_key, 0) + 1
+        
+        # 🔥 每100次触发记录一次DEBUG日志（验证实际触发频率）
+        if self._price_callback_count[count_key] % 100 == 0:
+            logger.debug(f"📊 价格回调触发统计: {symbol} 已触发 {self._price_callback_count[count_key]} 次")
+        
+        # 转换为标准格式
+        standard_symbol = SymbolMapper.to_standard_format(symbol, exchange_type)
+        
+        # 触发所有价格回调
+        for callback in self.price_callbacks:
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    callback(standard_symbol, close_price, close_price, close_price),
+                    self.loop
+                )
+                future.add_done_callback(lambda f: f.exception())
+            except Exception as e:
+                logger.error(f"❌ 执行价格更新回调失败: {e}", exc_info=True)
+    
+    def _notify_data_callbacks(self, kline: KlineData):
+        """
+        通知数据回调（用于信号生成）
+        
+        只有已完成的K线才会调用此方法
+        
+        Args:
+            kline: K线数据对象
+        """
+        if not self.loop:
+            logger.warning("⚠️ 事件循环未初始化，跳过K线处理")
+            return
+        
+        if not self.data_callbacks:
+            logger.warning("⚠️ 没有注册的数据回调函数，K线数据将被丢弃")
+            return
+        
+        logger.info(f"📤 通知 {len(self.data_callbacks)} 个数据回调: {kline.symbol} {kline.interval} ✅已完成")
+        
+        for idx, callback in enumerate(self.data_callbacks):
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    callback(kline),
+                    self.loop
+                )
+                future.add_done_callback(lambda f: f.exception())
+            except Exception as e:
+                logger.error(f"❌ 回调 {idx+1} 调用失败: {e}")
     
 
     def _on_ticker_data(self, data: Any):
@@ -590,11 +617,13 @@ class DataService:
                 logger.warning("⚠️ 事件循环未初始化，跳过价格缓存")
             
             # 🆕 通知价格更新回调（用于虚拟仓位止损止盈检查）
+            # 🔥 修复：ticker数据只有最新价格，将price作为high/low/close传递（三个参数相同）
+            # 这样可以保持接口一致性，虽然ticker数据无法提供K线的high/low，但至少可以检查当前价格
             if self.loop and self.price_callbacks:
                 for callback in self.price_callbacks:
                     try:
                         future = asyncio.run_coroutine_threadsafe(
-                            callback(symbol, price),
+                            callback(symbol, price, price, price),  # high=low=close=price
                             self.loop
                         )
                         future.add_done_callback(lambda f: f.exception())
@@ -779,7 +808,11 @@ class DataService:
     def add_price_callback(self, callback: Callable):
         """添加价格更新回调函数（用于虚拟仓位止损止盈监控）"""
         self.price_callbacks.append(callback)
-        logger.debug(f"注册价格更新回调: {callback.__name__}")
+        logger.info("=" * 70)
+        logger.info(f"✅ 注册价格更新回调: {callback.__name__ if hasattr(callback, '__name__') else type(callback).__name__}")
+        logger.info(f"   当前回调数: {len(self.price_callbacks)}")
+        logger.info(f"   事件循环状态: {'已初始化' if self.loop else '未初始化'}")
+        logger.info("=" * 70)
     
 
     def add_reconnect_callback(self, callback: Callable):

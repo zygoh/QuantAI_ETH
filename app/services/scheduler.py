@@ -61,12 +61,12 @@ class TaskScheduler:
     def _init_scheduled_tasks(self):
         """初始化调度任务"""
         try:
-            # 模型训练任务（每周五晚上00:00执行）
+            # 模型训练任务（每周五晚上24点执行，即周六00:00）
             self.tasks['model_training'] = ScheduledTask(
                 name='模型训练',
                 func=self._run_model_training,
-                scheduled_time=dt_time(0, 0),  # 晚上00:00（即周五深夜12点）
-                weekly_day=4  # 周五（0=周一，1=周二，...，4=周五）
+                scheduled_time=dt_time(0, 0),  # 00:00（即周五晚上24点，周六凌晨00:00）
+                weekly_day=5  # 周六（0=周一，1=周二，...，5=周六）
             )
             
             # 数据更新任务
@@ -90,12 +90,14 @@ class TaskScheduler:
                 scheduled_time=dt_time(0, 0)  # 每天00:00
             )
             
-            # 📊 虚拟交易每日盈亏统计任务（每天00:05执行）
-            self.tasks['daily_pnl_report'] = ScheduledTask(
-                name='虚拟交易每日盈亏统计',
-                func=self._run_daily_pnl_report,
-                scheduled_time=dt_time(0, 5)  # 每天00:05（健康检查之后）
-            )
+            # 📊 虚拟交易每日盈亏统计任务（已移除）
+            # 原因：开仓/平仓时已经实时统计所有历史交易，不需要单独的每日任务
+            # 如果需要查看每日统计，可以通过数据库查询或API接口获取
+            # self.tasks['daily_pnl_report'] = ScheduledTask(
+            #     name='虚拟交易每日盈亏统计',
+            #     func=self._run_daily_pnl_report,
+            #     scheduled_time=dt_time(0, 5)  # 每天00:05（健康检查之后）
+            # )
             
             # 数据清理任务（禁用：只在系统启动时清理，不在运行中清理）
             # self.tasks['data_cleanup'] = ScheduledTask(
@@ -477,14 +479,10 @@ class TaskScheduler:
     async def _run_data_update(self):
         """运行数据更新任务"""
         try:
-            logger.info("开始数据更新")
-            
             symbol = settings.SYMBOL
             
-            # 更新最近24小时的数据
+            # 更新最近24小时的数据（日志已在historical_data_manager中输出）
             await historical_data_manager.update_recent_data(symbol, hours=24)
-            
-            logger.info("数据更新完成")
             
         except Exception as e:
             logger.error(f"数据更新失败: {e}")
@@ -552,12 +550,11 @@ class TaskScheduler:
             yesterday = (datetime.now() - timedelta(days=1)).date()
             today = datetime.now().date()
             
-            # 查询昨天的所有订单
+            # 查询昨天的所有虚拟订单（只统计CLOSE订单，因为虚拟订单只在平仓时创建）
             async with postgresql_manager.SessionLocal() as session:
                 query = text("""
                     SELECT 
                         COUNT(*) as total_orders,
-                        COUNT(CASE WHEN order_action = 'OPEN' THEN 1 END) as open_orders,
                         COUNT(CASE WHEN order_action = 'CLOSE' THEN 1 END) as close_orders,
                         COALESCE(SUM(CASE WHEN pnl IS NOT NULL THEN pnl ELSE 0 END), 0) as total_pnl,
                         COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) as winning_trades,
@@ -565,17 +562,17 @@ class TaskScheduler:
                     FROM orders
                     WHERE DATE(timestamp) = :date
                     AND is_virtual = true
+                    AND order_action = 'CLOSE'
                 """)
                 result = await session.execute(query, {'date': yesterday})
                 row = result.fetchone()
                 
                 if row:
                     total_orders = row[0] or 0
-                    open_orders = row[1] or 0
-                    close_orders = row[2] or 0
-                    total_pnl = float(row[3] or 0)
-                    winning_trades = row[4] or 0
-                    losing_trades = row[5] or 0
+                    close_orders = row[1] or 0
+                    total_pnl = float(row[2] or 0)
+                    winning_trades = row[3] or 0
+                    losing_trades = row[4] or 0
                     
                     # 获取当前虚拟账户余额
                     summary = await position_manager.get_position_summary()
@@ -588,7 +585,7 @@ class TaskScheduler:
                     # 输出统计日志
                     logger.info("=" * 60)
                     logger.info(f"📊 虚拟交易每日盈亏统计 - {yesterday}")
-                    logger.info(f"   总订单数: {total_orders} (开仓: {open_orders}, 平仓: {close_orders})")
+                    logger.info(f"   平仓订单数: {total_orders} (虚拟订单只在平仓时创建)")
                     logger.info(f"   已平仓订单: {total_closed} (盈利: {winning_trades}, 亏损: {losing_trades})")
                     logger.info(f"   胜率: {win_rate:.2f}%")
                     logger.info(f"   昨日总盈亏: {total_pnl:+.2f} USDT")
