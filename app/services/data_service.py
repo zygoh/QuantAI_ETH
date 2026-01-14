@@ -443,16 +443,6 @@ class DataService:
         if not self.price_callbacks:
             return  # 没有回调函数，静默返回
         
-        # 🔥 触发计数器（用于验证实际触发频率）
-        if not hasattr(self, '_price_callback_count'):
-            self._price_callback_count = {}
-        count_key = f"{symbol}_count"
-        self._price_callback_count[count_key] = self._price_callback_count.get(count_key, 0) + 1
-        
-        # 🔥 每100次触发记录一次DEBUG日志（验证实际触发频率）
-        if self._price_callback_count[count_key] % 100 == 0:
-            logger.debug(f"📊 价格回调触发统计: {symbol} 已触发 {self._price_callback_count[count_key]} 次")
-        
         # 转换为标准格式
         standard_symbol = SymbolMapper.to_standard_format(symbol, exchange_type)
         

@@ -1187,41 +1187,21 @@ class TradingEngine:
                     self._last_empty_cache_log = datetime.now().timestamp()
                 return
             
-            # 🔥 触发计数器（用于验证实际触发频率）
-            if not hasattr(self, '_price_update_count'):
-                self._price_update_count = {}
-            if not hasattr(self, '_price_update_start_time'):
-                self._price_update_start_time = datetime.now().timestamp()
-                logger.info(f"🎯 价格更新回调首次被调用: {symbol} high={high:.2f} low={low:.2f} close={close:.2f}")
-            
-            # 更新计数器
-            count_key = f"{standard_symbol}_count"
-            self._price_update_count[count_key] = self._price_update_count.get(count_key, 0) + 1
-            
-            # 🔥 日志控制：启动后前5分钟每10秒记录一次，之后每30秒记录一次
-            # 但每次都会显示触发次数统计，验证实际触发频率
+            # 🔥 日志控制：每30秒记录一次（避免日志过多）
             should_log = False
             current_time = datetime.now().timestamp()
             
-            # 检查是否需要记录日志
             if not hasattr(self, '_last_price_log_time'):
                 self._last_price_log_time = {}
             
             last_log_time = self._last_price_log_time.get(symbol, 0)
-            time_since_start = current_time - self._price_update_start_time
-            
-            # 启动后前5分钟每10秒记录一次，之后每30秒记录一次
-            log_interval = 10 if time_since_start < 300 else 30
-            if current_time - last_log_time > log_interval:
+            if current_time - last_log_time > 30:
                 should_log = True
                 self._last_price_log_time[symbol] = current_time
             
             # 只在需要时记录（避免日志过多）
             if should_log:
-                total_count = self._price_update_count.get(count_key, 0)
-                elapsed_seconds = current_time - self._price_update_start_time
-                avg_frequency = total_count / elapsed_seconds if elapsed_seconds > 0 else 0
-                logger.info(f"📊 止损止盈监控: {standard_symbol} | 实时价格={close:.2f} | 仓位数: {len(positions)} | 触发次数: {total_count}次 | 平均频率: {avg_frequency:.2f}次/秒")
+                logger.info(f"📊 止损止盈监控: {standard_symbol} | 实时价格={close:.2f} | 仓位数: {len(positions)}")
                 # 显示每个仓位的详细信息（使用实时价格 close 判断）
                 for pos in positions:
                     side = pos.get('side', 'UNKNOWN')
