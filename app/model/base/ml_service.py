@@ -25,6 +25,26 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 # Local App
 from app.core.cache import cache_manager
 from app.core.config import settings
+from app.core.constants import (
+    FEATURE_IMPORTANCE_THRESHOLD_HIGH,
+    FEATURE_IMPORTANCE_THRESHOLD_LOW,
+    LABEL_PT_SL_CONFIG,
+    LABEL_VOLATILITY_DEFAULT,
+    LABEL_VOLATILITY_MIN,
+    LABEL_VOLATILITY_WINDOW,
+    LABEL_WINDOW_CONFIG,
+    LGB_BAGGING_FRACTION,
+    LGB_BAGGING_FREQ,
+    LGB_FEATURE_FRACTION,
+    LGB_LEARNING_RATE,
+    LGB_MAX_DEPTH,
+    LGB_MIN_CHILD_SAMPLES,
+    LGB_MIN_SPLIT_GAIN,
+    LGB_N_ESTIMATORS,
+    LGB_NUM_LEAVES,
+    LGB_REG_ALPHA,
+    LGB_REG_LAMBDA
+)
 from app.core.database import postgresql_manager
 from app.exchange.exchange_factory import ExchangeFactory
 from app.model.base.utils import (
@@ -61,20 +81,20 @@ class MLService:
             'num_class': 3,  # 0: 下跌, 1: 横盘, 2: 上涨
             'metric': 'multi_logloss',
             'boosting_type': 'gbdt',
-            'n_estimators': 300,  # 500→300（减少训练轮数，防过拟合）
-            'num_leaves': 31,  # 默认值，训练时会根据时间框架调整
-            'learning_rate': 0.05,  # 0.03→0.05（配合减少轮数）
-            'feature_fraction': 0.8,  # 0.85→0.8（更强特征采样）
-            'bagging_fraction': 0.8,  # 0.85→0.8（更强数据采样）
-            'bagging_freq': 5,
+            'n_estimators': LGB_N_ESTIMATORS,
+            'num_leaves': LGB_NUM_LEAVES,
+            'learning_rate': LGB_LEARNING_RATE,
+            'feature_fraction': LGB_FEATURE_FRACTION,
+            'bagging_fraction': LGB_BAGGING_FRACTION,
+            'bagging_freq': LGB_BAGGING_FREQ,
             'verbose': -1,
             'random_state': 42,
             'n_jobs': -1,
-            'max_depth': 6,  # 8→6（降低深度）
-            'min_child_samples': 40,  # 30→40（增加最小样本）
-            'reg_alpha': 0.5,  # 0.3→0.5（增强L1正则化）
-            'reg_lambda': 0.5,  # 0.3→0.5（增强L2正则化）
-            'min_split_gain': 0.02,  # 0.01→0.02（提高分裂阈值）
+            'max_depth': LGB_MAX_DEPTH,
+            'min_child_samples': LGB_MIN_CHILD_SAMPLES,
+            'reg_alpha': LGB_REG_ALPHA,
+            'reg_lambda': LGB_REG_LAMBDA,
+            'min_split_gain': LGB_MIN_SPLIT_GAIN,
             'is_unbalance': True  # 自动处理不平衡类别
         }
 
@@ -110,14 +130,14 @@ class MLService:
                 'gpu_platform_id': 0,
                 'gpu_device_id': 0
             })
+
+        # 模型文件路径（每个时间框架独立）
+        self.model_dir = "models"
+        os.makedirs(self.model_dir, exist_ok=True)
     
     def _compute_effective_sample_weights(self, y: pd.Series, timeframe: str) -> np.ndarray:
         """使用有效样本数计算样本权重（使用模块函数）"""
         return compute_effective_sample_weights(y, timeframe)
-        
-        # 模型文件路径（每个时间框架独立）
-        self.model_dir = "models"
-        os.makedirs(self.model_dir, exist_ok=True)
     
     def _get_model_paths(self, timeframe: str) -> Dict[str, str]:
         """获取指定时间框架的模型文件路径"""
@@ -546,34 +566,20 @@ class MLService:
         try:
             # 1. 参数配置 (根据时间框架调整)
             # 时间窗口 (预测未来多少根K线)
-            window_config = {
-                '3m': 20,   # 60分钟
-                '5m': 24,   # 2小时
-                '15m': 32   # 8小时
-            }
-            # 止盈止损系数 (相对于波动率)
-            # 目标：高胜率，所以TP可以略小于SL，或者接近
-            pt_sl_config = {
-                '3m':  (2.2, 1.6),  # TP=2.2*Vol, SL=1.6*Vol (稍微放宽TP以捕捉大波段)
-                '5m':  (2.2, 1.8),
-                '15m': (2.5, 2.0)
-            }
-            
-            window = window_config.get(timeframe, 20)
-            pt_mult, sl_mult = pt_sl_config.get(timeframe, (2.0, 1.5))
+            window = LABEL_WINDOW_CONFIG.get(timeframe, 20)
+            pt_mult, sl_mult = LABEL_PT_SL_CONFIG.get(timeframe, (2.0, 1.5))
             
             # 2. 计算波动率 (使用ATR或Rolling Std)
             # 这里简单使用Rolling Std of Returns (Close-to-Close)
             returns = df['close'].pct_change()
-            volatility = returns.rolling(window=20).std()
+            volatility = returns.rolling(window=LABEL_VOLATILITY_WINDOW).std()
             
             # 处理NaN波动率 (使用均值填充)
-            vol_mean = volatility.mean() if not volatility.isna().all() else 0.002
+            vol_mean = volatility.mean() if not volatility.isna().all() else LABEL_VOLATILITY_DEFAULT
             volatility = volatility.fillna(vol_mean)
             
             # 确保波动率有一个下限，防止死市时的极小阈值
-            min_vol = 0.001
-            volatility = volatility.clip(lower=min_vol)
+            volatility = volatility.clip(lower=LABEL_VOLATILITY_MIN)
             
             # 3. 向量化计算三重障碍
             # 这种方法避免了慢速Python循环
@@ -775,7 +781,7 @@ class MLService:
             # 获取特征重要性
             imp = lgb_filter.feature_importances_
             # 🆕 Kim建议1: 使用均值阈值，过滤噪音特征（如1e-6）
-            imp_threshold = imp.mean() * 0.1  # 均值的10%
+            imp_threshold = imp.mean() * FEATURE_IMPORTANCE_THRESHOLD_HIGH
             stage1_mask = imp > imp_threshold
             stage1_cols = X.columns[stage1_mask].tolist()
             
@@ -785,7 +791,7 @@ class MLService:
             # 🔧 修复：如果过滤后特征数为0，使用更宽松的阈值
             if len(stage1_cols) == 0:
                 logger.warning(f"⚠️ {timeframe} 特征选择后剩余0个特征，使用更宽松的阈值（均值的1%）")
-                imp_threshold = imp.mean() * 0.01  # 降低到均值的1%
+                imp_threshold = imp.mean() * FEATURE_IMPORTANCE_THRESHOLD_LOW
                 stage1_mask = imp > imp_threshold
                 stage1_cols = X.columns[stage1_mask].tolist()
                 filtered_count = n_feats - len(stage1_cols)

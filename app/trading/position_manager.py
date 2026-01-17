@@ -19,12 +19,14 @@ from typing import Dict, List, Any, Optional
 # Local App
 from app.core.cache import cache_manager
 from app.core.config import settings
+from app.core.constants import (
+    POSITION_MAX_VALUE_USDT,
+    POSITION_MIN_VALUE_USDT,
+    VIRTUAL_ACCOUNT_INITIAL_BALANCE,
+    VIRTUAL_BALANCE_KEY
+)
 
 logger = logging.getLogger(__name__)
-
-# 🎯 虚拟账户配置（用于 SIGNAL_ONLY 模式）
-VIRTUAL_ACCOUNT_BALANCE = 20.0  # 🔥 虚拟账户初始余额（USDT）- 调整为20U
-VIRTUAL_BALANCE_KEY = "virtual_account:balance"  # Redis键名
 
 @dataclass
 class PositionInfo:
@@ -58,8 +60,8 @@ class PositionManager:
     
     def __init__(self):
         self.leverage = settings.LEVERAGE
-        self.max_position_value = 500000  # 最大持仓价值（USDT）- 全仓模式需要较大值
-        self.min_position_value = 20  # ✅ U本位最小仓位价值（币安要求）
+        self.max_position_value = POSITION_MAX_VALUE_USDT
+        self.min_position_value = POSITION_MIN_VALUE_USDT
                 
     async def initialize(self):
         """初始化仓位管理器（模拟交易模式）"""
@@ -89,12 +91,12 @@ class PositionManager:
                     pass
             
             # 如果不存在或格式错误，返回初始值
-            balance = VIRTUAL_ACCOUNT_BALANCE
+            balance = VIRTUAL_ACCOUNT_INITIAL_BALANCE
             await cache_manager.set(VIRTUAL_BALANCE_KEY, balance)
             return balance
         except Exception as e:
             logger.error(f"获取虚拟账户余额失败: {e}")
-            return VIRTUAL_ACCOUNT_BALANCE
+            return VIRTUAL_ACCOUNT_INITIAL_BALANCE
     
     async def update_virtual_balance(self, pnl: float) -> float:
         """
@@ -126,12 +128,12 @@ class PositionManager:
             重置后的余额
         """
         try:
-            await cache_manager.set(VIRTUAL_BALANCE_KEY, VIRTUAL_ACCOUNT_BALANCE)
-            logger.info(f"🔄 虚拟账户余额已重置: {VIRTUAL_ACCOUNT_BALANCE} USDT")
-            return VIRTUAL_ACCOUNT_BALANCE
+            await cache_manager.set(VIRTUAL_BALANCE_KEY, VIRTUAL_ACCOUNT_INITIAL_BALANCE)
+            logger.info(f"🔄 虚拟账户余额已重置: {VIRTUAL_ACCOUNT_INITIAL_BALANCE} USDT")
+            return VIRTUAL_ACCOUNT_INITIAL_BALANCE
         except Exception as e:
             logger.error(f"重置虚拟账户余额失败: {e}")
-            return VIRTUAL_ACCOUNT_BALANCE
+            return VIRTUAL_ACCOUNT_INITIAL_BALANCE
     
     # ========== 仓位计算 ==========
     
@@ -170,15 +172,15 @@ class PositionManager:
                     available_balance = float(cached_balance)
                     if available_balance <= 0:
                         logger.warning(f"⚠️ 虚拟账户余额不足: {available_balance}，重置为初始值")
-                        available_balance = VIRTUAL_ACCOUNT_BALANCE
+                        available_balance = VIRTUAL_ACCOUNT_INITIAL_BALANCE
                         await cache_manager.set(VIRTUAL_BALANCE_KEY, available_balance)
                 except (ValueError, TypeError):
                     logger.warning(f"⚠️ 虚拟账户余额格式错误: {cached_balance}，重置为初始值")
-                    available_balance = VIRTUAL_ACCOUNT_BALANCE
+                    available_balance = VIRTUAL_ACCOUNT_INITIAL_BALANCE
                     await cache_manager.set(VIRTUAL_BALANCE_KEY, available_balance)
             else:
                 # 首次使用，设置初始余额
-                available_balance = VIRTUAL_ACCOUNT_BALANCE
+                available_balance = VIRTUAL_ACCOUNT_INITIAL_BALANCE
                 await cache_manager.set(VIRTUAL_BALANCE_KEY, available_balance)
                 logger.info(f"💰 初始化虚拟账户余额: {available_balance} USDT")
             

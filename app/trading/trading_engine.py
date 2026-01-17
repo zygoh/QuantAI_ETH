@@ -15,7 +15,16 @@ from typing import Dict, List, Any, Optional
 # Local App
 from app.core.cache import cache_manager
 from app.core.config import settings
-from app.core.constants import VIRTUAL_OPEN_FEE_RATE, VIRTUAL_CLOSE_FEE_RATE
+from app.core.constants import (
+    POSITION_MAX_DAILY_TRADES,
+    POSITION_MAX_SIZE,
+    TRADING_SAFE_STOP_LOSS_LONG_PCT,
+    TRADING_SAFE_STOP_LOSS_SHORT_PCT,
+    TRADING_SAFE_TAKE_PROFIT_LONG_PCT,
+    TRADING_SAFE_TAKE_PROFIT_SHORT_PCT,
+    VIRTUAL_OPEN_FEE_RATE,
+    VIRTUAL_CLOSE_FEE_RATE
+)
 from app.core.database import postgresql_manager
 from app.exchange.exchange_factory import ExchangeFactory
 from app.exchange.mappers import SymbolMapper
@@ -113,8 +122,8 @@ class TradingEngine:
         self._position_lock = asyncio.Lock()  # 仓位操作锁
         
         # 风险控制参数
-        self.max_position_size = 1000  # 最大持仓数量
-        self.max_daily_trades = 50     # 每日最大交易次数
+        self.max_position_size = POSITION_MAX_SIZE
+        self.max_daily_trades = POSITION_MAX_DAILY_TRADES
         self.daily_trade_count = 0
         self.last_trade_date = datetime.now().date()
         
@@ -723,24 +732,24 @@ class TradingEngine:
                     if actual_stop_loss >= current_price:
                         logger.error(f"❌ LONG仓位止损价格无效: 止损({actual_stop_loss:.2f}) >= 当前价格({current_price:.2f})")
                         # 使用安全的默认止损（当前价格的1.5%下方）
-                        actual_stop_loss = current_price * 0.985
+                        actual_stop_loss = current_price * TRADING_SAFE_STOP_LOSS_LONG_PCT
                         logger.warning(f"   已修正为安全止损价: {actual_stop_loss:.2f}")
                     if actual_take_profit <= current_price:
                         logger.error(f"❌ LONG仓位止盈价格无效: 止盈({actual_take_profit:.2f}) <= 当前价格({current_price:.2f})")
                         # 使用安全的默认止盈（当前价格的3%上方）
-                        actual_take_profit = current_price * 1.03
+                        actual_take_profit = current_price * TRADING_SAFE_TAKE_PROFIT_LONG_PCT
                         logger.warning(f"   已修正为安全止盈价: {actual_take_profit:.2f}")
                 else:  # SHORT
                     # 做空：止损必须高于当前价格，止盈必须低于当前价格
                     if actual_stop_loss <= current_price:
                         logger.error(f"❌ SHORT仓位止损价格无效: 止损({actual_stop_loss:.2f}) <= 当前价格({current_price:.2f})")
                         # 使用安全的默认止损（当前价格的1.5%上方）
-                        actual_stop_loss = current_price * 1.015
+                        actual_stop_loss = current_price * TRADING_SAFE_STOP_LOSS_SHORT_PCT
                         logger.warning(f"   已修正为安全止损价: {actual_stop_loss:.2f}")
                     if actual_take_profit >= current_price:
                         logger.error(f"❌ SHORT仓位止盈价格无效: 止盈({actual_take_profit:.2f}) >= 当前价格({current_price:.2f})")
                         # 使用安全的默认止盈（当前价格的3%下方）
-                        actual_take_profit = current_price * 0.97
+                        actual_take_profit = current_price * TRADING_SAFE_TAKE_PROFIT_SHORT_PCT
                         logger.warning(f"   已修正为安全止盈价: {actual_take_profit:.2f}")
                 
                 # 创建新的虚拟仓位

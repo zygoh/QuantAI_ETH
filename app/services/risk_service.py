@@ -15,7 +15,24 @@ from scipy import stats
 
 # Local App
 from app.core.cache import cache_manager
-from app.core.config import settings
+from app.core.constants import (
+    KELLY_MULTIPLIER,
+    KELLY_MAX_POSITION_RATIO,
+    MAX_DRAWDOWN_LIMIT,
+    RISK_ATR_KLINES_COUNT,
+    RISK_ATR_TAKE_PROFIT_MULTIPLIER,
+    RISK_ATR_TRAILING_STOP_MULTIPLIER,
+    RISK_ATR_WINDOW,
+    RISK_FIXED_TRAILING_STOP_PCT,
+    RISK_FREE_RATE,
+    RISK_MONTE_CARLO_SIMULATIONS,
+    RISK_METRICS_QUERY_LIMIT,
+    RISK_VAR_LIMIT_PCT,
+    VAR_CONFIDENCE,
+    POSITION_MAX_SIZE,
+    STOP_LOSS_PCT_FALLBACK,
+    TAKE_PROFIT_PCT_FALLBACK
+)
 from app.core.database import postgresql_manager
 from app.exchange.base_exchange_client import UnifiedKlineData
 from app.exchange.exchange_factory import ExchangeFactory
@@ -63,7 +80,7 @@ class RiskService:
     async def calculate_var(
         self, 
         symbol: str, 
-        confidence: float = 0.95, 
+        confidence: float = VAR_CONFIDENCE,
         holding_period: int = 1,
         method: str = 'historical'
     ) -> VaRResult:
@@ -163,7 +180,7 @@ class RiskService:
         returns: pd.Series, 
         confidence: float, 
         holding_period: int,
-        num_simulations: int = 10000
+        num_simulations: int = RISK_MONTE_CARLO_SIMULATIONS
     ) -> float:
         """蒙特卡洛模拟法计算VaR"""
         try:
@@ -194,7 +211,7 @@ class RiskService:
     async def calculate_expected_shortfall(
         self, 
         symbol: str, 
-        confidence: float = 0.95
+        confidence: float = VAR_CONFIDENCE
     ) -> float:
         """计算期望损失（条件VaR）"""
         try:
@@ -254,7 +271,7 @@ class RiskService:
             logger.error(f"计算最大回撤失败: {e}")
             return 0.0, 0.0
     
-    async def calculate_sharpe_ratio(self, symbol: str, risk_free_rate: float = 0.02) -> float:
+    async def calculate_sharpe_ratio(self, symbol: str, risk_free_rate: float = RISK_FREE_RATE) -> float:
         """计算夏普比率"""
         try:
             returns = await self._get_returns_data(symbol, days=252)
@@ -280,7 +297,7 @@ class RiskService:
             logger.error(f"计算夏普比率失败: {e}")
             return 0.0
     
-    async def calculate_sortino_ratio(self, symbol: str, risk_free_rate: float = 0.02) -> float:
+    async def calculate_sortino_ratio(self, symbol: str, risk_free_rate: float = RISK_FREE_RATE) -> float:
         """计算索提诺比率"""
         try:
             returns = await self._get_returns_data(symbol, days=252)
@@ -331,7 +348,7 @@ class RiskService:
             kelly_fraction = (b * p - q) / b
             
             # 限制Kelly比例在合理范围内
-            kelly_fraction = max(0, min(kelly_fraction, 0.25))  # 最大25%
+            kelly_fraction = max(0, min(kelly_fraction, KELLY_MAX_POSITION_RATIO))
             
             return kelly_fraction
             
@@ -347,7 +364,7 @@ class RiskService:
             start_time = end_time - timedelta(days=days)
             
             signals = await postgresql_manager.query_signals(
-                symbol, start_time, end_time, limit=1000
+                symbol, start_time, end_time, limit=RISK_METRICS_QUERY_LIMIT
             )
             
             if not signals:
@@ -421,7 +438,7 @@ class RiskService:
     async def calculate_portfolio_var(
         self, 
         positions: List[Dict[str, Any]], 
-        confidence: float = 0.95
+        confidence: float = VAR_CONFIDENCE
     ) -> float:
         """计算投资组合VaR"""
         try:
@@ -483,7 +500,7 @@ class RiskService:
             position = await position_manager.get_position(symbol)
             
             # 计算风险指标
-            var_result = await self.calculate_var(symbol, confidence=settings.VAR_CONFIDENCE)
+            var_result = await self.calculate_var(symbol, confidence=VAR_CONFIDENCE)
             max_dd, current_dd = await self.calculate_max_drawdown(symbol)
             
             # 风险检查
@@ -491,19 +508,19 @@ class RiskService:
                 'var_check': {
                     'passed': True,
                     'value': var_result.var_1d,
-                    'limit': 0.05,  # 5% VaR限制
+                'limit': RISK_VAR_LIMIT_PCT,
                     'message': 'VaR风险正常'
                 },
                 'drawdown_check': {
-                    'passed': current_dd <= settings.MAX_DRAWDOWN_LIMIT * 100,
+                    'passed': current_dd <= MAX_DRAWDOWN_LIMIT * 100,
                     'value': current_dd,
-                    'limit': settings.MAX_DRAWDOWN_LIMIT * 100,
-                    'message': '回撤风险正常' if current_dd <= settings.MAX_DRAWDOWN_LIMIT * 100 else '回撤超过限制'
+                    'limit': MAX_DRAWDOWN_LIMIT * 100,
+                    'message': '回撤风险正常' if current_dd <= MAX_DRAWDOWN_LIMIT * 100 else '回撤超过限制'
                 },
                 'position_size_check': {
                     'passed': True,
                     'value': position.size if position else 0,
-                    'limit': 1000,  # 最大持仓限制
+                    'limit': POSITION_MAX_SIZE,
                     'message': '持仓大小正常'
                 }
             }
@@ -567,7 +584,7 @@ class RiskService:
                 'drawdown_metrics': {
                     'max_drawdown': max_dd,
                     'current_drawdown': current_dd,
-                    'drawdown_limit': settings.MAX_DRAWDOWN_LIMIT * 100
+                    'drawdown_limit': MAX_DRAWDOWN_LIMIT * 100
                 },
                 'performance_metrics': {
                     'sharpe_ratio': sharpe_ratio,
@@ -577,7 +594,7 @@ class RiskService:
                 'trading_metrics': trading_metrics,
                 'position_sizing': {
                     'kelly_percentage': kelly_pct,
-                    'recommended_size': kelly_pct * settings.KELLY_MULTIPLIER
+                    'recommended_size': kelly_pct * KELLY_MULTIPLIER
                 },
                 'risk_assessment': risk_limits
             }
@@ -628,7 +645,7 @@ class RiskService:
             klines = exchange_client.get_klines_paginated(
                 symbol=symbol,
                 interval='5m',
-                limit=100  # 5m需要更多样本（100个=8.3小时）
+                limit=RISK_ATR_KLINES_COUNT
             )
             
             if not klines or len(klines) < 20:
@@ -656,7 +673,7 @@ class RiskService:
                 high=df['high'],
                 low=df['low'],
                 close=df['close'],
-                window=14
+                window=RISK_ATR_WINDOW
             )
             current_atr = atr_indicator.average_true_range().iloc[-1]
             
@@ -669,11 +686,11 @@ class RiskService:
                 stop_loss = entry_price - (current_atr * 1.2)
                 
                 # 🔥 统一使用3.6倍ATR止盈，确保盈亏比3:1（1.2 * 3 = 3.6）
-                take_profit = entry_price + (current_atr * 3.6)  # 盈亏比3:1
+                take_profit = entry_price + (current_atr * RISK_ATR_TAKE_PROFIT_MULTIPLIER)
                 logger.debug(f"  置信度({confidence:.2f})：使用3.6倍ATR止盈（盈亏比3:1）")
                 
                 # 跟踪止损初始距离
-                trailing_stop_distance = current_atr * 1.0
+                trailing_stop_distance = current_atr * RISK_ATR_TRAILING_STOP_MULTIPLIER
                 
             elif signal_type == 'SHORT':
                 # 做空：止损在上方，止盈在下方
@@ -681,10 +698,10 @@ class RiskService:
                 stop_loss = entry_price + (current_atr * 1.2)
                 
                 # 🔥 统一使用3.6倍ATR止盈，确保盈亏比3:1（1.2 * 3 = 3.6）
-                take_profit = entry_price - (current_atr * 3.6)  # 盈亏比3:1
+                take_profit = entry_price - (current_atr * RISK_ATR_TAKE_PROFIT_MULTIPLIER)
                 logger.debug(f"  置信度({confidence:.2f})：使用3.6倍ATR止盈（盈亏比3:1）")
                 
-                trailing_stop_distance = current_atr * 1.0
+                trailing_stop_distance = current_atr * RISK_ATR_TRAILING_STOP_MULTIPLIER
             else:
                 logger.warning(f"未知信号类型: {signal_type}")
                 return {}
@@ -730,10 +747,10 @@ class RiskService:
     ) -> Dict[str, float]:
         """固定百分比止损（备用方案）"""
         try:
-            stop_loss_pct = 0.015  # 1.5%
+            stop_loss_pct = STOP_LOSS_PCT_FALLBACK
             
             # 🔥 统一使用3:1盈亏比（所有置信度级别）
-            take_profit_pct = 0.045  # 4.5%，盈亏比1:3
+            take_profit_pct = TAKE_PROFIT_PCT_FALLBACK
             
             if signal_type == 'LONG':
                 stop_loss = entry_price * (1 - stop_loss_pct)
@@ -751,7 +768,7 @@ class RiskService:
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'trailing_stop_enabled': False,
-                'trailing_stop_distance': entry_price * 0.01,  # 1%
+                'trailing_stop_distance': entry_price * RISK_FIXED_TRAILING_STOP_PCT,
                 'atr': None,
                 'atr_percent': None,
                 'risk_reward_ratio': risk_reward,

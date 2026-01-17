@@ -15,6 +15,16 @@ import pandas as pd
 # Local App
 from app.core.cache import cache_manager
 from app.core.config import settings
+from app.core.constants import (
+    DRAWDOWN_CHECK_INTERVAL_SECONDS,
+    DRAWDOWN_CRITICAL_RATIO,
+    DRAWDOWN_CACHE_TTL_SECONDS,
+    DRAWDOWN_ALERT_CACHE_TTL_SECONDS,
+    DRAWDOWN_EVENT_THRESHOLD,
+    DRAWDOWN_LOOKBACK_DAYS,
+    DRAWDOWN_WARNING_RATIO,
+    MAX_DRAWDOWN_LIMIT
+)
 from app.core.database import postgresql_manager
 
 logger = logging.getLogger(__name__)
@@ -48,16 +58,16 @@ class DrawdownMonitor:
         self.is_running = False
         self.monitor_task = None
         
-        # 回撤阈值设置（基于配置的MAX_DRAWDOWN_LIMIT）
-        # 使用配置的最大回撤限制，按比例设置三级阈值
-        max_dd = settings.MAX_DRAWDOWN_LIMIT  # 默认0.15 (15%)
-        self.warning_threshold = max_dd * 0.33    # 约5%警告
-        self.critical_threshold = max_dd * 0.67   # 约10%严重
+        # 回撤阈值设置（基于常量MAX_DRAWDOWN_LIMIT）
+        # 使用最大回撤限制，按比例设置三级阈值
+        max_dd = MAX_DRAWDOWN_LIMIT  # 默认0.15 (15%)
+        self.warning_threshold = max_dd * DRAWDOWN_WARNING_RATIO
+        self.critical_threshold = max_dd * DRAWDOWN_CRITICAL_RATIO
         self.emergency_threshold = max_dd          # 15%紧急（等于配置值）
         
         # 监控参数
-        self.check_interval = 60  # 检查间隔（秒）
-        self.lookback_days = 30   # 回看天数
+        self.check_interval = DRAWDOWN_CHECK_INTERVAL_SECONDS
+        self.lookback_days = DRAWDOWN_LOOKBACK_DAYS
         
         # 回撤历史
         self.drawdown_events: List[DrawdownEvent] = []
@@ -151,7 +161,7 @@ class DrawdownMonitor:
             await cache_manager.set_cache(
                 'current_drawdown',
                 str(current_drawdown),
-                expire=300
+                expire=DRAWDOWN_CACHE_TTL_SECONDS
             )
             
         except Exception as e:
@@ -266,7 +276,7 @@ class DrawdownMonitor:
             await cache_manager.set_cache(
                 f'drawdown_alert_{int(alert.timestamp.timestamp())}',
                 str(alert_data),
-                expire=3600
+                expire=DRAWDOWN_ALERT_CACHE_TTL_SECONDS
             )
             
             # 通知回调函数
@@ -290,7 +300,7 @@ class DrawdownMonitor:
             current_equity = equity_curve['equity'].iloc[-1]
             
             # 检查是否开始新的回撤事件
-            if current_drawdown > 0.01:  # 回撤超过1%
+            if current_drawdown > DRAWDOWN_EVENT_THRESHOLD:
                 if not self.current_drawdown_event:
                     # 开始新的回撤事件
                     peak_idx = drawdown_series.idxmax()  # 找到峰值

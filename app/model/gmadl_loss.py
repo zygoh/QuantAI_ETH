@@ -8,6 +8,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+# Local App
+from app.core.constants import GMADL_ERROR_MIN, GMADL_PROB_MAX, GMADL_PROB_MIN
+
 
 class GMADLoss(nn.Module):
     """
@@ -207,12 +210,12 @@ class GMADLossWithHOLDPenalty(nn.Module):
 
         # 1. 计算softmax概率（添加数值稳定性）
         probs = torch.softmax(logits, dim=1)
-        probs = torch.clamp(probs, min=1e-7, max=1.0 - 1e-7)
+        probs = torch.clamp(probs, min=GMADL_PROB_MIN, max=GMADL_PROB_MAX)
 
         # 2. 获取正确类别概率并计算误差
         batch_size = targets.size(0)
         target_probs = probs[torch.arange(batch_size, device=logits.device, dtype=torch.long), targets]
-        errors = torch.clamp(1.0 - target_probs, min=1e-7, max=1.0)
+        errors = torch.clamp(1.0 - target_probs, min=GMADL_ERROR_MIN, max=1.0)
 
         # 3. GMADL损失（增强数值稳定性）
         abs_errors = torch.abs(errors)

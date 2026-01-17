@@ -34,7 +34,32 @@ from numpy.lib.format import open_memmap
 # Local application imports
 from app.model.base.ml_service import MLService
 from app.core.config import settings
+from app.core.constants import GMADL_ALPHA, GMADL_BETA, USE_GMADL_LOSS
 from app.core.cache import cache_manager
+from app.core.constants import (
+    ENSEMBLE_FALLBACK_WEIGHTS,
+    ENSEMBLE_MAX_SPLITS,
+    ENSEMBLE_META_HOLD_PENALTY_WEIGHTS,
+    ENSEMBLE_META_LEARNER_PARAMS,
+    ENSEMBLE_META_TIME_DECAY_FACTOR,
+    ENSEMBLE_TRAIN_SPLIT_RATIO,
+    ENSEMBLE_VAL_SPLIT_RATIO,
+    INFORMER_BATCH_SIZE,
+    INFORMER_D_MODEL,
+    INFORMER_EPOCHS,
+    INFORMER_GRAD_CLIP_NORM,
+    INFORMER_LEARNING_RATE,
+    INFORMER_MAX_CONSECUTIVE_NAN_INF,
+    INFORMER_MAX_NAN_INF_TOLERANCE,
+    INFORMER_N_HEADS,
+    INFORMER_N_LAYERS,
+    INFORMER_N_TRIALS,
+    INFORMER_SEQ_LEN_CONFIG,
+    INFORMER_TIMEOUT_SECONDS,
+    INFORMER_WARMUP_EPOCHS,
+    OPTUNA_N_TRIALS,
+    OPTUNA_TIMEOUT_SECONDS
+)
 from app.model.optimizers.hyperparameter_optimizer import HyperparameterOptimizer
 from app.services.direction_consistency_checker import TradingDirectionConsistencyChecker, ConsistencyCheck
 from app.services.adaptive_frequency_controller import AdaptiveFrequencyController, FrequencyControl
@@ -123,29 +148,25 @@ class EnsembleMLService(MLService):
         self.model_versions = {}  # {timeframe: version_number}
         
         # 集成权重（Stacking自动学习，这里作为降级方案）
-        self.fallback_weights = {
-            'lgb': 0.4,
-            'xgb': 0.3,
-            'cat': 0.3
-        }
+        self.fallback_weights = ENSEMBLE_FALLBACK_WEIGHTS
         
         # 🔧 超参数优化配置
         self.enable_hyperparameter_tuning = True  # ✅ 已启用（Phase 2B）
         self.optimize_all_models = True  # ✅ GPU加速下优化所有模型
         self.optimize_informer2 = True  # ✅ 优化Informer-2（深度学习）
-        self.optuna_n_trials = 100  # Optuna试验次数（传统模型）
-        self.informer_n_trials = 20  # Informer-2试验次数（保证至少完成整轮搜索）
-        self.optuna_timeout = 1800  # 超时30分钟（GPU加速下足够优化3个模型）
-        self.informer_timeout = 3600  # Informer-2超时60分钟（防止仅完成1-2次试验）
+        self.optuna_n_trials = OPTUNA_N_TRIALS
+        self.informer_n_trials = INFORMER_N_TRIALS
+        self.optuna_timeout = OPTUNA_TIMEOUT_SECONDS
+        self.informer_timeout = INFORMER_TIMEOUT_SECONDS
         
         # 🤖 Informer-2深度学习配置
         self.enable_informer2 = True  # ✅ 已启用（Phase 3 - 神经网络）
-        self.informer_d_model = 128  # 模型维度
-        self.informer_n_heads = 8  # 注意力头数
-        self.informer_n_layers = 3  # Encoder层数
-        self.informer_epochs = 50  # 训练轮数（GPU加速）
-        self.informer_batch_size = 256  # 批次大小
-        self.informer_lr = 0.0005  # 学习率（降低以提高数值稳定性：0.001→0.0005）
+        self.informer_d_model = INFORMER_D_MODEL
+        self.informer_n_heads = INFORMER_N_HEADS
+        self.informer_n_layers = INFORMER_N_LAYERS
+        self.informer_epochs = INFORMER_EPOCHS
+        self.informer_batch_size = INFORMER_BATCH_SIZE
+        self.informer_lr = INFORMER_LEARNING_RATE
         
         # 🔥 高级内存优化配置（生产级别）
         self.use_gradient_checkpointing = True  # 梯度检查点（节省50-70%内存）
@@ -158,11 +179,7 @@ class EnsembleMLService(MLService):
         
         # 🔑 序列长度配置（用于Informer-2序列输入）
         # 🎯 优化：减少序列长度以降低内存占用（减少80-90%）
-        self.seq_len_config = {
-            '3m': 96,   # 96 × 3分钟 = 4.8小时（足够短期模式识别）
-            '5m': 96,   # 96 × 5分钟 = 8小时（主时间框架）
-            '15m': 64   # 64 × 15分钟 = 16小时（趋势确认）
-        }
+        self.seq_len_config = INFORMER_SEQ_LEN_CONFIG
         # 🧠 序列内存优化：使用内存映射文件，避免整库常驻内存
         # 🔥 关键修复：禁用内存映射（在交叉验证时会导致索引问题）
         self.use_sequence_memmap = False
@@ -728,8 +745,8 @@ class EnsembleMLService(MLService):
             # 3️⃣ 时间序列分割（三段式：Train 60% / Val 20% / Test 20%）
             # 🔑 修复数据泄露：使用独立测试集评估元学习器
             min_len = min(len(X_lgb_scaled), len(X_xgb_scaled), len(X_cat_scaled))
-            train_split_idx = int(min_len * 0.6)  # 60% 训练集
-            val_split_idx = int(min_len * 0.8)     # 20% 验证集（用于训练元学习器）
+            train_split_idx = int(min_len * ENSEMBLE_TRAIN_SPLIT_RATIO)
+            val_split_idx = int(min_len * ENSEMBLE_VAL_SPLIT_RATIO)
             
             # 🔑 分割数据（取最新的数据，保证时间对齐）
             if isinstance(X_lgb_scaled, np.ndarray):
@@ -766,8 +783,8 @@ class EnsembleMLService(MLService):
             # 🆕 分割序列数据（用于Informer-2，三段式）
             X_seq_train, X_seq_val, X_seq_test, y_seq_train, y_seq_val, y_seq_test = None, None, None, None, None, None
             if self.enable_informer2 and X_seq_lgb is not None:
-                seq_train_split_idx = int(len(X_seq_lgb) * 0.6)
-                seq_val_split_idx = int(len(X_seq_lgb) * 0.8)
+                seq_train_split_idx = int(len(X_seq_lgb) * ENSEMBLE_TRAIN_SPLIT_RATIO)
+                seq_val_split_idx = int(len(X_seq_lgb) * ENSEMBLE_VAL_SPLIT_RATIO)
                 X_seq_train = X_seq_lgb[:seq_train_split_idx]
                 X_seq_val = X_seq_lgb[seq_train_split_idx:seq_val_split_idx]
                 X_seq_test = X_seq_lgb[seq_val_split_idx:]
@@ -1380,37 +1397,24 @@ class EnsembleMLService(MLService):
             hold_ratio = (meta_labels_val == 1).sum() / len(meta_labels_val)
             
             # 🔑 根据HOLD比例动态调整惩罚（平衡策略）
-            if hold_ratio > 0.60:  # HOLD占比>60%，重惩罚
-                meta_hold_penalty_weight = 0.45
-            elif hold_ratio > 0.50:  # HOLD占比>50%，中等
-                meta_hold_penalty_weight = 0.55
-            elif hold_ratio > 0.40:  # HOLD占比>40%，轻度
-                meta_hold_penalty_weight = 0.65
-            else:  # HOLD占比<=40%，正常
-                meta_hold_penalty_weight = 0.75
+            meta_hold_penalty_weight = ENSEMBLE_META_HOLD_PENALTY_WEIGHTS.get(0.0, 0.75)
+            for threshold, weight in sorted(ENSEMBLE_META_HOLD_PENALTY_WEIGHTS.items(), reverse=True):
+                if hold_ratio > threshold:
+                    meta_hold_penalty_weight = weight
+                    break
             
             logger.info(f"   HOLD占比: {hold_ratio*100:.1f}% → 惩罚系数: {meta_hold_penalty_weight}")
             
             meta_class_weights = compute_sample_weight('balanced', meta_labels_val)
             # ✅ 添加时间衰减权重（与基础模型保持一致）
-            meta_time_decay = np.exp(-np.arange(len(meta_features_val)) / (len(meta_features_val) * 0.1))[::-1]
+            meta_time_decay = np.exp(
+                -np.arange(len(meta_features_val)) / (len(meta_features_val) * ENSEMBLE_META_TIME_DECAY_FACTOR)
+            )[::-1]
             meta_hold_penalty = np.where(meta_labels_val == 1, meta_hold_penalty_weight, 1.0)
             meta_sample_weights = meta_class_weights * meta_time_decay * meta_hold_penalty
             
             # 🔑 元学习器：专业配置平衡性能和防过拟合
-            meta_learner = lgb.LGBMClassifier(
-                n_estimators=150,    # ✅ 适当增加树数量 50→150
-                max_depth=6,         # ✅ 中等深度平衡表达能力 3→6
-                learning_rate=0.05,  # ✅ 降低学习率更稳定收敛 0.15→0.05
-                num_leaves=31,       # ✅ 2^5-1标准配置 7→31
-                min_child_samples=20,  # ✅ 适度最小样本 30→20
-                subsample=0.8,       # ✅ 行采样防过拟合 0.7→0.8
-                colsample_bytree=0.8,  # ✅ 列采样防过拟合 0.7→0.8
-                reg_alpha=0.1,       # ✅ 适度L1正则化 0.3→0.1
-                reg_lambda=0.1,      # ✅ 适度L2正则化 0.3→0.1
-                random_state=42,
-                verbose=-1
-            )
+            meta_learner = lgb.LGBMClassifier(**ENSEMBLE_META_LEARNER_PARAMS)
             meta_learner.fit(meta_features_val, meta_labels_val, sample_weight=meta_sample_weights)
             
             logger.info(f"✅ 元学习器训练完成（动态HOLD惩罚={meta_hold_penalty_weight}）")
@@ -1434,7 +1438,7 @@ class EnsembleMLService(MLService):
             # 🔑 修复：根据验证集大小动态调整折数，确保每个fold至少有2个训练样本
             val_size = len(meta_features_val)
             # 计算合适的折数：每个fold至少需要2个训练样本和1个测试样本
-            max_splits = min(5, max(1, (val_size - 1) // 2))
+            max_splits = min(ENSEMBLE_MAX_SPLITS, max(1, (val_size - 1) // 2))
             if max_splits < 2:
                 logger.warning(f"⚠️ 验证集太小（{val_size}个样本），跳过交叉验证")
                 cv_scores = []
@@ -1469,14 +1473,11 @@ class EnsembleMLService(MLService):
                     fold_hold_ratio = (y_train == 1).sum() / len(y_train)
                     
                     # 动态惩罚（平衡策略，与最终模型完全一致）
-                    if fold_hold_ratio > 0.60:
-                        fold_penalty = 0.45
-                    elif fold_hold_ratio > 0.50:
-                        fold_penalty = 0.55
-                    elif fold_hold_ratio > 0.40:
-                        fold_penalty = 0.65
-                    else:
-                        fold_penalty = 0.75
+                    fold_penalty = ENSEMBLE_META_HOLD_PENALTY_WEIGHTS.get(0.0, 0.75)
+                    for threshold, weight in sorted(ENSEMBLE_META_HOLD_PENALTY_WEIGHTS.items(), reverse=True):
+                        if fold_hold_ratio > threshold:
+                            fold_penalty = weight
+                            break
                     
                     fold_hold_penalty = np.where(y_train == 1, fold_penalty, 1.0)
                     fold_sample_weights = fold_weights * fold_hold_penalty
@@ -2005,8 +2006,8 @@ class EnsembleMLService(MLService):
                 epochs = custom_params.get('epochs', self.informer_epochs)
                 batch_size = custom_params.get('batch_size', self.informer_batch_size)
                 lr = custom_params.get('lr', self.informer_lr)
-                alpha = custom_params.get('alpha', settings.GMADL_ALPHA)
-                beta = custom_params.get('beta', settings.GMADL_BETA)
+                alpha = custom_params.get('alpha', GMADL_ALPHA)
+                beta = custom_params.get('beta', GMADL_BETA)
                 logger.info(f"🎯 使用优化参数: d_model={d_model}, n_heads={n_heads}, n_layers={n_layers}, epochs={epochs}")
             else:
                 d_model = self.informer_d_model
@@ -2016,8 +2017,8 @@ class EnsembleMLService(MLService):
                 epochs = self.informer_epochs
                 batch_size = self.informer_batch_size
                 lr = self.informer_lr
-                alpha = settings.GMADL_ALPHA
-                beta = settings.GMADL_BETA
+                alpha = GMADL_ALPHA
+                beta = GMADL_BETA
             
             # 5. 初始化模型（支持序列输入 + 梯度检查点）
             n_features = X_seq_train.shape[2]  # 特征数量（从序列的最后一维获取）
@@ -2044,13 +2045,13 @@ class EnsembleMLService(MLService):
                 hold_penalty_nn = float(max(0.50, min(0.75, 0.85 - 0.5 * hold_ratio_informer)))
 
             criterion = create_trade_loss(
-                use_gmadl=settings.USE_GMADL_LOSS,
+                use_gmadl=USE_GMADL_LOSS,
                 hold_penalty=hold_penalty_nn,
                 alpha=alpha,
                 beta=beta
             )
 
-            if settings.USE_GMADL_LOSS:
+            if USE_GMADL_LOSS:
                 logger.info(
                     f"   损失函数: GMADL + HOLD惩罚 (alpha={alpha:.2f}, beta={beta:.2f})"
                 )
@@ -2091,7 +2092,7 @@ class EnsembleMLService(MLService):
             
             # ✅ 修复C: 添加Warmup + ReduceLROnPlateau组合调度器
             # Warmup配置
-            warmup_epochs = 5  # 前5个epoch warmup
+            warmup_epochs = INFORMER_WARMUP_EPOCHS
             target_lr = lr
             
             # 主调度器：ReduceLROnPlateau（用于warmup后的学习率调整）
@@ -2161,7 +2162,7 @@ class EnsembleMLService(MLService):
                 logger.info("   混合精度训练: 禁用（CPU环境）")
             
             # 可选：如果未来需要重新启用AMP，使用保守策略
-            # if settings.USE_GMADL_LOSS and use_amp:
+            # if USE_GMADL_LOSS and use_amp:
             #     logger.info("   ⚠️ GMADL开启 → 为保障数值稳定，禁用AMP改用FP32训练")
             #     use_amp = False
             # 
@@ -2237,9 +2238,9 @@ class EnsembleMLService(MLService):
             
             # ✅ 修复F: 平衡的早期终止阈值
             nan_inf_count = 0  # 统计nan/inf出现次数
-            max_nan_inf_tolerance = 30  # 从50降低到30（平衡值）
+            max_nan_inf_tolerance = INFORMER_MAX_NAN_INF_TOLERANCE
             consecutive_nan_inf = 0  # 连续nan/inf次数
-            max_consecutive_nan_inf = 8  # 从10降低到8（平衡值）
+            max_consecutive_nan_inf = INFORMER_MAX_CONSECUTIVE_NAN_INF
             
             logger.info(f"   早期终止阈值: 连续{max_consecutive_nan_inf}次 或 累计{max_nan_inf_tolerance}次")
             
@@ -2408,9 +2409,9 @@ class EnsembleMLService(MLService):
                         
                         # ⭐ 核心修复：梯度裁剪（防止梯度爆炸）
                         torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), 
+                            model.parameters(),
                             max_norm=1.0,      # 梯度范数上限（Informer2建议1.0）
-                            norm_type=2.0       # L2范数
+                            norm_type=INFORMER_GRAD_CLIP_NORM
                         )
                         
                         # 优化器步进
@@ -3037,7 +3038,7 @@ class EnsembleMLService(MLService):
                 inf_proba = None
                 inf_pred = None
             
-            # 1. 基础元特征（12个）
+            # 1. 基础元特征（如果有inf是12个，否则是9个，但为了与训练时一致，总是生成12个）
             meta_features = np.concatenate([
                 lgb_proba,  # 3个
                 xgb_proba,  # 3个
@@ -3045,7 +3046,11 @@ class EnsembleMLService(MLService):
             ])
             
             if inf_proba is not None:
-                meta_features = np.concatenate([meta_features, inf_proba])  # +3个
+                meta_features = np.concatenate([meta_features, inf_proba])  # +3个 = 12个
+            else:
+                # 如果没有inf，用0填充以保持特征数量一致（如果模型期望25个特征）
+                # 但先检查模型期望的特征数量
+                meta_features = np.concatenate([meta_features, np.zeros(3)])  # +3个占位符 = 12个
             
             # 2. 增强元特征（11个）
             # 模型一致性
@@ -3064,33 +3069,40 @@ class EnsembleMLService(MLService):
             xgb_entropy = entr(xgb_proba).sum()
             cat_entropy = entr(cat_proba).sum()
             
-            # 平均概率
+            # 平均概率（保持与训练时一致：3个值，每个类别的平均概率）
             avg_proba = np.mean([lgb_proba, xgb_proba, cat_proba], axis=0)
             if inf_proba is not None:
                 avg_proba = np.mean([lgb_proba, xgb_proba, cat_proba, inf_proba], axis=0)
             
-            # 概率标准差
-            prob_std = np.std([lgb_proba, xgb_proba, cat_proba], axis=0).mean()
+            # 概率标准差（保持与训练时一致：每个类别概率标准差的最大值）
+            prob_std = np.std([lgb_proba, xgb_proba, cat_proba], axis=0)
             if inf_proba is not None:
-                prob_std = np.std([lgb_proba, xgb_proba, cat_proba, inf_proba], axis=0).mean()
+                prob_std = np.std([lgb_proba, xgb_proba, cat_proba, inf_proba], axis=0)
+            prob_std_max = prob_std.max()  # 取最大值（与训练时一致）
             
             # Informer-2增强特征（如果存在）
             if inf_proba is not None:
                 inf_max_prob = inf_proba.max()
                 inf_entropy = entr(inf_proba).sum()
                 
-                enhanced_features = np.array([
-                    agreement, lgb_max_prob, xgb_max_prob, cat_max_prob,
-                    lgb_entropy, xgb_entropy, cat_entropy,
-                    avg_proba.mean(), prob_std,
-                    inf_max_prob, inf_entropy
+                # 与训练时保持一致：agreement(1) + max_prob(4) + entropy(4) + avg_proba(3) + prob_std_max(1) = 13个
+                enhanced_features = np.concatenate([
+                    np.array([agreement]),
+                    np.array([lgb_max_prob, xgb_max_prob, cat_max_prob, inf_max_prob]),
+                    np.array([lgb_entropy, xgb_entropy, cat_entropy, inf_entropy]),
+                    avg_proba,  # 3个值
+                    np.array([prob_std_max])
                 ])
             else:
-                enhanced_features = np.array([
-                    agreement, lgb_max_prob, xgb_max_prob, cat_max_prob,
-                    lgb_entropy, xgb_entropy, cat_entropy,
-                    avg_proba.mean(), prob_std,
-                    0.0, 0.0  # 占位符
+                # 如果模型期望25个特征（训练时有inf），但回测时没有inf，用0填充inf相关特征
+                # 与训练时保持一致：agreement(1) + max_prob(4) + entropy(4) + avg_proba(3) + prob_std_max(1) = 13个
+                # 其中inf_max_prob和inf_entropy用0填充
+                enhanced_features = np.concatenate([
+                    np.array([agreement]),
+                    np.array([lgb_max_prob, xgb_max_prob, cat_max_prob, 0.0]),  # inf_max_prob用0填充
+                    np.array([lgb_entropy, xgb_entropy, cat_entropy, 0.0]),  # inf_entropy用0填充
+                    avg_proba,  # 3个值
+                    np.array([prob_std_max])
                 ])
             
             # 合并所有特征
@@ -3100,8 +3112,9 @@ class EnsembleMLService(MLService):
             
         except Exception as e:
             logger.error(f"❌ 增强元特征生成失败: {e}")
-            # 返回默认特征
-            default_features = np.zeros(23)  # 12 + 11
+            # 返回默认特征（与训练时保持一致：如果有inf是25个，否则是20个）
+            # 这里使用25个以确保与训练时一致（如果模型期望25个特征）
+            default_features = np.zeros(25)  # 12 + 13（有inf的情况）
             return default_features.reshape(1, -1)
 
     def _get_recent_performance(self) -> Dict[str, float]:

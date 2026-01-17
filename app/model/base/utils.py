@@ -4,6 +4,9 @@
 import logging
 import pandas as pd
 import numpy as np
+
+# Local App
+from app.core.constants import EFFECTIVE_SAMPLE_BETA_BASE, EFFECTIVE_SAMPLE_BETA_NON_3M
 from typing import Tuple
 
 logger = logging.getLogger(__name__)
@@ -28,11 +31,11 @@ def compute_effective_sample_weights(y: pd.Series, timeframe: str) -> np.ndarray
         
         counts = np.maximum(counts, 1.0)
         
-        base_beta = 0.999
+        base_beta = EFFECTIVE_SAMPLE_BETA_BASE
         if timeframe == '3m':
             beta = min(base_beta, 1.0 - 1.0 / (total + 1))
         else:
-            beta = min(0.995, 1.0 - 1.0 / (total + 1))
+            beta = min(EFFECTIVE_SAMPLE_BETA_NON_3M, 1.0 - 1.0 / (total + 1))
         
         effective_num = (1.0 - np.power(beta, counts)) / (1.0 - beta)
         class_weights = 1.0 / effective_num

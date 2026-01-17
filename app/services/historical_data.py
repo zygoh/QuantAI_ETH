@@ -13,6 +13,7 @@ import pandas as pd
 
 # Local App
 from app.core.config import settings
+from app.core.constants import HISTORICAL_DATA_BATCH_SIZE, HISTORICAL_DATA_RATE_LIMIT_DELAY
 from app.core.database import postgresql_manager
 from app.exchange.base_exchange_client import UnifiedKlineData
 from app.exchange.exchange_factory import ExchangeFactory
@@ -23,8 +24,8 @@ class HistoricalDataManager:
     """历史数据管理器"""
     
     def __init__(self):
-        self.batch_size = 1000  # 每批获取的数据量
-        self.rate_limit_delay = 0.1  # API调用间隔（秒）
+        self.batch_size = HISTORICAL_DATA_BATCH_SIZE
+        self.rate_limit_delay = HISTORICAL_DATA_RATE_LIMIT_DELAY
         # 🔑 获取交易所客户端（使用工厂模式，支持多交易所）
         self.exchange_client = ExchangeFactory.get_current_client()
     

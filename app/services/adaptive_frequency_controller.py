@@ -19,6 +19,25 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import pandas as pd
 
+# Local App
+from app.core.constants import (
+    FREQUENCY_BASE_LIMIT,
+    FREQUENCY_ATR_WINDOW,
+    FREQUENCY_FEE_RATE,
+    FREQUENCY_FEE_OVERFLOW_MULTIPLIER,
+    FREQUENCY_MAX_LIMIT,
+    FREQUENCY_MAX_DAILY_TRADES,
+    FREQUENCY_MIN_LIMIT,
+    FREQUENCY_MIN_CONFIDENCE,
+    FREQUENCY_MIN_TRADE_INTERVAL_MINUTES,
+    FREQUENCY_OVERFLOW_MULTIPLIER,
+    FREQUENCY_PERFORMANCE_FACTOR_BASE,
+    FREQUENCY_TARGET_FEE_IMPACT,
+    FREQUENCY_TREND_FACTOR_BASE,
+    FREQUENCY_TREND_STRENGTH_THRESHOLD,
+    FREQUENCY_VOLATILITY_THRESHOLD
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,17 +65,17 @@ class AdaptiveFrequencyController:
     
     def __init__(self):
         # 频率控制参数
-        self.base_frequency_limit = 0.3  # 基础频率限制（30%）
-        self.max_daily_trades = 20       # 最大日交易次数
-        self.min_trade_interval = 15     # 最小交易间隔（分钟）
+        self.base_frequency_limit = FREQUENCY_BASE_LIMIT
+        self.max_daily_trades = FREQUENCY_MAX_DAILY_TRADES
+        self.min_trade_interval = FREQUENCY_MIN_TRADE_INTERVAL_MINUTES
         
         # 手续费参数
-        self.fee_rate = 0.0007           # 手续费率（0.07%）
-        self.target_fee_impact = 0.05    # 目标手续费影响（5%/日）
+        self.fee_rate = FREQUENCY_FEE_RATE
+        self.target_fee_impact = FREQUENCY_TARGET_FEE_IMPACT
         
         # 市场状态参数
-        self.volatility_threshold = 0.02  # 波动率阈值
-        self.trend_strength_threshold = 0.6  # 趋势强度阈值
+        self.volatility_threshold = FREQUENCY_VOLATILITY_THRESHOLD
+        self.trend_strength_threshold = FREQUENCY_TREND_STRENGTH_THRESHOLD
         
         # 历史记录
         self.trade_history: List[Dict] = []
@@ -88,7 +107,7 @@ class AdaptiveFrequencyController:
             high_close = np.abs(price_data['high'] - price_data['close'].shift(1))
             low_close = np.abs(price_data['low'] - price_data['close'].shift(1))
             true_range = np.maximum(high_low, np.maximum(high_close, low_close))
-            atr = true_range.rolling(window=14).mean()
+            atr = true_range.rolling(window=FREQUENCY_ATR_WINDOW).mean()
             volatility = (atr / price_data['close']).mean()
             
             # 2. 趋势强度计算（ADX）
@@ -166,7 +185,7 @@ class AdaptiveFrequencyController:
             volatility_factor = max(0.5, 1.0 - (volatility - 0.01) * 10)
             
             # 2. 趋势强度调整（强趋势增加频率）
-            trend_factor = 0.5 + trend_strength * 0.5
+            trend_factor = FREQUENCY_TREND_FACTOR_BASE + trend_strength * FREQUENCY_TREND_FACTOR_BASE
             
             # 3. 成交量调整（高成交量增加频率）
             volume_factor = min(1.5, max(0.5, volume_ratio))
@@ -175,7 +194,7 @@ class AdaptiveFrequencyController:
             win_rate = recent_performance.get('win_rate', 0.5)
             avg_profit = recent_performance.get('avg_profit', 0.0)
             
-            performance_factor = 0.5 + win_rate * 0.5
+            performance_factor = FREQUENCY_PERFORMANCE_FACTOR_BASE + win_rate * FREQUENCY_PERFORMANCE_FACTOR_BASE
             if avg_profit > 0:
                 performance_factor = min(1.2, performance_factor * 1.1)
             
@@ -183,7 +202,7 @@ class AdaptiveFrequencyController:
             optimal_freq = base_freq * volatility_factor * trend_factor * volume_factor * performance_factor
             
             # 限制范围
-            optimal_freq = max(0.05, min(0.8, optimal_freq))
+            optimal_freq = max(FREQUENCY_MIN_LIMIT, min(FREQUENCY_MAX_LIMIT, optimal_freq))
             
             logger.debug(f"🔍 最优频率计算: 基础={base_freq:.3f}, "
                         f"波动率因子={volatility_factor:.3f}, "
@@ -315,16 +334,16 @@ class AdaptiveFrequencyController:
         """判断是否允许交易"""
         try:
             # 1. 频率限制检查
-            if current_freq >= optimal_freq * 1.2:  # 超过最优频率20%
+            if current_freq >= optimal_freq * FREQUENCY_OVERFLOW_MULTIPLIER:
                 return False, f"交易频率过高 ({current_freq:.3f} >= {optimal_freq:.3f})"
             
             # 2. 手续费影响检查
-            if fee_impact > self.target_fee_impact * 1.5:  # 超过目标手续费1.5倍
+            if fee_impact > self.target_fee_impact * FREQUENCY_FEE_OVERFLOW_MULTIPLIER:
                 return False, f"手续费影响过大 ({fee_impact:.3f}% > {self.target_fee_impact:.3f}%)"
             
             # 3. 置信度检查
-            if confidence < 0.4:  # 置信度过低
-                return False, f"信号置信度过低 ({confidence:.3f} < 0.4)"
+            if confidence < FREQUENCY_MIN_CONFIDENCE:
+                return False, f"信号置信度过低 ({confidence:.3f} < {FREQUENCY_MIN_CONFIDENCE})"
             
             # 4. 最小间隔检查
             if self.trade_history:

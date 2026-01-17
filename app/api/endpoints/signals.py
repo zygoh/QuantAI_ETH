@@ -14,6 +14,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.api.dependencies import get_current_user
 from app.api.models import SignalRequest, SignalsResponse, TradingSignal
 from app.core.config import settings
+from app.core.constants import (
+    API_SIGNAL_HISTORY_LIMIT,
+    API_SIGNAL_LATEST_DATA_LIMIT,
+    API_SIGNAL_RECENT_HOURS,
+    API_SIGNAL_RECENT_LIMIT,
+    API_SIGNALS_HISTORY_HOURS,
+    API_SIGNALS_HISTORY_LIMIT,
+    API_SIGNALS_PERFORMANCE_DAYS,
+    API_SIGNALS_SUMMARY_DAYS
+)
 from app.core.database import postgresql_manager
 
 logger = logging.getLogger(__name__)
@@ -34,8 +44,8 @@ def set_services(sg, ml, ds):
 @router.get("/", response_model=SignalsResponse)
 async def get_signals(
     symbol: Optional[str] = Query(None, description="交易对符号"),
-    hours: int = Query(24, description="查询小时数"),
-    limit: int = Query(100, description="返回数量限制"),
+    hours: int = Query(API_SIGNALS_HISTORY_HOURS, description="查询小时数"),
+    limit: int = Query(API_SIGNALS_HISTORY_LIMIT, description="返回数量限制"),
     current_user: str = Depends(get_current_user)
 ):
     """获取交易信号历史"""
@@ -138,7 +148,11 @@ async def get_latest_signal(
         query_symbol = symbol or settings.SYMBOL
         
         # 获取最近1小时的信号
-        signals = await signal_generator.get_recent_signals(query_symbol, hours=1, limit=1)
+        signals = await signal_generator.get_recent_signals(
+            query_symbol,
+            hours=API_SIGNAL_RECENT_HOURS,
+            limit=API_SIGNAL_RECENT_LIMIT
+        )
         
         if signals:
             latest_signal = signals[0]
@@ -161,7 +175,7 @@ async def get_latest_signal(
 @router.get("/performance")
 async def get_signal_performance(
     symbol: Optional[str] = Query(None, description="交易对符号"),
-    days: int = Query(7, description="统计天数"),
+    days: int = Query(API_SIGNALS_PERFORMANCE_DAYS, description="统计天数"),
     current_user: str = Depends(get_current_user)
 ):
     """获取信号表现统计"""
@@ -189,7 +203,7 @@ async def get_signal_performance(
 @router.get("/statistics")
 async def get_signal_statistics(
     symbol: Optional[str] = Query(None, description="交易对符号"),
-    days: int = Query(30, description="统计天数"),
+    days: int = Query(API_SIGNALS_SUMMARY_DAYS, description="统计天数"),
     current_user: str = Depends(get_current_user)
 ):
     """获取信号统计"""
@@ -203,7 +217,7 @@ async def get_signal_statistics(
         start_time = end_time - timedelta(days=days)
         
         signals = await postgresql_manager.query_signals(
-            query_symbol, start_time, end_time, limit=1000
+            query_symbol, start_time, end_time, limit=API_SIGNAL_HISTORY_LIMIT
         )
         
         # 统计信号
@@ -253,7 +267,11 @@ async def get_model_prediction(
         query_symbol = symbol or settings.SYMBOL
         
         # 获取最新数据
-        latest_data = await data_service.get_latest_klines(query_symbol, '15m', limit=200)
+        latest_data = await data_service.get_latest_klines(
+            query_symbol,
+            '15m',
+            limit=API_SIGNAL_LATEST_DATA_LIMIT
+        )
         
         if not latest_data:
             raise HTTPException(status_code=404, detail="无法获取市场数据")

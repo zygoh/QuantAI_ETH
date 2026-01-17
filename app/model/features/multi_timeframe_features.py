@@ -11,6 +11,18 @@ import pandas as pd
 
 # Local App
 from app.model.features.utils import calculate_rsi
+from app.core.constants import (
+    FEATURE_EPS,
+    MTF_INTERVAL_15M_MAX,
+    MTF_INTERVAL_3M_MAX,
+    MTF_INTERVAL_5M_MAX,
+    MTF_RESAMPLE_MAP,
+    MTF_RSI_WINDOW,
+    MTF_SHIFT_LAG,
+    MTF_SMA_FAST_WINDOW,
+    MTF_SMA_SLOW_WINDOW,
+    MTF_VOLATILITY_WINDOW
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +45,13 @@ def add_multi_timeframe_features(df: pd.DataFrame) -> pd.DataFrame:
         time_diffs = df_temp.index.to_series().diff().dt.total_seconds() / 60
         median_interval = time_diffs.median()
         
-        if median_interval <= 3.5:
+        if median_interval <= MTF_INTERVAL_3M_MAX:
             current_tf = '3m'
             other_tfs = ['5m', '15m']
-        elif median_interval <= 7.5:
+        elif median_interval <= MTF_INTERVAL_5M_MAX:
             current_tf = '5m'
             other_tfs = ['15m']
-        elif median_interval <= 22.5:
+        elif median_interval <= MTF_INTERVAL_15M_MAX:
             current_tf = '15m'
             other_tfs = []
         else:
@@ -53,27 +65,23 @@ def add_multi_timeframe_features(df: pd.DataFrame) -> pd.DataFrame:
         logger.debug(f"多时间框架特征: 当前={current_tf}, 向上采样到={other_tfs}")
         
         for other_tf in other_tfs:
-            if other_tf == '3m':
-                resample_str = '3min'
-            elif other_tf == '5m':
-                resample_str = '5min'
-            elif other_tf == '15m':
-                resample_str = '15min'
-            else:
+            resample_str = MTF_RESAMPLE_MAP.get(other_tf)
+            if not resample_str:
                 continue
             
+            # Pandas 2.x 兼容：'first'/'last' 需使用 lambda
             df_resampled = df_temp.resample(resample_str).agg({
-                'open': 'first',
+                'open': lambda x: x.iloc[0] if len(x) > 0 else np.nan,
                 'high': 'max',
                 'low': 'min',
-                'close': 'last',
+                'close': lambda x: x.iloc[-1] if len(x) > 0 else np.nan,
                 'volume': 'sum'
             }).ffill()
             
             close_resampled = df_resampled['close']
-            sma_20_resampled = close_resampled.rolling(20).mean()
-            sma_50_resampled = close_resampled.rolling(50).mean()
-            rsi_resampled = calculate_rsi(close_resampled, 14)
+            sma_20_resampled = close_resampled.rolling(MTF_SMA_FAST_WINDOW).mean()
+            sma_50_resampled = close_resampled.rolling(MTF_SMA_SLOW_WINDOW).mean()
+            rsi_resampled = calculate_rsi(close_resampled, MTF_RSI_WINDOW)
             
             trend_resampled = pd.Series(0, index=df_resampled.index)
             trend_resampled[sma_20_resampled > sma_50_resampled] = 1
@@ -82,13 +90,13 @@ def add_multi_timeframe_features(df: pd.DataFrame) -> pd.DataFrame:
             close_resampled_safe = close_resampled.replace(0, np.nan) if (close_resampled == 0).sum() > 0 else close_resampled
             returns_resampled = close_resampled_safe.pct_change(fill_method=None)
             returns_resampled = returns_resampled.replace([np.inf, -np.inf], np.nan)
-            volatility_resampled = returns_resampled.rolling(20).std()
+            volatility_resampled = returns_resampled.rolling(MTF_VOLATILITY_WINDOW).std()
             
-            trend_resampled_shifted = trend_resampled.shift(1)
-            rsi_resampled_shifted = rsi_resampled.shift(1)
-            volatility_resampled_shifted = volatility_resampled.shift(1)
-            sma_20_resampled_shifted = sma_20_resampled.shift(1)
-            sma_50_resampled_shifted = sma_50_resampled.shift(1)
+            trend_resampled_shifted = trend_resampled.shift(MTF_SHIFT_LAG)
+            rsi_resampled_shifted = rsi_resampled.shift(MTF_SHIFT_LAG)
+            volatility_resampled_shifted = volatility_resampled.shift(MTF_SHIFT_LAG)
+            sma_20_resampled_shifted = sma_20_resampled.shift(MTF_SHIFT_LAG)
+            sma_50_resampled_shifted = sma_50_resampled.shift(MTF_SHIFT_LAG)
             
             df_resampled_features = pd.DataFrame({
                 'trend': trend_resampled_shifted,
@@ -110,6 +118,9 @@ def add_multi_timeframe_features(df: pd.DataFrame) -> pd.DataFrame:
                 direction='backward'
             )
             
+            # 避免重复索引问题：使用 loc 而非 reindex
+            if not df_temp.index.is_unique:
+                df_temp = df_temp[~df_temp.index.duplicated(keep='last')]
             df_aligned = df_aligned.reindex(df_temp.index)
             
             new_features[f'trend_{other_tf}'] = df_aligned['trend']
@@ -143,12 +154,12 @@ def add_multi_timeframe_features(df: pd.DataFrame) -> pd.DataFrame:
                 if f'sma_20_{other_tf}' in new_features:
                     new_features[f'price_to_sma20_{other_tf}'] = (
                         (df_temp['close'] - new_features[f'sma_20_{other_tf}']) / 
-                        (new_features[f'sma_20_{other_tf}'] + 1e-10)
+                        (new_features[f'sma_20_{other_tf}'] + FEATURE_EPS)
                     )
                 if f'sma_50_{other_tf}' in new_features:
                     new_features[f'price_to_sma50_{other_tf}'] = (
                         (df_temp['close'] - new_features[f'sma_50_{other_tf}']) / 
-                        (new_features[f'sma_50_{other_tf}'] + 1e-10)
+                        (new_features[f'sma_50_{other_tf}'] + FEATURE_EPS)
                     )
         
         for col_name, col_data in new_features.items():

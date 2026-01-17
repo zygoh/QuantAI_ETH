@@ -14,6 +14,11 @@ from typing import Dict, List, Any, Optional, Callable
 # Local App
 from app.core.cache import cache_manager
 from app.core.config import settings
+from app.core.constants import (
+    DEBUG_LOG_PROBABILITY,
+    WS_DEFAULT_INTERVAL_MS,
+    WS_RECONNECT_DELAY_SECONDS
+)
 from app.core.database import postgresql_manager
 from app.exchange.clients.binance.binance_client import binance_ws_client
 from app.exchange.exchange_factory import ExchangeFactory
@@ -49,7 +54,7 @@ class DataService:
         self.subscriptions: Dict[str, bool] = {}
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 10
-        self.reconnect_delay = 5  # 秒
+        self.reconnect_delay = WS_RECONNECT_DELAY_SECONDS
         
         # 🔥 保存主事件循环引用（用于WebSocket回调）
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -621,7 +626,7 @@ class DataService:
                         logger.error(f"执行价格更新回调失败: {e}", exc_info=True)
             
             # 🔥 添加调试日志（每100次记录一次，避免日志过多）
-            if random.random() < 0.01:  # 1%的概率记录调试日志
+            if random.random() < DEBUG_LOG_PROBABILITY:
                 logger.debug(f"📊 价格更新: {symbol} @{price:.2f}, 回调数: {len(self.price_callbacks)}")
             
         except Exception as e:
@@ -887,7 +892,7 @@ class DataService:
         elif unit == 'M':
             return value * 30 * 24 * 60 * 60 * 1000
         else:
-            return 60 * 1000  # 默认1分钟
+            return WS_DEFAULT_INTERVAL_MS
     
     async def reconnect(self):
         """重连WebSocket"""

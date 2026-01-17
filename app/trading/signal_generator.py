@@ -28,6 +28,24 @@ import ta
 from app.core.config import settings
 from app.core.database import postgresql_manager
 from app.core.cache import cache_manager
+from app.core.constants import (
+    ADX_RANGING_THRESHOLD,
+    ADX_TRENDING_THRESHOLD,
+    BINANCE_API_MAX_LIMIT,
+    BINANCE_RATE_LIMIT_DELAY_SECONDS,
+    SIGNAL_BUFFER_DAYS,
+    SIGNAL_API_DELAY_SECONDS,
+    SIGNAL_FEATURE_CACHE_TTL,
+    SIGNAL_HOLD_WEIGHT_DECAY,
+    SIGNAL_MIN_INTERVAL_SECONDS,
+    SIGNAL_MIN_REQUIRED_KLINES,
+    SIGNAL_PREDICTION_CACHE_TTL,
+    SIGNAL_PREDICTION_DAYS,
+    SIGNAL_TIMEFRAME_WEIGHTS,
+    SIGNAL_WARMUP_COUNT,
+    STOP_LOSS_PCT,
+    TAKE_PROFIT_PCT
+)
 from app.model.base.ml_service import MLService
 from app.services.data_service import DataService, KlineData
 from app.exchange.exchange_factory import ExchangeFactory
@@ -68,7 +86,7 @@ class SignalGenerator:
         
         # 信号生成参数
         self.confidence_threshold = settings.CONFIDENCE_THRESHOLD
-        self.min_signal_interval = 180  # 短线策略：3分钟最小信号间隔（180秒，与3m K线周期一致）
+        self.min_signal_interval = SIGNAL_MIN_INTERVAL_SECONDS
         # 🔥 移除预测间隔限制：K线完成时立即预测（实时响应）
         # 原设计：min_prediction_interval = 30秒（防抖）
         # 新设计：K线完成是明确事件，应该立即响应，不需要防抖
@@ -79,11 +97,11 @@ class SignalGenerator:
         # 🔑 特征缓存（新增）
         self.feature_cache: Dict[str, pd.DataFrame] = {}  # {cache_key: features}
         self.feature_cache_time: Dict[str, float] = {}  # {cache_key: timestamp}
-        self.feature_cache_ttl = 300  # 特征缓存5分钟
+        self.feature_cache_ttl = SIGNAL_FEATURE_CACHE_TTL
         
         # 🔥 优化止损止盈参数（提高盈亏比）
-        self.stop_loss_pct = 0.012  # 1.2%止损（收紧止损，减少单笔亏损）
-        self.take_profit_pct = 0.036  # 3.6%止盈（目标盈亏比 3:1）
+        self.stop_loss_pct = STOP_LOSS_PCT
+        self.take_profit_pct = TAKE_PROFIT_PCT
         
         # WebSocket 数据缓冲区（存储实时K线数据）
         self.kline_buffers: Dict[str, pd.DataFrame] = {}  # {timeframe: DataFrame}
@@ -93,18 +111,14 @@ class SignalGenerator:
         self.cached_predictions_time: Dict[str, float] = {}  # {timeframe: timestamp} 缓存时间
         
         # 🔥 信号缓存过期时间（秒）- 根据时间框架设置不同的TTL
-        self.prediction_cache_ttl: Dict[str, int] = {
-            '3m': 300,   # 3分钟K线：5分钟过期
-            '5m': 600,   # 5分钟K线：10分钟过期
-            '15m': 1200  # 15分钟K线：20分钟过期
-        }
+        self.prediction_cache_ttl = SIGNAL_PREDICTION_CACHE_TTL
         
         # 🔒 安全保护：前5个信号仅记录，不交易（仅首次部署时启用）
-        self.warmup_signals = 5  # 预热信号数量
+        self.warmup_signals = SIGNAL_WARMUP_COUNT
         self.signal_counter = 0  # 信号计数器（启动时会从Redis加载）
         
         # 缓冲区设计：按天数统一（所有时间框架覆盖相同天数）
-        self.buffer_days = 30  # 统一30天覆盖范围（超短线策略，较短缓冲）
+        self.buffer_days = SIGNAL_BUFFER_DAYS
         
         # 根据时间框架计算实际需要的K线数量
         self.buffer_sizes = {
@@ -160,7 +174,7 @@ class SignalGenerator:
                     buffer_size = self.buffer_sizes.get(timeframe, 500)
                     
                     # Binance API limit 最大1500条，需要分批获取
-                    max_limit = 1500
+                    max_limit = BINANCE_API_MAX_LIMIT
                     all_klines = []
                     
                     # ✅ 统一使用分页方法（自动处理超过1500的情况）
@@ -169,7 +183,7 @@ class SignalGenerator:
                             symbol=symbol,
                             interval=timeframe,
                         limit=buffer_size,
-                        rate_limit_delay=0.2
+                        rate_limit_delay=BINANCE_RATE_LIMIT_DELAY_SECONDS
                     )
                     
                     if all_klines:
@@ -186,7 +200,7 @@ class SignalGenerator:
                         logger.warning(f"⚠️ {timeframe} 初始数据获取失败")
                     
                     # API限流延迟
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(SIGNAL_API_DELAY_SECONDS)
                     
                 except Exception as e:
                     logger.error(f"初始化 {timeframe} 缓冲区失败: {e}")
@@ -403,12 +417,7 @@ class SignalGenerator:
         """预测单个时间框架"""
         try:
             # 确定需要的数据量（超短线策略：较短周期）
-            prediction_days_config = {
-                '3m': 10,    # 10天=4800条（超短期）
-                '5m': 10,    # 10天=2880条（主时间框架）
-                '15m': 10    # 10天=960条（趋势确认）
-            }
-            prediction_days = prediction_days_config.get(timeframe, 10)
+            prediction_days = SIGNAL_PREDICTION_DAYS.get(timeframe, 10)
             
             interval_minutes = {
                 '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30,
@@ -540,11 +549,6 @@ class SignalGenerator:
             
             # ✅ 差异化预测天数：每个时间框架使用最优配置
             # 原则：确保特征完整（最长窗口200期）+ 适合时间框架特性
-            prediction_days_config = {
-                '3m': 10,    # 10天=4800条（超短期，高频样本）
-                '5m': 10,    # 10天=2880条（主时间框架，快速响应）
-                '15m': 10    # 10天=960条（趋势确认）
-            }
             
             # 时间周期对应的分钟数
             interval_minutes = {
@@ -558,7 +562,7 @@ class SignalGenerator:
                 data_source = ""
                 
                 # 根据时间框架使用差异化的预测天数
-                prediction_days = prediction_days_config.get(timeframe, 35)
+                prediction_days = SIGNAL_PREDICTION_DAYS.get(timeframe, 10)
                 minutes = interval_minutes.get(timeframe, 60)
                 required_klines = int((prediction_days * 24 * 60) / minutes)
                 
@@ -588,7 +592,7 @@ class SignalGenerator:
                 
                 # 🔧 修复：确保有足够数据计算长周期指标（如long_vol需要100周期）
                 # 至少需要250条数据，确保所有技术指标都能正常计算
-                min_required_klines = 250
+                min_required_klines = SIGNAL_MIN_REQUIRED_KLINES
                 if df is None or len(df) < min_required_klines:
                     logger.warning(f"❌ {timeframe}数据不足: {len(df) if df is not None else 0}条 < {min_required_klines}条（需要足够数据计算长周期指标）")
                     continue
@@ -627,11 +631,7 @@ class SignalGenerator:
             # 3m:  57,600条/120天 (训练46k)  ✅ 超短期辅助，快速反应
             # 5m:  34,560条/120天 (训练27.6k) ✅ 主导，捕捉短期入场点
             # 15m: 11,520条/120天 (训练9.2k)  ✅ 中期辅助，趋势过滤
-            timeframe_weights = {
-                '3m': 0.15,    # 超短期辅助：捕捉极短期波动
-                '5m': 0.70,    # 🎯 短线主导：提高权重，快速捕捉入场点
-                '15m': 0.15    # 中期辅助：趋势确认，避免逆势交易
-            }
+            timeframe_weights = SIGNAL_TIMEFRAME_WEIGHTS
             
             # 计算加权信号（动态权重：长周期HOLD时降权）
             weighted_scores = {'LONG': 0, 'SHORT': 0, 'HOLD': 0}
@@ -647,7 +647,7 @@ class SignalGenerator:
                     hold_confidence = prediction.get('confidence', 0)
                     if hold_confidence > 0.65:
                         # HOLD置信度很高时，权重减半（避免压制5m）
-                        weight = base_weight * 0.5
+                        weight = base_weight * SIGNAL_HOLD_WEIGHT_DECAY
                         logger.debug(f"   {timeframe} HOLD高置信度({hold_confidence:.2f})，权重{base_weight}→{weight}")
                     else:
                         weight = base_weight
@@ -1102,8 +1102,8 @@ class SignalGenerator:
                             raise ValueError("ADX计算结果无效")
                         
                         # 🔥 提高市场状态判断阈值（更严格过滤震荡市场）
-                        TRENDING_THRESHOLD = 30  # ADX >= 30: 趋势市场（从25提高到30）
-                        RANGING_THRESHOLD = 25   # ADX <= 25: 震荡市场（从20提高到25）
+                        TRENDING_THRESHOLD = ADX_TRENDING_THRESHOLD
+                        RANGING_THRESHOLD = ADX_RANGING_THRESHOLD
                         
                         # 判断市场状态
                         if current_adx >= TRENDING_THRESHOLD:

@@ -4,3 +4,5 @@
 /.cursor/
 /.git/
 /.gitignore
+*.pkl
+*.pt

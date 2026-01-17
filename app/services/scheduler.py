@@ -17,6 +17,11 @@ from sqlalchemy import text
 # Local App
 from app.core.cache import cache_manager
 from app.core.config import settings
+from app.core.constants import (
+    SCHEDULER_DATA_INTEGRITY_CHECK_INTERVAL_HOURS,
+    SCHEDULER_DATA_UPDATE_INTERVAL_HOURS,
+    SCHEDULER_MODEL_TRAINING_DAY
+)
 from app.core.database import postgresql_manager
 from app.model.base.ml_service import MLService
 from app.services.data_service import DataService
@@ -66,21 +71,21 @@ class TaskScheduler:
                 name='模型训练',
                 func=self._run_model_training,
                 scheduled_time=dt_time(0, 0),  # 00:00（即周五晚上24点，周六凌晨00:00）
-                weekly_day=5  # 周六（0=周一，1=周二，...，5=周六）
+                weekly_day=SCHEDULER_MODEL_TRAINING_DAY
             )
             
             # 数据更新任务
             self.tasks['data_update'] = ScheduledTask(
                 name='数据更新',
                 func=self._run_data_update,
-                interval_hours=1  # 每小时更新一次数据
+                interval_hours=SCHEDULER_DATA_UPDATE_INTERVAL_HOURS
             )
             
             # 数据完整性检查任务
             self.tasks['data_integrity_check'] = ScheduledTask(
                 name='数据完整性检查',
                 func=self._run_data_integrity_check,
-                interval_hours=6  # 每6小时检查一次
+                interval_hours=SCHEDULER_DATA_INTEGRITY_CHECK_INTERVAL_HOURS
             )
             
             # 🔧 系统健康检查任务（每天00:00执行）

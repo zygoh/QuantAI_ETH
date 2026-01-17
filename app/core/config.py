@@ -4,7 +4,6 @@
 # StdLib
 import logging
 import os
-from typing import Optional
 
 # Third-Party
 try:
@@ -53,43 +52,16 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://172.22.22.93:6379"
     REDIS_DB: int = 0
     
-    # 机器学习配置
-    # 注意：模型训练由scheduler统一管理（每天00:01执行）
-    USE_GMADL_LOSS: bool = False  # 生产默认使用稳定的交叉熵损失
-    GMADL_ALPHA: float = 1.0
-    GMADL_BETA: float = 0.5
     
     # GPU配置
     USE_GPU: bool = True
     GPU_DEVICE: str = "cuda:0"
     
-    # 风险管理配置
-    VAR_CONFIDENCE: float = 0.95
-    MAX_DRAWDOWN_LIMIT: float = 0.15  # 15%
-    KELLY_MULTIPLIER: float = 0.25  # Kelly系数乘数
     
     # 日志配置
     LOG_LEVEL: str = "DEBUG"
     LOG_FILE: str = "trading_system.log"
     
-    # WebSocket重连配置
-    WS_RECONNECT_INITIAL_DELAY: float = 1.0  # 初始重连延迟（秒）
-    WS_RECONNECT_MAX_DELAY: float = 60.0  # 最大重连延迟（秒）
-    WS_RECONNECT_BACKOFF_FACTOR: float = 2.0  # 退避因子
-    WS_RECONNECT_MAX_RETRIES: int = 10  # 最大重试次数
-    WS_PING_INTERVAL: int = 30  # 心跳ping间隔（秒）
-    WS_PONG_TIMEOUT: int = 10  # pong超时时间（秒）
-    WS_SSL_TIMEOUT: int = 30  # SSL握手超时（秒）
-    WS_MESSAGE_TIMEOUT: int = 1200  # 消息超时（秒，20分钟）
-    WS_MESSAGE_WARNING_TIMEOUT: int = 600  # 消息警告超时（秒，10分钟）
-    
-    # GradScaler配置
-    GRAD_SCALER_GROWTH_FACTOR: float = 1.2
-    GRAD_SCALER_GROWTH_INTERVAL: int = 2000
-    GRAD_SCALER_MAX_SCALE: float = 100000.0  # 最大scale阈值
-    GRAD_SCALER_AUTO_RESET: bool = True  # 是否启用自动重置
-    GRAD_SCALER_RESET_THRESHOLD_EPOCHS: int = 3  # 触发重置的epoch阈值
-    GRAD_SCALER_MAX_CONSECUTIVE_OVERFLOW: int = 5  # 最大连续溢出次数
     
     class Config:
         env_file = ".env"
@@ -120,46 +92,6 @@ class Settings(BaseSettings):
         # 验证交易所配置
         self.validate_exchange_config()
         
-        # WebSocket重连配置验证
-        if self.WS_RECONNECT_INITIAL_DELAY <= 0:
-            errors.append(f"WS_RECONNECT_INITIAL_DELAY必须大于0，当前值: {self.WS_RECONNECT_INITIAL_DELAY}")
-        
-        if self.WS_RECONNECT_MAX_DELAY <= 0:
-            errors.append(f"WS_RECONNECT_MAX_DELAY必须大于0，当前值: {self.WS_RECONNECT_MAX_DELAY}")
-        
-        if self.WS_RECONNECT_MAX_DELAY < self.WS_RECONNECT_INITIAL_DELAY:
-            errors.append(f"WS_RECONNECT_MAX_DELAY({self.WS_RECONNECT_MAX_DELAY})必须大于等于WS_RECONNECT_INITIAL_DELAY({self.WS_RECONNECT_INITIAL_DELAY})")
-        
-        if self.WS_RECONNECT_BACKOFF_FACTOR <= 1.0:
-            errors.append(f"WS_RECONNECT_BACKOFF_FACTOR必须大于1.0，当前值: {self.WS_RECONNECT_BACKOFF_FACTOR}")
-        
-        if self.WS_RECONNECT_MAX_RETRIES <= 0:
-            errors.append(f"WS_RECONNECT_MAX_RETRIES必须大于0，当前值: {self.WS_RECONNECT_MAX_RETRIES}")
-        
-        if self.WS_PING_INTERVAL <= 0:
-            errors.append(f"WS_PING_INTERVAL必须大于0，当前值: {self.WS_PING_INTERVAL}")
-        
-        if self.WS_PONG_TIMEOUT <= 0:
-            errors.append(f"WS_PONG_TIMEOUT必须大于0，当前值: {self.WS_PONG_TIMEOUT}")
-        
-        if self.WS_SSL_TIMEOUT <= 0:
-            errors.append(f"WS_SSL_TIMEOUT必须大于0，当前值: {self.WS_SSL_TIMEOUT}")
-        
-        # GradScaler配置验证
-        if self.GRAD_SCALER_GROWTH_FACTOR <= 1.0:
-            errors.append(f"GRAD_SCALER_GROWTH_FACTOR必须大于1.0，当前值: {self.GRAD_SCALER_GROWTH_FACTOR}")
-        
-        if self.GRAD_SCALER_GROWTH_INTERVAL <= 0:
-            errors.append(f"GRAD_SCALER_GROWTH_INTERVAL必须大于0，当前值: {self.GRAD_SCALER_GROWTH_INTERVAL}")
-        
-        if self.GRAD_SCALER_MAX_SCALE <= 0:
-            errors.append(f"GRAD_SCALER_MAX_SCALE必须大于0，当前值: {self.GRAD_SCALER_MAX_SCALE}")
-        
-        if self.GRAD_SCALER_RESET_THRESHOLD_EPOCHS <= 0:
-            errors.append(f"GRAD_SCALER_RESET_THRESHOLD_EPOCHS必须大于0，当前值: {self.GRAD_SCALER_RESET_THRESHOLD_EPOCHS}")
-        
-        if self.GRAD_SCALER_MAX_CONSECUTIVE_OVERFLOW <= 0:
-            errors.append(f"GRAD_SCALER_MAX_CONSECUTIVE_OVERFLOW必须大于0，当前值: {self.GRAD_SCALER_MAX_CONSECUTIVE_OVERFLOW}")
         
         # 如果有错误，抛出异常
         if errors:

@@ -18,6 +18,13 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
 
+# Local App
+from app.core.constants import (
+    DIRECTION_CONSISTENCY_THRESHOLD,
+    DIRECTION_CONFIDENCE_THRESHOLD,
+    DIRECTION_STRENGTH_THRESHOLD
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,9 +57,9 @@ class TradingDirectionConsistencyChecker:
     """
     
     def __init__(self):
-        self.consistency_threshold = 0.7  # 一致性阈值
-        self.confidence_threshold = 0.6   # 置信度阈值
-        self.direction_strength_threshold = 0.5  # 方向强度阈值
+        self.consistency_threshold = DIRECTION_CONSISTENCY_THRESHOLD
+        self.confidence_threshold = DIRECTION_CONFIDENCE_THRESHOLD
+        self.direction_strength_threshold = DIRECTION_STRENGTH_THRESHOLD
         
         logger.info("✅ 交易方向一致性检查器初始化完成")
     

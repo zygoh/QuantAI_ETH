@@ -24,6 +24,15 @@ import xgboost as xgb
 import catboost as cb
 from sklearn.utils import resample
 
+# Local App
+from app.core.constants import (
+    STABILITY_BOOTSTRAP_RATIO,
+    STABILITY_DIVERSITY_THRESHOLD,
+    STABILITY_FEATURE_SAMPLING_RATIO,
+    STABILITY_N_BAGGING_MODELS,
+    STABILITY_STABILITY_THRESHOLD
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,13 +59,13 @@ class ModelStabilityEnhancer:
     
     def __init__(self):
         # Bagging参数
-        self.n_bagging_models = 5  # Bagging模型数量
-        self.bootstrap_ratio = 0.8  # 自助采样比例
-        self.feature_sampling_ratio = 0.8  # 特征采样比例
+        self.n_bagging_models = STABILITY_N_BAGGING_MODELS
+        self.bootstrap_ratio = STABILITY_BOOTSTRAP_RATIO
+        self.feature_sampling_ratio = STABILITY_FEATURE_SAMPLING_RATIO
         
         # 多样性参数
-        self.diversity_threshold = 0.3  # 多样性阈值
-        self.stability_threshold = 0.8  # 稳定性阈值
+        self.diversity_threshold = STABILITY_DIVERSITY_THRESHOLD
+        self.stability_threshold = STABILITY_STABILITY_THRESHOLD
         
         # 历史记录
         self.stability_history: List[ModelStabilityMetrics] = []

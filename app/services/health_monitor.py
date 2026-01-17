@@ -15,6 +15,13 @@ import pandas as pd
 # Local App
 from app.core.cache import cache_manager
 from app.core.config import settings
+from app.core.constants import (
+    ALERT_CACHE_TTL_SECONDS,
+    HEALTH_BUFFER_MIN_SIZE,
+    HEALTH_CHECK_INTERVAL_SECONDS,
+    HEALTH_CHECK_QUERY_LIMIT,
+    HEALTH_DATA_FRESHNESS_SECONDS
+)
 from app.core.database import postgresql_manager
 from app.exchange.clients.binance.binance_client import binance_ws_client
 from app.exchange.exchange_factory import ExchangeFactory
@@ -26,7 +33,7 @@ class HealthMonitor:
     
     def __init__(self):
         self.is_running = False
-        self.check_interval = 300  # 5分钟 = 300秒
+        self.check_interval = HEALTH_CHECK_INTERVAL_SECONDS
         self.monitor_task = None
         self.last_check_time = None
         self.signal_generator = None  # 将由主程序设置
@@ -266,7 +273,7 @@ class HealthMonitor:
                 start_time = end_time - timedelta(hours=1)
                 
                 df = await postgresql_manager.query_kline_data(
-                    symbol, interval, start_time, end_time, limit=100
+                    symbol, interval, start_time, end_time, limit=HEALTH_CHECK_QUERY_LIMIT
                 )
                 
                 if not df.empty:
@@ -286,12 +293,12 @@ class HealthMonitor:
                         'records': len(df),
                         'latest': latest_time.isoformat(),
                         'age_minutes': round(time_diff, 1),
-                        'fresh': time_diff < 60  # 1小时内算新鲜
+                        'fresh': time_diff < (HEALTH_DATA_FRESHNESS_SECONDS / 60)
                     }
                     
                     total_records += len(df)
                     
-                    if time_diff < 60:
+                    if time_diff < (HEALTH_DATA_FRESHNESS_SECONDS / 60):
                         has_recent_data = True
                 else:
                     timeframe_status[interval] = {
@@ -355,7 +362,7 @@ class HealthMonitor:
             
             for timeframe, df in buffers.items():
                 buffer_size = len(df) if isinstance(df, pd.DataFrame) else 0
-                buffer_ok = buffer_size >= 200  # 至少需要200条数据
+                buffer_ok = buffer_size >= HEALTH_BUFFER_MIN_SIZE
                 
                 buffer_status[timeframe] = {
                     'size': buffer_size,
@@ -625,7 +632,11 @@ class HealthMonitor:
                 logger.info(f"ℹ️ [INFO] {component}: {message}")
             
             # 缓存告警（供前端查询，保留1小时）
-            await cache_manager.set(f"alert:{component}:{alert_type}", alert_data, expire=3600)
+            await cache_manager.set(
+                f"alert:{component}:{alert_type}",
+                alert_data,
+                expire=ALERT_CACHE_TTL_SECONDS
+            )
             
         except Exception as e:
             logger.error(f"发送告警失败: {e}")

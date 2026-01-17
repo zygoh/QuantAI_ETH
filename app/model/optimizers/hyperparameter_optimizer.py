@@ -23,10 +23,24 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+# Local App
+from app.core.constants import (
+    GMADL_ALPHA,
+    GMADL_BETA,
+    GRAD_SCALER_AUTO_RESET,
+    GRAD_SCALER_GROWTH_FACTOR,
+    GRAD_SCALER_GROWTH_INTERVAL,
+    GRAD_SCALER_MAX_CONSECUTIVE_OVERFLOW,
+    GRAD_SCALER_MAX_SCALE,
+    GRAD_SCALER_RESET_THRESHOLD_EPOCHS,
+    OPTIMIZER_LR_REDUCE_FACTOR,
+    OPTIMIZER_LR_REDUCE_THRESHOLD,
+    USE_GMADL_LOSS
+)
 from app.model.informer2_model import Informer2ForClassification
 from app.model.gmadl_loss import create_trade_loss
 from app.model.base.ml_service import MLService
-from app.core.config import settings
 
 # 可选依赖：bitsandbytes（8-bit优化器）
 try:
@@ -65,10 +79,10 @@ class DynamicGradScalerConfig:
         """
         self.model_param_count = model_param_count
         self.init_scale = self.calculate_init_scale(model_param_count)
-        self.growth_factor = settings.GRAD_SCALER_GROWTH_FACTOR
+        self.growth_factor = GRAD_SCALER_GROWTH_FACTOR
         self.backoff_factor = 0.5
-        self.growth_interval = settings.GRAD_SCALER_GROWTH_INTERVAL
-        self.max_scale = settings.GRAD_SCALER_MAX_SCALE
+        self.growth_interval = GRAD_SCALER_GROWTH_INTERVAL
+        self.max_scale = GRAD_SCALER_MAX_SCALE
         
         logger.info(f"🔧 GradScaler配置器初始化:")
         logger.info(f"   模型参数量: {model_param_count/1e6:.2f}M")
@@ -141,13 +155,13 @@ class GradScalerMonitor:
         self.scaler = scaler
         self.init_scale = init_scale
         self.scale_history: List[float] = []
-        self.max_scale_threshold = settings.GRAD_SCALER_MAX_SCALE
+        self.max_scale_threshold = GRAD_SCALER_MAX_SCALE
         self.consecutive_overflow_count = 0
-        self.max_consecutive_overflow = settings.GRAD_SCALER_MAX_CONSECUTIVE_OVERFLOW
+        self.max_consecutive_overflow = GRAD_SCALER_MAX_CONSECUTIVE_OVERFLOW
         self.epoch_scale_records: Dict[int, float] = {}
         self.scale_records: List[ScaleRecord] = []
         self.abnormal_epoch_count = 0
-        self.reset_threshold_epochs = settings.GRAD_SCALER_RESET_THRESHOLD_EPOCHS
+        self.reset_threshold_epochs = GRAD_SCALER_RESET_THRESHOLD_EPOCHS
         
         logger.info(f"📊 GradScaler监控器初始化:")
         logger.info(f"   最大scale阈值: {self.max_scale_threshold}")
@@ -1130,15 +1144,15 @@ class HyperparameterOptimizer:
                         hold_penalty_nn = float(max(0.50, min(0.75, 0.85 - 0.5 * hold_ratio_opt)))
 
                     criterion = create_trade_loss(
-                        use_gmadl=settings.USE_GMADL_LOSS,
+                        use_gmadl=USE_GMADL_LOSS,
                         hold_penalty=hold_penalty_nn,
-                        alpha=params.get('alpha', settings.GMADL_ALPHA),
-                        beta=params.get('beta', settings.GMADL_BETA)
+                        alpha=params.get('alpha', GMADL_ALPHA),
+                        beta=params.get('beta', GMADL_BETA)
                     )
 
-                    if settings.USE_GMADL_LOSS:
+                    if USE_GMADL_LOSS:
                         logger.debug(
-                            f"   损失函数: GMADL + HOLD惩罚 (alpha={params.get('alpha', settings.GMADL_ALPHA):.2f}, beta={params.get('beta', settings.GMADL_BETA):.2f})"
+                            f"   损失函数: GMADL + HOLD惩罚 (alpha={params.get('alpha', GMADL_ALPHA):.2f}, beta={params.get('beta', GMADL_BETA):.2f})"
                         )
                     else:
                         logger.debug("   损失函数: 交叉熵 + HOLD惩罚 (稳定模式)")
@@ -1176,10 +1190,10 @@ class HyperparameterOptimizer:
                     scheduler = ReduceLROnPlateau(
                         optimizer,
                         mode='min',
-                        factor=0.5,
+                        factor=OPTIMIZER_LR_REDUCE_FACTOR,
                         patience=5,
                         min_lr=1e-6,
-                        threshold=1e-4,
+                        threshold=OPTIMIZER_LR_REDUCE_THRESHOLD,
                         threshold_mode='rel',
                         cooldown=2
                     )
@@ -1199,7 +1213,7 @@ class HyperparameterOptimizer:
                     
                     # 🚀 动态混合精度配置（使用新的配置器和监控器）
                     use_amp = device.type == 'cuda' and torch.cuda.is_available()
-                    if settings.USE_GMADL_LOSS and use_amp:
+                    if USE_GMADL_LOSS and use_amp:
                         logger.debug("   ⚠️ GMADL开启 → Optuna试验禁用AMP改用FP32训练")
                         use_amp = False
                     
@@ -1515,7 +1529,7 @@ class HyperparameterOptimizer:
                                         
                                         # 如果scale超过阈值或连续溢出，触发重置
                                         if need_reset or scale_exceeded:
-                                            if settings.GRAD_SCALER_AUTO_RESET:
+                                            if GRAD_SCALER_AUTO_RESET:
                                                 scaler_monitor.reset_scale()
                                                 logger.warning(f"🔄 Trial {trial.number} Fold {fold_idx+1} Epoch {epoch+1} Batch {i+1}: Scale已自动重置")
                                             else:
@@ -1579,7 +1593,7 @@ class HyperparameterOptimizer:
                         # 🔥 Epoch结束后检查scale异常
                         if use_amp and scaler_monitor:
                             need_reset = scaler_monitor.check_epoch_abnormal(epoch)
-                            if need_reset and settings.GRAD_SCALER_AUTO_RESET:
+                            if need_reset and GRAD_SCALER_AUTO_RESET:
                                 scaler_monitor.reset_scale()
                                 logger.warning(f"🔄 Trial {trial.number} Fold {fold_idx+1} Epoch {epoch+1}: 连续epoch异常，Scale已重置")
                             

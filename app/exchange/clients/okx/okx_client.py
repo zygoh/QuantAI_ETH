@@ -24,6 +24,13 @@ except ImportError:
 
 # Local App
 from app.core.config import settings
+from app.core.constants import (
+    OKX_API_LIMIT_LARGE,
+    OKX_API_LIMIT_MEDIUM,
+    OKX_DEFAULT_INTERVAL_MS,
+    OKX_MAX_RETRIES,
+    OKX_PING_TIMEOUT_SECONDS
+)
 from app.exchange.base_exchange_client import (
     BaseExchangeClient,
     UnifiedKlineData,
@@ -294,16 +301,16 @@ class OKXClient(BaseExchangeClient):
         end_time: Optional[int] = None
     ) -> List[UnifiedKlineData]:
         """获取K线数据"""
-        max_retries = 3
+        max_retries = OKX_MAX_RETRIES
         retry_delays = [2, 5, 10]
         
         try:
             if limit > 300:
                 logger.warning(f"limit={limit} 超过OKX最大限制300，自动调整为300")
-                limit = 300
+                limit = OKX_API_LIMIT_LARGE
             elif limit <= 0:
                 logger.warning(f"limit={limit} 无效，使用默认值100")
-                limit = 100
+                limit = OKX_API_LIMIT_MEDIUM
             
             okx_symbol = SymbolMapper.to_exchange_format(symbol, "OKX")
             okx_interval = IntervalMapper.to_exchange_format(interval, "OKX")
@@ -434,7 +441,7 @@ class OKXClient(BaseExchangeClient):
         elif unit == 'M':
             return value * 30 * 24 * 60 * 60 * 1000
         else:
-            return 60 * 1000  # 默认1分钟
+            return OKX_DEFAULT_INTERVAL_MS
 
     
     def get_klines_paginated(
@@ -452,7 +459,7 @@ class OKXClient(BaseExchangeClient):
                 return self.get_klines(symbol, interval, limit, start_time, end_time)
             
             all_klines = []
-            max_per_request = 300
+            max_per_request = OKX_API_LIMIT_LARGE
             batches_needed = (limit + max_per_request - 1) // max_per_request
             
             logger.debug(f"📊 分页获取OKX K线: {symbol} {interval} 需要{limit}条，分{batches_needed}批获取")
@@ -931,7 +938,7 @@ class OKXWebSocketClient:
             run_forever_kwargs = {
                 'sslopt': sslopt,
                 'ping_interval': 25,  # 每25秒发送一次ping（小于OKX的30秒超时）
-                'ping_timeout': 10    # ping超时时间10秒
+                'ping_timeout': OKX_PING_TIMEOUT_SECONDS
             }
             
             # 🔥 去除代理：WebSocket直接使用直连模式，不添加任何代理配置

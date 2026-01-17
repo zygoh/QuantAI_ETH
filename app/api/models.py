@@ -5,6 +5,16 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel, Field
 
+# Local App
+from app.core.constants import (
+    BACKTEST_DEFAULT_DAYS,
+    BACKTEST_DEFAULT_LEVERAGE,
+    BACKTEST_DEFAULT_PRIMARY_TIMEFRAME,
+    BACKTEST_DEFAULT_SYMBOL,
+    BACKTEST_DEFAULT_TIMEFRAMES,
+    BACKTEST_INITIAL_BALANCE
+)
+
 # 基础响应模型
 class BaseResponse(BaseModel):
     """基础响应模型"""
@@ -78,6 +88,46 @@ class TrainingRequest(BaseModel):
 class TrainingResponse(BaseResponse):
     """训练响应"""
     data: Optional[Dict[str, Any]] = None
+
+# 回测相关模型
+class BacktestRequest(BaseModel):
+    """回测请求"""
+    symbol: Optional[str] = BACKTEST_DEFAULT_SYMBOL
+    days: int = BACKTEST_DEFAULT_DAYS
+    initial_balance: float = BACKTEST_INITIAL_BALANCE
+    leverage: float = BACKTEST_DEFAULT_LEVERAGE
+    primary_timeframe: str = BACKTEST_DEFAULT_PRIMARY_TIMEFRAME
+    timeframes: Optional[List[str]] = BACKTEST_DEFAULT_TIMEFRAMES
+    include_trades: bool = False
+
+class BacktestTrade(BaseModel):
+    """回测交易明细"""
+    entry_time: datetime
+    exit_time: datetime
+    side: str
+    entry_price: float
+    exit_price: float
+    pnl: float
+    pnl_percent: float
+    reason: str
+
+class BacktestResult(BaseModel):
+    """回测结果"""
+    symbol: str
+    days: int
+    initial_balance: float
+    final_balance: float
+    total_return: float
+    win_rate: float
+    profit_factor: float
+    max_drawdown: float
+    total_trades: int
+    avg_trade_return: float
+    trades: Optional[List[BacktestTrade]] = None
+
+class BacktestResponse(BaseResponse):
+    """回测响应"""
+    data: Optional[BacktestResult] = None
 
 # 绩效相关模型
 class PerformanceMetrics(BaseModel):

@@ -9,7 +9,13 @@ from fastapi import APIRouter, Depends, HTTPException
 
 # Local App
 from app.api.dependencies import get_current_user
-from app.api.models import TrainingRequest, TrainingResponse
+from app.core.config import settings
+from app.api.models import (
+    TrainingRequest,
+    TrainingResponse,
+    BacktestRequest,
+    BacktestResponse
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -17,12 +23,14 @@ router = APIRouter()
 # 全局服务实例
 ml_service = None
 scheduler = None
+backtest_service = None
 
-def set_services(ml, sched):
+def set_services(ml, sched, backtest=None):
     """设置服务实例"""
-    global ml_service, scheduler
+    global ml_service, scheduler, backtest_service
     ml_service = ml
     scheduler = sched
+    backtest_service = backtest
 
 @router.post("/start", response_model=TrainingResponse)
 async def start_training(
@@ -57,6 +65,41 @@ async def start_training(
     except Exception as e:
         logger.error(f"模型训练失败: {e}")
         raise HTTPException(status_code=500, detail=f"模型训练失败: {str(e)}")
+
+@router.post("/backtest", response_model=BacktestResponse)
+async def run_backtest(
+    request: BacktestRequest,
+    current_user: str = Depends(get_current_user)
+):
+    """运行模型回测"""
+    try:
+        if not backtest_service:
+            raise HTTPException(status_code=503, detail="回测服务不可用")
+
+        symbol = request.symbol or settings.SYMBOL
+        logger.info(f"🚀 启动回测: {symbol} {request.days}天")
+
+        result = await backtest_service.run_backtest(
+            symbol=symbol,
+            days=request.days,
+            initial_balance=request.initial_balance,
+            leverage=request.leverage,
+            primary_timeframe=request.primary_timeframe,
+            timeframes=request.timeframes,
+            include_trades=request.include_trades
+        )
+
+        return BacktestResponse(
+            success=True,
+            message="回测完成",
+            data=result
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"回测失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"回测失败: {str(e)}")
 
 @router.get("/status")
 async def get_training_status(current_user: str = Depends(get_current_user)):

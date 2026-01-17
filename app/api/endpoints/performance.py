@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.api.dependencies import get_current_user
 from app.api.models import PerformanceMetrics, PerformanceResponse
 from app.core.config import settings
+from app.core.constants import MAX_DRAWDOWN_LIMIT
 from app.services.drawdown_monitor import drawdown_monitor
 
 logger = logging.getLogger(__name__)
@@ -119,7 +120,7 @@ async def get_drawdown_metrics(
         drawdown_data = {
             'max_drawdown': max_dd,
             'current_drawdown': current_dd,
-            'drawdown_limit': settings.MAX_DRAWDOWN_LIMIT * 100,
+            'drawdown_limit': MAX_DRAWDOWN_LIMIT * 100,
             'risk_level': drawdown_status.get('risk_level', 'UNKNOWN'),
             'statistics': drawdown_stats,
             'monitoring_status': drawdown_status.get('monitoring_status', 'INACTIVE')

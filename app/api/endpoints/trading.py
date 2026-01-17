@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from app.api.dependencies import get_current_user
 from app.api.models import TradeRequest, TradingModeRequest, TradingResponse
 from app.core.config import settings
+from app.core.constants import KELLY_MULTIPLIER, MAX_DRAWDOWN_LIMIT, VAR_CONFIDENCE
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -212,9 +213,9 @@ async def get_trading_limits(current_user: str = Depends(get_current_user)):
             'leverage': settings.LEVERAGE,
             'confidence_threshold': settings.CONFIDENCE_THRESHOLD,
             'timeframes': settings.TIMEFRAMES,
-            'max_drawdown_limit': settings.MAX_DRAWDOWN_LIMIT,
-            'kelly_multiplier': settings.KELLY_MULTIPLIER,
-            'var_confidence': settings.VAR_CONFIDENCE,
+            'max_drawdown_limit': MAX_DRAWDOWN_LIMIT,
+            'kelly_multiplier': KELLY_MULTIPLIER,
+            'var_confidence': VAR_CONFIDENCE,
         }
         
         # 如果交易控制器可用，获取交易模式

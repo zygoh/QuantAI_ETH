@@ -23,6 +23,23 @@ from binance.um_futures import UMFutures
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
 
 # Local App
+from app.core.constants import (
+    BINANCE_API_LIMIT_LARGE,
+    BINANCE_API_LIMIT_MEDIUM,
+    BINANCE_API_MAX_LIMIT,
+    BINANCE_MAX_INITIAL_RETRIES,
+    BINANCE_MAX_WAIT_SECONDS,
+    BINANCE_MESSAGE_TIMEOUT_SECONDS,
+    BINANCE_PERIODIC_RETRY_INTERVAL_SECONDS,
+    BINANCE_RATE_LIMIT_DELAY_SECONDS,
+    BINANCE_RECV_WINDOW_MS,
+    BINANCE_WARNING_TIMEOUT_SECONDS,
+    WS_PING_INTERVAL,
+    WS_PONG_TIMEOUT,
+    WS_RECONNECT_BACKOFF_FACTOR,
+    WS_RECONNECT_INITIAL_DELAY,
+    WS_RECONNECT_MAX_DELAY
+)
 from app.core.config import settings
 from app.exchange.base_exchange_client import (
     BaseExchangeClient,
@@ -67,11 +84,11 @@ class ExponentialBackoffReconnector:
     
     def __init__(self):
         """初始化重连器"""
-        self.initial_delay = settings.WS_RECONNECT_INITIAL_DELAY
-        self.max_delay = settings.WS_RECONNECT_MAX_DELAY
-        self.backoff_factor = settings.WS_RECONNECT_BACKOFF_FACTOR
-        self.max_initial_retries = 3  # 前3次使用指数退避
-        self.periodic_retry_interval = 120.0  # 3次之后每隔2分钟（120秒）重连一次
+        self.initial_delay = WS_RECONNECT_INITIAL_DELAY
+        self.max_delay = WS_RECONNECT_MAX_DELAY
+        self.backoff_factor = WS_RECONNECT_BACKOFF_FACTOR
+        self.max_initial_retries = BINANCE_MAX_INITIAL_RETRIES
+        self.periodic_retry_interval = BINANCE_PERIODIC_RETRY_INTERVAL_SECONDS
         
         self.current_delay = self.initial_delay
         self.retry_count = 0
@@ -288,8 +305,8 @@ class WebSocketHeartbeat:
             ws_client: WebSocket客户端实例
         """
         self.ws_client = ws_client
-        self.ping_interval = settings.WS_PING_INTERVAL
-        self.pong_timeout = settings.WS_PONG_TIMEOUT
+        self.ping_interval = WS_PING_INTERVAL
+        self.pong_timeout = WS_PONG_TIMEOUT
         self.last_ping_time: Optional[datetime] = None
         self.last_pong_time: Optional[datetime] = None
         self.heartbeat_task: Optional[asyncio.Task] = None
@@ -460,7 +477,7 @@ class BinanceClient(BaseExchangeClient):
         self.client = UMFutures(**client_kwargs)
         
         # 设置默认的recvWindow（在API调用时使用）
-        self.recv_window = 60000  # 60秒的时间窗口（默认5000ms）
+        self.recv_window = BINANCE_RECV_WINDOW_MS
         
         # WebSocket客户端
         self.ws_client: Optional[UMFuturesWebsocketClient] = None
@@ -546,12 +563,12 @@ class BinanceClient(BaseExchangeClient):
             # 将标准格式转换为 Binance 格式
             exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
             
-            if limit > 1000:
-                logger.warning(f"limit={limit} 超过Binance最大限制1000，自动调整为1000")
-                limit = 1000
+            if limit > BINANCE_API_LIMIT_LARGE:
+                logger.warning(f"limit={limit} 超过Binance最大限制{BINANCE_API_LIMIT_LARGE}，自动调整为{BINANCE_API_LIMIT_LARGE}")
+                limit = BINANCE_API_LIMIT_LARGE
             elif limit <= 0:
-                logger.warning(f"limit={limit} 无效，使用默认值500")
-                limit = 500
+                logger.warning(f"limit={limit} 无效，使用默认值{BINANCE_API_LIMIT_MEDIUM}")
+                limit = BINANCE_API_LIMIT_MEDIUM
             
             params = {
                 'symbol': exchange_symbol,
@@ -633,7 +650,7 @@ class BinanceClient(BaseExchangeClient):
         limit: int,
         start_time: Optional[int] = None,
         end_time: Optional[int] = None,
-        rate_limit_delay: float = 0.1
+        rate_limit_delay: float = BINANCE_RATE_LIMIT_DELAY_SECONDS
     ) -> List[UnifiedKlineData]:
         """
         分页获取K线数据（自动处理超过1000的情况）
@@ -650,12 +667,12 @@ class BinanceClient(BaseExchangeClient):
             K线数据列表（按时间升序排列）
         """
         try:
-            if limit <= 1000:
+            if limit <= BINANCE_API_LIMIT_LARGE:
                 return self.get_klines(symbol, interval, limit, start_time, end_time)
             
             # 超过1000，需要分页获取
             all_klines = []
-            max_per_request = 1000
+            max_per_request = BINANCE_API_LIMIT_LARGE
             batches_needed = (limit + max_per_request - 1) // max_per_request
             
             logger.debug(f"分页获取K线: {symbol} {interval} 需要{limit}条，分{batches_needed}批获取")
@@ -875,11 +892,11 @@ class BinanceWebSocketClient:
                 #     "check_hostname": True,
                 #     "cert_reqs": ssl.CERT_REQUIRED,
                 #     "ssl_version": ssl.PROTOCOL_TLS,  # 使用最新TLS版本
-                #     "timeout": settings.WS_SSL_TIMEOUT  # SSL握手超时
+                #     "timeout": WS_SSL_TIMEOUT  # SSL握手超时
                 # },
-                # "timeout": settings.WS_SSL_TIMEOUT,  # 整体超时
-                # "ping_interval": settings.WS_PING_INTERVAL,  # 启用内置ping
-                # "ping_timeout": settings.WS_PONG_TIMEOUT
+                # "timeout": WS_SSL_TIMEOUT,  # 整体超时
+                # "ping_interval": WS_PING_INTERVAL,  # 启用内置ping
+                # "ping_timeout": WS_PONG_TIMEOUT
             }
             
             # 添加代理配置（仅在USE_PROXY_WS启用时）
@@ -1085,7 +1102,7 @@ class BinanceWebSocketClient:
             self.start_websocket()
             
             # 等待连接建立
-            max_wait_time = 10  # 最多等待10秒
+            max_wait_time = BINANCE_MAX_WAIT_SECONDS
             wait_time = 0
             while not self.is_connected and wait_time < max_wait_time:
                 await asyncio.sleep(0.5)
@@ -1170,8 +1187,8 @@ class BinanceWebSocketClient:
     async def _health_check(self):
         """健康检查（检测消息超时）"""
         # 15m K线周期需要更长的超时时间（至少20分钟）
-        message_timeout = 1200  # 20分钟（考虑最长15m周期 + 缓冲）
-        warning_timeout = 600  # 10分钟警告（但不重连）
+        message_timeout = BINANCE_MESSAGE_TIMEOUT_SECONDS
+        warning_timeout = BINANCE_WARNING_TIMEOUT_SECONDS
         
         while self.is_running:
             try:
@@ -1239,7 +1256,7 @@ class BinanceWebSocketClient:
             self.start_websocket()
             
             # 等待连接建立
-            max_wait_time = 10
+            max_wait_time = BINANCE_MAX_WAIT_SECONDS
             wait_time = 0
             while not self.is_connected and wait_time < max_wait_time:
                 await asyncio.sleep(0.5)

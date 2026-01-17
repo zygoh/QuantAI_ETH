@@ -21,6 +21,7 @@ from app.services.risk_service import RiskService
 from app.trading.signal_generator import SignalGenerator
 from app.trading.trading_controller import TradingController
 from app.services.scheduler import TaskScheduler
+from app.services.backtest_service import BacktestService
 from app.services.drawdown_monitor import drawdown_monitor
 from app.services.health_monitor import health_monitor
 from app.core.database import init_database, cleanup_database, close_database
@@ -77,13 +78,14 @@ risk_service = None
 signal_generator = None
 trading_controller = None
 scheduler = None
+backtest_service = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     global data_service, ml_service, trading_engine, risk_service
-    global signal_generator, trading_controller, scheduler
+    global signal_generator, trading_controller, scheduler, backtest_service
 
     logger.info("启动量化交易系统...")
 
@@ -215,6 +217,7 @@ async def lifespan(app: FastAPI):
             trading_engine, signal_generator, ml_service, data_service
         )
         scheduler = TaskScheduler(ml_service, data_service, signal_generator)  # 🔥 传入signal_generator
+        backtest_service = BacktestService(ml_service)
 
         # 设置API端点的服务依赖（已移除account端点，仅支持模拟交易）
         from app.api.endpoints import positions, signals, trading, training, performance, system, websocket
@@ -222,7 +225,7 @@ async def lifespan(app: FastAPI):
         positions.set_data_service(data_service)
         signals.set_services(signal_generator, ml_service, data_service)
         trading.set_trading_controller(trading_controller)
-        training.set_services(ml_service, scheduler)
+        training.set_services(ml_service, scheduler, backtest_service)
         performance.set_services(risk_service, trading_controller)
         system.set_services(trading_controller, scheduler)
         websocket.set_services(data_service, signal_generator, trading_controller)

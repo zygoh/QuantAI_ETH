@@ -5,6 +5,14 @@ import logging
 import pandas as pd
 import numpy as np
 
+# Local App
+from app.core.constants import (
+    FEATURE_STD_EPS,
+    PRICE_ACCELERATION_SHIFTS,
+    PRICE_CHANGE_PERIODS,
+    PRICE_MOMENTUM_WINDOW
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,7 +39,7 @@ def add_price_features(df: pd.DataFrame) -> pd.DataFrame:
         new_features['close_position'] = (df['close'] - df['low']) / price_range_safe
         
         # 多周期价格变化
-        for period in [2, 3, 5, 10, 20]:
+        for period in PRICE_CHANGE_PERIODS:
             pct_chg = close_for_pct.pct_change(period, fill_method=None)
             pct_chg = pct_chg.replace([np.inf, -np.inf], np.nan)
             new_features[f'price_change_{period}'] = pct_chg
@@ -41,13 +49,16 @@ def add_price_features(df: pd.DataFrame) -> pd.DataFrame:
             new_features[f'high_low_ratio_{period}'] = df['high'].rolling(period).max() / rolling_low_safe
         
         # 价格加速度（一阶、三阶、五阶）
-        new_features['price_acceleration'] = price_change - price_change.shift(1)
-        new_features['price_acceleration_3'] = price_change - price_change.shift(3)
-        new_features['price_acceleration_5'] = price_change - price_change.shift(5)
+        new_features['price_acceleration'] = price_change - price_change.shift(PRICE_ACCELERATION_SHIFTS[0])
+        new_features['price_acceleration_3'] = price_change - price_change.shift(PRICE_ACCELERATION_SHIFTS[1])
+        new_features['price_acceleration_5'] = price_change - price_change.shift(PRICE_ACCELERATION_SHIFTS[2])
         
         # 价格动量强度
-        new_features['price_momentum_strength'] = price_change.abs().rolling(5).mean()
-        new_features['price_momentum_direction'] = price_change.rolling(5).mean() / (price_change.rolling(5).std() + 1e-8)
+        new_features['price_momentum_strength'] = price_change.abs().rolling(PRICE_MOMENTUM_WINDOW).mean()
+        new_features['price_momentum_direction'] = (
+            price_change.rolling(PRICE_MOMENTUM_WINDOW).mean() /
+            (price_change.rolling(PRICE_MOMENTUM_WINDOW).std() + FEATURE_STD_EPS)
+        )
         
         # 一次性添加所有特征
         df = pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)

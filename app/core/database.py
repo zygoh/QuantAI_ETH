@@ -20,7 +20,11 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 
 # Local App
 from app.core.config import settings
-from app.core.constants import VIRTUAL_OPEN_FEE_RATE, VIRTUAL_CLOSE_FEE_RATE
+from app.core.constants import (
+    DB_POOL_RECYCLE_SECONDS,
+    VIRTUAL_CLOSE_FEE_RATE,
+    VIRTUAL_OPEN_FEE_RATE
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +51,7 @@ class PostgreSQLManager:
                 pool_size=settings.PG_POOL_SIZE,
                 max_overflow=settings.PG_MAX_OVERFLOW,
                 pool_pre_ping=True,  # 连接池健康检查
-                pool_recycle=3600    # 1小时回收连接
+                pool_recycle=DB_POOL_RECYCLE_SECONDS
             )
             
             # 创建会话工厂
@@ -284,6 +288,79 @@ class PostgreSQLManager:
                 await conn.execute(text("COMMENT ON COLUMN orders.exit_price IS '平仓价格（虚拟订单）'"))
                 await conn.execute(text("COMMENT ON COLUMN orders.pnl IS '盈亏金额（虚拟订单）'"))
                 await conn.execute(text("COMMENT ON COLUMN orders.pnl_percent IS '盈亏百分比（虚拟订单）'"))
+
+                # 11. 创建回测结果表
+                await conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS backtest_runs (
+                        id BIGSERIAL PRIMARY KEY,
+                        symbol TEXT NOT NULL,
+                        days INTEGER NOT NULL,
+                        initial_balance NUMERIC(20, 8) NOT NULL,
+                        final_balance NUMERIC(20, 8) NOT NULL,
+                        total_return NUMERIC(10, 6) NOT NULL,
+                        win_rate NUMERIC(10, 6) NOT NULL,
+                        profit_factor NUMERIC(20, 8) NOT NULL,
+                        max_drawdown NUMERIC(10, 6) NOT NULL,
+                        total_trades INTEGER NOT NULL,
+                        avg_trade_return NUMERIC(20, 8) NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai')::TIMESTAMPTZ
+                    )
+                """))
+
+                await conn.execute(text("""
+                    CREATE INDEX IF NOT EXISTS idx_backtest_runs_symbol_time
+                        ON backtest_runs (symbol, created_at DESC)
+                """))
+
+                await conn.execute(text("COMMENT ON TABLE backtest_runs IS '回测结果表：存储每次回测的汇总指标'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_runs.id IS '主键ID'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_runs.symbol IS '交易对'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_runs.days IS '回测天数'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_runs.initial_balance IS '初始资金'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_runs.final_balance IS '最终资金'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_runs.total_return IS '总收益率'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_runs.win_rate IS '胜率'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_runs.profit_factor IS '盈亏因子'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_runs.max_drawdown IS '最大回撤'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_runs.total_trades IS '总交易次数'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_runs.avg_trade_return IS '平均单笔回报'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_runs.created_at IS '记录创建时间'"))
+
+                # 12. 创建回测交易明细表
+                await conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS backtest_trades (
+                        id BIGSERIAL PRIMARY KEY,
+                        run_id BIGINT NOT NULL,
+                        entry_time TIMESTAMPTZ NOT NULL,
+                        exit_time TIMESTAMPTZ NOT NULL,
+                        side TEXT NOT NULL,
+                        entry_price NUMERIC(20, 8) NOT NULL,
+                        exit_price NUMERIC(20, 8) NOT NULL,
+                        pnl NUMERIC(20, 8) NOT NULL,
+                        pnl_percent NUMERIC(20, 8) NOT NULL,
+                        reason TEXT,
+                        created_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai')::TIMESTAMPTZ,
+                        FOREIGN KEY (run_id) REFERENCES backtest_runs(id) ON DELETE CASCADE
+                    )
+                """))
+
+                await conn.execute(text("""
+                    CREATE INDEX IF NOT EXISTS idx_backtest_trades_run_id
+                        ON backtest_trades (run_id)
+                """))
+
+                await conn.execute(text("COMMENT ON TABLE backtest_trades IS '回测交易明细表：存储每次回测的交易记录'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_trades.id IS '主键ID'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_trades.run_id IS '关联回测ID'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_trades.entry_time IS '开仓时间'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_trades.exit_time IS '平仓时间'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_trades.side IS '方向：LONG/SHORT'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_trades.entry_price IS '开仓价格'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_trades.exit_price IS '平仓价格'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_trades.pnl IS '盈亏金额'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_trades.pnl_percent IS '盈亏百分比'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_trades.reason IS '平仓原因'"))
+                await conn.execute(text("COMMENT ON COLUMN backtest_trades.created_at IS '记录创建时间'"))
                 
                 logger.info("数据库表结构初始化完成")
                 
@@ -475,6 +552,128 @@ class PostgreSQLManager:
         except Exception as e:
             logger.error(f"❌ 写入订单数据失败: {e}", exc_info=True)
             logger.error(f"   订单详情: symbol={order.get('symbol')}, side={order.get('side')}, order_action={order.get('order_action')}, position_id={order.get('position_id')}")
+            raise
+
+    async def clear_backtest_data(self) -> None:
+        """清空历史回测数据（使用CASCADE处理外键约束）"""
+        try:
+            async with self.SessionLocal() as session:
+                async with session.begin():
+                    # 使用 CASCADE 自动处理外键约束：先删除子表，再删除父表
+                    # 或者直接对父表使用 CASCADE，会自动级联删除子表
+                    await session.execute(text("TRUNCATE TABLE backtest_runs CASCADE"))
+                    # 重置序列
+                    await session.execute(text("ALTER SEQUENCE backtest_trades_id_seq RESTART WITH 1"))
+                    await session.execute(text("ALTER SEQUENCE backtest_runs_id_seq RESTART WITH 1"))
+            logger.info("✅ 回测历史数据已清空")
+        except Exception as e:
+            logger.error(f"❌ 清空回测数据失败: {e}", exc_info=True)
+            raise
+
+    async def write_backtest_results(
+        self,
+        result: Dict[str, Any],
+        trades: List[Dict[str, Any]]
+    ) -> int:
+        """
+        写入回测结果与交易明细
+
+        Returns:
+            回测运行ID
+        """
+        try:
+            async with self.SessionLocal() as session:
+                async with session.begin():
+                    run_sql = text("""
+                        INSERT INTO backtest_runs (
+                            symbol, days, initial_balance, final_balance,
+                            total_return, win_rate, profit_factor, max_drawdown,
+                            total_trades, avg_trade_return
+                        )
+                        VALUES (
+                            :symbol, :days, :initial_balance, :final_balance,
+                            :total_return, :win_rate, :profit_factor, :max_drawdown,
+                            :total_trades, :avg_trade_return
+                        )
+                        RETURNING id
+                    """)
+                    run_params = {
+                        'symbol': result['symbol'],
+                        'days': result['days'],
+                        'initial_balance': result['initial_balance'],
+                        'final_balance': result['final_balance'],
+                        'total_return': result['total_return'],
+                        'win_rate': result['win_rate'],
+                        'profit_factor': result['profit_factor'],
+                        'max_drawdown': result['max_drawdown'],
+                        'total_trades': result['total_trades'],
+                        'avg_trade_return': result['avg_trade_return']
+                    }
+                    run_result = await session.execute(run_sql, run_params)
+                    run_id = int(run_result.scalar_one())
+
+                    if trades:
+                        trade_sql = text("""
+                            INSERT INTO backtest_trades (
+                                run_id, entry_time, exit_time, side,
+                                entry_price, exit_price, pnl, pnl_percent, reason
+                            )
+                            VALUES (
+                                :run_id, :entry_time, :exit_time, :side,
+                                :entry_price, :exit_price, :pnl, :pnl_percent, :reason
+                            )
+                        """)
+                        trade_rows = []
+                        for trade in trades:
+                            entry_time = trade.get('entry_time')
+                            exit_time = trade.get('exit_time')
+                            
+                            # 时间格式转换（严格模式：确保类型正确）
+                            if isinstance(entry_time, str):
+                                entry_time = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
+                            elif isinstance(entry_time, pd.Timestamp):
+                                entry_time = entry_time.to_pydatetime()
+                            elif not isinstance(entry_time, datetime):
+                                raise ValueError(f"entry_time 类型错误: {type(entry_time)}")
+                            
+                            if isinstance(exit_time, str):
+                                exit_time = datetime.fromisoformat(exit_time.replace('Z', '+00:00'))
+                            elif isinstance(exit_time, pd.Timestamp):
+                                exit_time = exit_time.to_pydatetime()
+                            elif not isinstance(exit_time, datetime):
+                                raise ValueError(f"exit_time 类型错误: {type(exit_time)}")
+
+                            # 数据验证（严格模式）
+                            if entry_time is None or exit_time is None:
+                                raise ValueError("entry_time 或 exit_time 为空")
+                            if exit_time < entry_time:
+                                raise ValueError(f"exit_time ({exit_time}) 早于 entry_time ({entry_time})")
+                            if trade.get('side') not in ['LONG', 'SHORT']:
+                                raise ValueError(f"side 值错误: {trade.get('side')}")
+                            if trade.get('entry_price') is None or trade.get('exit_price') is None:
+                                raise ValueError("entry_price 或 exit_price 为空")
+                            if trade.get('entry_price') <= 0 or trade.get('exit_price') <= 0:
+                                raise ValueError(f"价格必须大于0: entry={trade.get('entry_price')}, exit={trade.get('exit_price')}")
+                            
+                            trade_rows.append({
+                                'run_id': run_id,
+                                'entry_time': entry_time,
+                                'exit_time': exit_time,
+                                'side': trade.get('side'),
+                                'entry_price': trade.get('entry_price'),
+                                'exit_price': trade.get('exit_price'),
+                                'pnl': trade.get('pnl'),
+                                'pnl_percent': trade.get('pnl_percent'),
+                                'reason': trade.get('reason')
+                            })
+
+                        if trade_rows:
+                            await session.execute(trade_sql, trade_rows)
+
+            logger.info(f"✅ 回测结果写入完成: run_id={run_id}")
+            return run_id
+        except Exception as e:
+            logger.error(f"❌ 写入回测结果失败: {e}", exc_info=True)
             raise
     
     async def query_kline_data(
