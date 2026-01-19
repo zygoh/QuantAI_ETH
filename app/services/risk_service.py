@@ -679,27 +679,29 @@ class RiskService:
             
             logger.info(f"📊 当前ATR: {current_atr:.2f} ({current_atr/entry_price*100:.2f}%)")
             
-            # 3. 🔥 优化止损止盈计算（提高盈亏比到3:1）
+            # 3. ✅ 同步回测逻辑：优化止损止盈计算（追求超高胜率）
+            # 回测中使用：止损 ATR×1.5（放宽止损，减少被止损概率），止盈 ATR×3.0（适度降低止盈，提高达成率）
+            # 盈亏比 2:1，但胜率会提高
             if signal_type == 'LONG':
                 # 做多：止损在下方，止盈在上方
-                # 🔥 收紧止损：从1.5倍ATR降到1.2倍ATR
-                stop_loss = entry_price - (current_atr * 1.2)
+                # ✅ 同步回测：放宽止损到1.5倍ATR，减少被止损概率
+                stop_loss = entry_price - (current_atr * 1.5)
                 
-                # 🔥 统一使用3.6倍ATR止盈，确保盈亏比3:1（1.2 * 3 = 3.6）
-                take_profit = entry_price + (current_atr * RISK_ATR_TAKE_PROFIT_MULTIPLIER)
-                logger.debug(f"  置信度({confidence:.2f})：使用3.6倍ATR止盈（盈亏比3:1）")
+                # ✅ 同步回测：适度降低止盈到3.0倍ATR，提高达成率
+                take_profit = entry_price + (current_atr * 3.0)
+                logger.debug(f"  置信度({confidence:.2f})：使用1.5倍ATR止损，3.0倍ATR止盈（盈亏比2:1，追求超高胜率）")
                 
                 # 跟踪止损初始距离
                 trailing_stop_distance = current_atr * RISK_ATR_TRAILING_STOP_MULTIPLIER
                 
             elif signal_type == 'SHORT':
                 # 做空：止损在上方，止盈在下方
-                # 🔥 收紧止损：从1.5倍ATR降到1.2倍ATR
-                stop_loss = entry_price + (current_atr * 1.2)
+                # ✅ 同步回测：放宽止损到1.5倍ATR，减少被止损概率
+                stop_loss = entry_price + (current_atr * 1.5)
                 
-                # 🔥 统一使用3.6倍ATR止盈，确保盈亏比3:1（1.2 * 3 = 3.6）
-                take_profit = entry_price - (current_atr * RISK_ATR_TAKE_PROFIT_MULTIPLIER)
-                logger.debug(f"  置信度({confidence:.2f})：使用3.6倍ATR止盈（盈亏比3:1）")
+                # ✅ 同步回测：适度降低止盈到3.0倍ATR，提高达成率
+                take_profit = entry_price - (current_atr * 3.0)
+                logger.debug(f"  置信度({confidence:.2f})：使用1.5倍ATR止损，3.0倍ATR止盈（盈亏比2:1，追求超高胜率）")
                 
                 trailing_stop_distance = current_atr * RISK_ATR_TRAILING_STOP_MULTIPLIER
             else:

@@ -56,8 +56,9 @@ def save_ensemble_models(
             pattern = f"{safe_symbol}_{timeframe}_*"
             existing_files = list(model_path.glob(pattern))
             if existing_files:
-                timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-                old_dir = model_path.parent / 'old' / timestamp
+                # ✅ 修复：使用日期文件夹格式 old/2026-01-17/，而不是时间戳
+                date_str = datetime.now().strftime('%Y-%m-%d')
+                old_dir = model_path.parent / 'old' / date_str
                 old_dir.mkdir(parents=True, exist_ok=True)
                 backup_dir = old_dir
                 

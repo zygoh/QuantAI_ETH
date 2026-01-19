@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # 交易配置
     SYMBOL: str = "BTC/USDT"  # 使用标准格式，系统会自动转换为交易所格式
     LEVERAGE: int = 50  # 🔥 提高杠杆到50倍
-    CONFIDENCE_THRESHOLD: float = 0.45  # 🔥 提高阈值到0.45以提高信号质量（目标胜率>50%）
+    CONFIDENCE_THRESHOLD: float = 0.55  # 🔥 提高阈值到0.55以提高信号质量（目标胜率>60%，追求超高胜率）
     
     # 交易模式配置
     TRADING_MODE: str = "SIGNAL_ONLY"  # 默认交易模式：SIGNAL_ONLY（信号模式/虚拟交易）或 AUTO（自动交易/实盘）

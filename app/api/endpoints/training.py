@@ -2,7 +2,11 @@
 训练相关API端点
 """
 # StdLib
+import asyncio
 import logging
+import uuid
+from datetime import datetime
+from typing import Dict, Any, Optional
 
 # Third-Party
 from fastapi import APIRouter, Depends, HTTPException
@@ -24,6 +28,30 @@ router = APIRouter()
 ml_service = None
 scheduler = None
 backtest_service = None
+
+# ✅ 回测任务状态管理（内存存储，生产环境可考虑使用Redis）
+_backtest_tasks: Dict[str, Dict[str, Any]] = {}
+
+def _cleanup_old_tasks():
+    """清理超过24小时的已完成任务（避免内存泄漏）"""
+    try:
+        current_time = datetime.now()
+        expired_tasks = []
+        
+        for task_id, task in _backtest_tasks.items():
+            if task['status'] in ['completed', 'failed']:
+                completed_at = datetime.fromisoformat(task.get('completed_at', task['created_at']))
+                if (current_time - completed_at).total_seconds() > 86400:  # 24小时
+                    expired_tasks.append(task_id)
+        
+        for task_id in expired_tasks:
+            del _backtest_tasks[task_id]
+            logger.debug(f"清理过期回测任务: {task_id}")
+        
+        if expired_tasks:
+            logger.info(f"清理了 {len(expired_tasks)} 个过期回测任务")
+    except Exception as e:
+        logger.warning(f"清理回测任务失败: {e}")
 
 def set_services(ml, sched, backtest=None):
     """设置服务实例"""
@@ -66,20 +94,40 @@ async def start_training(
         logger.error(f"模型训练失败: {e}")
         raise HTTPException(status_code=500, detail=f"模型训练失败: {str(e)}")
 
-@router.post("/backtest", response_model=BacktestResponse)
+@router.post("/backtest", response_model=Dict[str, Any])
 async def run_backtest(
     request: BacktestRequest,
     current_user: str = Depends(get_current_user)
 ):
-    """运行模型回测"""
+    """启动回测任务（后台异步执行，立即返回任务ID）"""
     try:
         if not backtest_service:
             raise HTTPException(status_code=503, detail="回测服务不可用")
 
         symbol = request.symbol or settings.SYMBOL
-        logger.info(f"🚀 启动回测: {symbol} {request.days}天")
-
-        result = await backtest_service.run_backtest(
+        
+        # ✅ 生成唯一任务ID
+        task_id = str(uuid.uuid4())
+        
+        # ✅ 初始化任务状态
+        _backtest_tasks[task_id] = {
+            'task_id': task_id,
+            'status': 'pending',  # pending, running, completed, failed
+            'symbol': symbol,
+            'days': request.days,
+            'created_at': datetime.now().isoformat(),
+            'started_at': None,
+            'completed_at': None,
+            'result': None,
+            'error': None
+        }
+        
+        logger.info(f"🚀 创建回测任务: {task_id} | {symbol} {request.days}天 | "
+                   f"初始资金={request.initial_balance} | 杠杆={request.leverage}x")
+        
+        # ✅ 后台异步执行回测（不阻塞接口返回）
+        asyncio.create_task(_execute_backtest_task(
+            task_id=task_id,
             symbol=symbol,
             days=request.days,
             initial_balance=request.initial_balance,
@@ -87,19 +135,168 @@ async def run_backtest(
             primary_timeframe=request.primary_timeframe,
             timeframes=request.timeframes,
             include_trades=request.include_trades
-        )
-
-        return BacktestResponse(
-            success=True,
-            message="回测完成",
-            data=result
-        )
+        ))
+        
+        # ✅ 立即返回任务ID
+        return {
+            'success': True,
+            'message': '回测任务已创建，正在后台执行',
+            'data': {
+                'task_id': task_id,
+                'status': 'pending',
+                'created_at': _backtest_tasks[task_id]['created_at']
+            }
+        }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"回测失败: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"回测失败: {str(e)}")
+        logger.error(f"❌ 创建回测任务失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"创建回测任务失败: {str(e)}")
+
+
+async def _execute_backtest_task(
+    task_id: str,
+    symbol: str,
+    days: int,
+    initial_balance: float,
+    leverage: float,
+    primary_timeframe: str,
+    timeframes: Optional[list],
+    include_trades: bool
+):
+    """后台执行回测任务"""
+    try:
+        # 更新任务状态为运行中
+        if task_id in _backtest_tasks:
+            _backtest_tasks[task_id]['status'] = 'running'
+            _backtest_tasks[task_id]['started_at'] = datetime.now().isoformat()
+        
+        logger.info(f"🔄 开始执行回测任务: {task_id}")
+        
+        # 执行回测
+        result = await backtest_service.run_backtest(
+            symbol=symbol,
+            days=days,
+            initial_balance=initial_balance,
+            leverage=leverage,
+            primary_timeframe=primary_timeframe,
+            timeframes=timeframes,
+            include_trades=include_trades
+        )
+        
+        # 更新任务状态为完成
+        if task_id in _backtest_tasks:
+            _backtest_tasks[task_id]['status'] = 'completed'
+            _backtest_tasks[task_id]['completed_at'] = datetime.now().isoformat()
+            _backtest_tasks[task_id]['result'] = result
+        
+        logger.info(f"✅ 回测任务完成: {task_id} | 胜率={result.get('win_rate', 0):.2%} | "
+                   f"总收益={result.get('total_return', 0):.2%} | "
+                   f"交易次数={result.get('total_trades', 0)}")
+        
+    except Exception as e:
+        # 更新任务状态为失败
+        if task_id in _backtest_tasks:
+            _backtest_tasks[task_id]['status'] = 'failed'
+            _backtest_tasks[task_id]['completed_at'] = datetime.now().isoformat()
+            _backtest_tasks[task_id]['error'] = str(e)
+        
+        logger.error(f"❌ 回测任务失败: {task_id} | {e}", exc_info=True)
+
+
+@router.get("/backtest/{task_id}", response_model=Dict[str, Any])
+async def get_backtest_status(
+    task_id: str,
+    current_user: str = Depends(get_current_user)
+):
+    """查询回测任务状态"""
+    try:
+        # ✅ 清理过期任务
+        _cleanup_old_tasks()
+        
+        if task_id not in _backtest_tasks:
+            raise HTTPException(status_code=404, detail="回测任务不存在")
+        
+        task = _backtest_tasks[task_id]
+        
+        response_data = {
+            'task_id': task['task_id'],
+            'status': task['status'],
+            'symbol': task['symbol'],
+            'days': task['days'],
+            'created_at': task['created_at'],
+            'started_at': task['started_at'],
+            'completed_at': task['completed_at']
+        }
+        
+        # 如果任务完成，返回结果
+        if task['status'] == 'completed':
+            response_data['result'] = task['result']
+            return {
+                'success': True,
+                'message': '回测任务已完成',
+                'data': response_data
+            }
+        # 如果任务失败，返回错误信息
+        elif task['status'] == 'failed':
+            response_data['error'] = task['error']
+            return {
+                'success': False,
+                'message': '回测任务失败',
+                'data': response_data
+            }
+        # 如果任务还在运行中
+        else:
+            return {
+                'success': True,
+                'message': f'回测任务{task["status"]}中',
+                'data': response_data
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"查询回测任务状态失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"查询回测任务状态失败: {str(e)}")
+
+
+@router.get("/backtest", response_model=Dict[str, Any])
+async def list_backtest_tasks(
+    current_user: str = Depends(get_current_user)
+):
+    """列出所有回测任务"""
+    try:
+        # ✅ 清理过期任务
+        _cleanup_old_tasks()
+        
+        tasks_list = []
+        for task_id, task in _backtest_tasks.items():
+            tasks_list.append({
+                'task_id': task['task_id'],
+                'status': task['status'],
+                'symbol': task['symbol'],
+                'days': task['days'],
+                'created_at': task['created_at'],
+                'started_at': task['started_at'],
+                'completed_at': task['completed_at']
+            })
+        
+        # 按创建时间倒序排列
+        tasks_list.sort(key=lambda x: x['created_at'], reverse=True)
+        
+        return {
+            'success': True,
+            'message': '回测任务列表获取成功',
+            'data': {
+                'tasks': tasks_list,
+                'total': len(tasks_list)
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"获取回测任务列表失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"获取回测任务列表失败: {str(e)}")
 
 @router.get("/status")
 async def get_training_status(current_user: str = Depends(get_current_user)):

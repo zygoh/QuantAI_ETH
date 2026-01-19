@@ -2618,10 +2618,23 @@ class EnsembleMLService(MLService):
             # 🔑 基础模型预测（使用短键名）
             lgb_proba = models['lgb'].predict_proba(X_pred)[0]
             
+            # ✅ 修复：预测阶段检查 NaN/INF（生产级别必须）
+            if np.isnan(lgb_proba).any() or np.isinf(lgb_proba).any():
+                logger.error(f"❌ {timeframe} LightGBM预测输出包含NaN/INF，跳过本次预测")
+                return None
+            
             # ✅ 修复XGBoost设备不匹配问题：使用统一的预测方法（单样本预测）
             xgb_pred, xgb_proba = self._predict_xgboost(models['xgb'], X_pred, return_single=True)
             
+            if np.isnan(xgb_proba).any() or np.isinf(xgb_proba).any():
+                logger.error(f"❌ {timeframe} XGBoost预测输出包含NaN/INF，跳过本次预测")
+                return None
+            
             cat_proba = models['cat'].predict_proba(X_pred)[0]
+            
+            if np.isnan(cat_proba).any() or np.isinf(cat_proba).any():
+                logger.error(f"❌ {timeframe} CatBoost预测输出包含NaN/INF，跳过本次预测")
+                return None
             
             lgb_pred = models['lgb'].predict(X_pred)[0]
             cat_pred = models['cat'].predict(X_pred)[0]
@@ -2654,7 +2667,14 @@ class EnsembleMLService(MLService):
                         logger.warning(f"⚠️ {timeframe} Informer-2 scaler未找到，预测数据未归一化")
                     
                     inf_proba = models['inf'].predict_proba(latest_seq)[0]
-                    inf_pred = models['inf'].predict(latest_seq)[0]
+                    
+                    # ✅ 修复：Informer-2预测阶段检查 NaN/INF
+                    if np.isnan(inf_proba).any() or np.isinf(inf_proba).any():
+                        logger.error(f"❌ {timeframe} Informer-2预测输出包含NaN/INF，跳过Informer-2预测")
+                        inf_proba = None
+                        inf_pred = None
+                    else:
+                        inf_pred = models['inf'].predict(latest_seq)[0]
             else:
                 inf_proba = None
                 inf_pred = None
@@ -2732,9 +2752,26 @@ class EnsembleMLService(MLService):
                 
                 # 元学习器预测
                 stacking_proba = models['meta'].predict_proba(meta_features)[0]
-                final_pred = stacking_proba.argmax()
-                confidence = stacking_proba[final_pred]
-                final_probabilities = stacking_proba  # 使用元学习器概率
+                
+                # ✅ 修复：元学习器预测阶段检查 NaN/INF
+                if np.isnan(stacking_proba).any() or np.isinf(stacking_proba).any():
+                    logger.error(f"❌ {timeframe} 元学习器预测输出包含NaN/INF，降级为加权平均")
+                    # 降级为加权平均
+                    weights = self.fallback_weights
+                    ensemble_proba = (
+                        lgb_proba * weights['lgb'] +
+                        xgb_proba * weights['xgb'] +
+                        cat_proba * weights['cat']
+                    )
+                    if inf_proba is not None:
+                        ensemble_proba = (ensemble_proba * 3 + inf_proba) / 4
+                    final_pred = ensemble_proba.argmax()
+                    confidence = ensemble_proba[final_pred]
+                    final_probabilities = ensemble_proba
+                else:
+                    final_pred = stacking_proba.argmax()
+                    confidence = stacking_proba[final_pred]
+                    final_probabilities = stacking_proba  # 使用元学习器概率
             else:
                 # 降级：简单加权平均（如果元学习器不存在）
                 weights = self.fallback_weights
@@ -2743,6 +2780,12 @@ class EnsembleMLService(MLService):
                     xgb_proba * weights['xgb'] +
                     cat_proba * weights['cat']
                 )
+                
+                # ✅ 修复：加权平均后检查 NaN/INF
+                if np.isnan(ensemble_proba).any() or np.isinf(ensemble_proba).any():
+                    logger.error(f"❌ {timeframe} 加权平均概率包含NaN/INF，跳过本次预测")
+                    return None
+                
                 final_pred = ensemble_proba.argmax()
                 confidence = ensemble_proba[final_pred]
                 final_probabilities = ensemble_proba  # 使用加权平均概率

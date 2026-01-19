@@ -637,14 +637,21 @@ class SignalGenerator:
             weighted_scores = {'LONG': 0, 'SHORT': 0, 'HOLD': 0}
             total_weight = 0
             
+            # ✅ 同步回测逻辑：收集各时间框架的置信度，用于后续质量检查
+            timeframe_confidences = {}
+            
             for timeframe, prediction in predictions.items():
                 base_weight = timeframe_weights.get(timeframe, 0.2)
                 probabilities = prediction.get('probabilities', {})
                 signal = prediction.get('signal_type')
+                pred_confidence = prediction.get('confidence', 0.0)
+                
+                # ✅ 同步回测逻辑：记录各时间框架的置信度
+                timeframe_confidences[timeframe] = pred_confidence
                 
                 # 🔑 动态权重调整：如果长周期（15m）是HOLD且置信度高，大幅降低权重
                 if timeframe in ['15m'] and signal == 'HOLD':
-                    hold_confidence = prediction.get('confidence', 0)
+                    hold_confidence = pred_confidence
                     if hold_confidence > 0.65:
                         # HOLD置信度很高时，权重减半（避免压制5m）
                         weight = base_weight * SIGNAL_HOLD_WEIGHT_DECAY
@@ -678,6 +685,28 @@ class SignalGenerator:
             # 过滤HOLD信号
             if signal_type == 'HOLD':
                 logger.info(f"⊗ 最终信号为HOLD，不发出交易信号")
+                return None
+            
+            # ✅ 同步回测逻辑：增强信号质量检查（追求超高胜率）
+            # 1. 主时间框架（5m）必须达到较高置信度
+            primary_confidence = timeframe_confidences.get('5m', 0.0)
+            if primary_confidence < 0.50:
+                logger.info(f"⚠️ 主时间框架置信度过低: {primary_confidence:.4f} < 0.50，拒绝信号")
+                return None
+            
+            # 2. 至少两个时间框架方向一致
+            signal_agreement = 0
+            for timeframe, prediction in predictions.items():
+                if prediction.get('signal_type') == signal_type:
+                    signal_agreement += 1
+            
+            if signal_agreement < 2:
+                logger.info(f"⚠️ 时间框架方向不一致: {signal_agreement}/3，拒绝信号")
+                return None
+            
+            # 3. 最终置信度必须超过阈值（已在外部检查，这里作为双重保险）
+            if confidence < self.confidence_threshold:
+                logger.info(f"⚠️ 合成信号置信度过低: {confidence:.4f} < {self.confidence_threshold}，拒绝信号")
                 return None
             
             # 🆕 信号增强过滤（预期胜率+5-10%）
