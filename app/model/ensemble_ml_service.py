@@ -58,7 +58,9 @@ from app.core.constants import (
     INFORMER_TIMEOUT_SECONDS,
     INFORMER_WARMUP_EPOCHS,
     OPTUNA_N_TRIALS,
-    OPTUNA_TIMEOUT_SECONDS
+    OPTUNA_TIMEOUT_SECONDS,
+    TRAINING_BASE_DAYS_CONFIG,
+    TRAINING_DAYS_MULTIPLIER
 )
 from app.model.optimizers.hyperparameter_optimizer import HyperparameterOptimizer
 from app.services.direction_consistency_checker import TradingDirectionConsistencyChecker, ConsistencyCheck
@@ -398,15 +400,10 @@ class EnsembleMLService(MLService):
         try:
             symbol = settings.SYMBOL
             
-            # 🔑 基础训练天数配置（超短线策略：确保足够样本）
-            base_days_config = {
-                '3m': 120,   # 3m: 120天=57,600条（高频样本，捕捉极短期模式）
-                '5m': 120,   # 5m: 120天=34,560条（主时间框架，充足样本）
-                '15m': 120   # 15m: 120天=11,520条（中期过滤，足够识别趋势）
-            }
-            base_days = base_days_config.get(timeframe, 120)
+            # 🔑 训练天数配置：从全局常量读取（符合开发规范）
+            base_days = TRAINING_BASE_DAYS_CONFIG.get(timeframe, 180)
             
-            # 应用倍数
+            # 应用倍数（Ensemble模型统一使用1.5倍，即270天）
             training_days = int(base_days * days_multiplier)
             
             # 计算需要的K线数量
@@ -416,7 +413,9 @@ class EnsembleMLService(MLService):
             minutes = interval_minutes.get(timeframe, 60)
             required_klines = int((training_days * 24 * 60) / minutes)
             
-            logger.info(f"📥 获取{timeframe}数据（×{days_multiplier}倍）: {required_klines}条K线 ({training_days}天)")
+            # 🔑 说明：倍数是指基础天数（180天）乘以倍数得到实际训练天数
+            # 例如：180天 × 1.5倍 = 270天
+            logger.info(f"📥 获取{timeframe}数据: {required_klines}条K线 ({training_days}天 = 基础{base_days}天 × {days_multiplier}倍)")
             
             # ✅ 统一使用分页方法（自动处理超过1500的情况，支持多交易所）
             all_klines = self.exchange_client.get_klines_paginated(
@@ -439,9 +438,16 @@ class EnsembleMLService(MLService):
             # 🔑 关键：依赖时间戳排序，而不是假设API返回顺序
             df = df.sort_values('timestamp', ascending=True)  # 明确指定升序（旧→新）
             df = df.drop_duplicates(subset=['timestamp'], keep='last')
-            df = df.set_index('timestamp')
             
-            logger.info(f"✅ 获取成功: {len(df)}条（×{days_multiplier}倍数据）")
+            # 🔥 严格验证和过滤K线数据（检查价格、交易量、逻辑正确性）
+            df = self._validate_and_filter_kline_data(df, timeframe)
+            
+            # 设置索引
+            if not df.empty:
+                df = df.set_index('timestamp')
+                logger.info(f"✅ 获取成功: {len(df)}条（×{days_multiplier}倍数据，已通过严格验证）")
+            else:
+                logger.error(f"❌ {timeframe} 数据验证后为空，无法继续训练")
             
             return df
             
@@ -658,20 +664,21 @@ class EnsembleMLService(MLService):
         logger.info(f"🔄 {timeframe} 后台训练已开始（预测功能继续运行，训练完成后热更新模型）")
         
         try:
-            # 1️⃣ 为三个模型准备不同的训练数据（增加多样性）
-            logger.info(f"📥 为三个模型准备差异化训练数据...")
+            # 1️⃣ 为三个模型准备统一的训练数据（确保公平对比和最大化数据利用）
+            # 🔑 从全局常量读取训练天数倍数（符合开发规范）
+            unified_multiplier = TRAINING_DAYS_MULTIPLIER
+            base_days = TRAINING_BASE_DAYS_CONFIG.get(timeframe, 180)
+            unified_days = int(base_days * unified_multiplier)
+            logger.info(f"📥 为三个模型准备统一训练数据（{unified_days}天，{unified_multiplier}倍，最大化数据利用）...")
             
-            # LightGBM: 使用较新数据（标准天数）
-            data_lgb = await self._prepare_training_data_for_timeframe(timeframe)
-            logger.info(f"✅ LightGBM数据: {len(data_lgb)}条（标准）")
+            # 统一使用配置的倍数数据（所有模型使用相同数据，通过不同算法架构和超参数获得多样性）
+            data_unified = await self._prepare_diverse_training_data(timeframe, days_multiplier=unified_multiplier)
+            logger.info(f"✅ 统一训练数据: {len(data_unified)}条（{unified_days}天，所有模型共享）")
             
-            # XGBoost: 使用更多数据（+50%天数）
-            data_xgb = await self._prepare_diverse_training_data(timeframe, days_multiplier=1.5)
-            logger.info(f"✅ XGBoost数据: {len(data_xgb)}条（+50%天数）")
-            
-            # CatBoost: 使用最多数据（+100%天数）
-            data_cat = await self._prepare_diverse_training_data(timeframe, days_multiplier=2.0)
-            logger.info(f"✅ CatBoost数据: {len(data_cat)}条（+100%天数）")
+            # 三个模型使用相同数据
+            data_lgb = data_unified.copy()
+            data_xgb = data_unified.copy()
+            data_cat = data_unified.copy()
             
             # 2️⃣ 处理三份数据（特征工程 + 标签 + 特征选择）
             logger.info(f"🔧 处理三份训练数据...")
@@ -2147,12 +2154,14 @@ class EnsembleMLService(MLService):
                     logger.info(f"   检测到小模型({num_params/1e6:.1f}M参数)，使用init_scale=2^16")
                 
                 # ✅ 修复：使用新的torch.amp.GradScaler API（PyTorch 2.0+）
+                # 🔧 优化：使用全局常量配置，更保守的增长策略
+                from app.core.constants import GRAD_SCALER_GROWTH_FACTOR, GRAD_SCALER_GROWTH_INTERVAL
                 scaler = torch.amp.GradScaler(
                     'cuda',
                     init_scale=init_scale,  # 动态调整的初始缩放
-                    growth_factor=1.5,      # 增长因子（默认2.0，改为1.5更温和）
+                    growth_factor=GRAD_SCALER_GROWTH_FACTOR,  # 从全局常量读取（1.1，更保守）
                     backoff_factor=0.5,     # 回退因子（检测到溢出时）
-                    growth_interval=1000,   # 增长间隔（默认2000，改为1000更谨慎）
+                    growth_interval=GRAD_SCALER_GROWTH_INTERVAL,  # 从全局常量读取（3000，增长更慢）
                     enabled=True
                 )
                 logger.info("   混合精度训练: 启用（动态缩放策略）")
@@ -2408,9 +2417,10 @@ class EnsembleMLService(MLService):
                                     raise
                         
                         # ⭐ 核心修复：梯度裁剪（防止梯度爆炸）
+                        # 🔧 优化：从1.0降低到0.5，更严格的梯度裁剪，减少Scale值过大问题
                         torch.nn.utils.clip_grad_norm_(
                             model.parameters(),
-                            max_norm=1.0,      # 梯度范数上限（Informer2建议1.0）
+                            max_norm=0.5,      # 梯度范数上限（从1.0降低到0.5，更严格）
                             norm_type=INFORMER_GRAD_CLIP_NORM
                         )
                         

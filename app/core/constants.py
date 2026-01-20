@@ -97,6 +97,10 @@ KELLY_MULTIPLIER = 0.25  # Kelly系数乘数
 # =========================
 # 机器学习与特征
 # =========================
+# 训练数据天数配置（统一使用270天，最大化数据利用）
+TRAINING_BASE_DAYS_CONFIG = {"3m": 180, "5m": 180, "15m": 180}  # 基础天数
+TRAINING_DAYS_MULTIPLIER = 1.5  # Ensemble模型统一倍数（180 × 1.5 = 270天）
+
 LABEL_WINDOW_CONFIG = {"3m": 20, "5m": 24, "15m": 32}
 LABEL_PT_SL_CONFIG = {"3m": (2.2, 1.6), "5m": (2.2, 1.8), "15m": (2.5, 2.0)}
 LABEL_VOLATILITY_WINDOW = 20
@@ -280,9 +284,10 @@ WS_SSL_TIMEOUT = 30  # SSL握手超时（秒）
 # =========================
 # GradScaler配置（自动混合精度）
 # =========================
-GRAD_SCALER_GROWTH_FACTOR = 1.2
-GRAD_SCALER_GROWTH_INTERVAL = 2000
-GRAD_SCALER_MAX_SCALE = 100000.0  # 最大scale阈值
+# 🔧 优化：降低增长因子和增长间隔，减少Scale值过大问题
+GRAD_SCALER_GROWTH_FACTOR = 1.1  # 从1.2降低到1.1，更保守的增长策略
+GRAD_SCALER_GROWTH_INTERVAL = 3000  # 从2000增加到3000，增长更慢
+GRAD_SCALER_MAX_SCALE = 50000.0  # 从100000.0降低到50000.0，更早触发重置
 GRAD_SCALER_AUTO_RESET = True  # 是否启用自动重置
 GRAD_SCALER_RESET_THRESHOLD_EPOCHS = 3  # 触发重置的epoch阈值
 GRAD_SCALER_MAX_CONSECUTIVE_OVERFLOW = 5  # 最大连续溢出次数

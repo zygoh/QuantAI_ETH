@@ -102,15 +102,16 @@ class DynamicGradScalerConfig:
         Returns:
             初始scale值
         """
+        # 🔧 优化：降低初始scale值，减少Scale值过大问题
         if param_count > 10_000_000:  # >10M参数：大模型
-            init_scale = 2.**12  # 4096
-            logger.debug(f"   检测到大模型({param_count/1e6:.1f}M参数)，使用init_scale=2^12={init_scale}")
+            init_scale = 2.**11  # 从4096降低到2048
+            logger.debug(f"   检测到大模型({param_count/1e6:.1f}M参数)，使用init_scale=2^11={init_scale}")
         elif param_count > 1_000_000:  # 1M-10M参数：中等模型
-            init_scale = 2.**14  # 16384
-            logger.debug(f"   检测到中等模型({param_count/1e6:.1f}M参数)，使用init_scale=2^14={init_scale}")
+            init_scale = 2.**13  # 从16384降低到8192
+            logger.debug(f"   检测到中等模型({param_count/1e6:.1f}M参数)，使用init_scale=2^13={init_scale}")
         else:  # <1M参数：小模型
-            init_scale = 2.**16  # 65536
-            logger.debug(f"   检测到小模型({param_count/1e6:.1f}M参数)，使用init_scale=2^16={init_scale}")
+            init_scale = 2.**15  # 从65536降低到32768（这是导致Scale值过大的主要原因）
+            logger.debug(f"   检测到小模型({param_count/1e6:.1f}M参数)，使用init_scale=2^15={init_scale}")
         
         return init_scale
     
@@ -572,7 +573,7 @@ class HyperparameterOptimizer:
                 'n_layers': trial.suggest_int('n_layers', 1, 2),
                 'epochs': trial.suggest_int('epochs', 10, 30),
                 'batch_size': trial.suggest_categorical('batch_size', [64, 128, 256]),
-                'lr': trial.suggest_float('lr', 0.0001, 0.002, log=True),  # 降低上限: 0.006→0.002
+                'lr': trial.suggest_float('lr', 0.0001, 0.001, log=True),  # 🔧 优化：从0.002降低到0.001，减少梯度爆炸
                 'dropout': trial.suggest_float('dropout', 0.1, 0.3),
                 'alpha': trial.suggest_float('alpha', 0.8, 1.8),
                 'beta': trial.suggest_float('beta', 0.4, 0.6)

@@ -208,7 +208,7 @@ class FeatureEngineer:
                 if rows_dropped > 0:
                     if nan_by_column:
                         top_nan_cols = sorted(nan_by_column.items(), key=lambda x: x[1], reverse=True)[:5]
-                        nan_reason = f"（主要因技术指标窗口导致，NaN最多的列: {', '.join([f'{col}({count})' for col, count in top_nan_cols])}）"
+                        nan_reason = f"（技术指标窗口导致：前{rows_dropped}行无法计算长周期指标如SMA_200/SMA_50等，NaN最多的列: {', '.join([f'{col}({count})' for col, count in top_nan_cols])}）"
                     else:
                         nan_reason = "（因NaN/Inf导致）"
                     

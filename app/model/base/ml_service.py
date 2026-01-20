@@ -43,7 +43,8 @@ from app.core.constants import (
     LGB_N_ESTIMATORS,
     LGB_NUM_LEAVES,
     LGB_REG_ALPHA,
-    LGB_REG_LAMBDA
+    LGB_REG_LAMBDA,
+    TRAINING_BASE_DAYS_CONFIG
 )
 from app.core.database import postgresql_manager
 from app.exchange.exchange_factory import ExchangeFactory
@@ -408,18 +409,132 @@ class MLService:
             logger.error(f"❌ {timeframe} 模型预测失败: {e}", exc_info=True)
             return {}
     
+    def _validate_and_filter_kline_data(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        """
+        严格验证和过滤K线数据（训练数据质量保证）
+        
+        检查项：
+        1. 必需字段存在性（open, high, low, close, volume）
+        2. 价格字段有效性（非空、非0、非NaN、非Inf）
+        3. 交易量有效性（非空、非0、非NaN、非Inf）
+        4. 价格逻辑正确性（high >= low, high >= open/close, low <= open/close）
+        
+        Args:
+            df: K线数据DataFrame
+            timeframe: 时间框架（用于日志）
+        
+        Returns:
+            过滤后的有效K线数据DataFrame
+        """
+        try:
+            if df.empty:
+                logger.warning(f"⚠️ {timeframe} 数据为空，无法验证")
+                return df
+            
+            rows_before = len(df)
+            required_columns = ['open', 'high', 'low', 'close', 'volume']
+            
+            # 1️⃣ 检查必需字段是否存在
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            if missing_columns:
+                logger.error(f"❌ {timeframe} K线数据缺少必需字段: {missing_columns}")
+                return pd.DataFrame()
+            
+            # 2️⃣ 检查价格字段（open, high, low, close）有效性
+            price_columns = ['open', 'high', 'low', 'close']
+            invalid_mask = pd.Series([False] * len(df), index=df.index)
+            
+            for col in price_columns:
+                # 检查NaN
+                nan_mask = df[col].isna()
+                if nan_mask.any():
+                    invalid_mask |= nan_mask
+                    logger.warning(f"⚠️ {timeframe} 检测到{nan_mask.sum()}条K线的{col}为NaN")
+                
+                # 检查Inf
+                inf_mask = np.isinf(df[col])
+                if inf_mask.any():
+                    invalid_mask |= inf_mask
+                    logger.warning(f"⚠️ {timeframe} 检测到{inf_mask.sum()}条K线的{col}为Inf")
+                
+                # 检查非正数（价格必须>0）
+                non_positive_mask = df[col] <= 0
+                if non_positive_mask.any():
+                    invalid_mask |= non_positive_mask
+                    logger.warning(f"⚠️ {timeframe} 检测到{non_positive_mask.sum()}条K线的{col}<=0")
+            
+            # 3️⃣ 检查交易量（volume）有效性
+            # 检查NaN
+            volume_nan_mask = df['volume'].isna()
+            if volume_nan_mask.any():
+                invalid_mask |= volume_nan_mask
+                logger.warning(f"⚠️ {timeframe} 检测到{volume_nan_mask.sum()}条K线的volume为NaN")
+            
+            # 检查Inf
+            volume_inf_mask = np.isinf(df['volume'])
+            if volume_inf_mask.any():
+                invalid_mask |= volume_inf_mask
+                logger.warning(f"⚠️ {timeframe} 检测到{volume_inf_mask.sum()}条K线的volume为Inf")
+            
+            # 检查非正数（交易量必须>0，0表示K线未完成）
+            volume_zero_mask = df['volume'] <= 0
+            if volume_zero_mask.any():
+                invalid_mask |= volume_zero_mask
+                logger.warning(f"⚠️ {timeframe} 检测到{volume_zero_mask.sum()}条K线的volume<=0（未完成K线）")
+            
+            # 4️⃣ 检查价格逻辑正确性
+            # high >= low
+            invalid_high_low = df['high'] < df['low']
+            if invalid_high_low.any():
+                invalid_mask |= invalid_high_low
+                logger.warning(f"⚠️ {timeframe} 检测到{invalid_high_low.sum()}条K线的high < low（逻辑错误）")
+            
+            # high >= open
+            invalid_high_open = df['high'] < df['open']
+            if invalid_high_open.any():
+                invalid_mask |= invalid_high_open
+                logger.warning(f"⚠️ {timeframe} 检测到{invalid_high_open.sum()}条K线的high < open（逻辑错误）")
+            
+            # high >= close
+            invalid_high_close = df['high'] < df['close']
+            if invalid_high_close.any():
+                invalid_mask |= invalid_high_close
+                logger.warning(f"⚠️ {timeframe} 检测到{invalid_high_close.sum()}条K线的high < close（逻辑错误）")
+            
+            # low <= open
+            invalid_low_open = df['low'] > df['open']
+            if invalid_low_open.any():
+                invalid_mask |= invalid_low_open
+                logger.warning(f"⚠️ {timeframe} 检测到{invalid_low_open.sum()}条K线的low > open（逻辑错误）")
+            
+            # low <= close
+            invalid_low_close = df['low'] > df['close']
+            if invalid_low_close.any():
+                invalid_mask |= invalid_low_close
+                logger.warning(f"⚠️ {timeframe} 检测到{invalid_low_close.sum()}条K线的low > close（逻辑错误）")
+            
+            # 5️⃣ 过滤无效数据
+            df_valid = df[~invalid_mask].copy()
+            filtered_count = rows_before - len(df_valid)
+            
+            if filtered_count > 0:
+                logger.warning(f"⚠️ {timeframe} 数据验证完成：过滤{filtered_count}条无效K线，剩余{len(df_valid)}条（{filtered_count/rows_before*100:.1f}%被过滤）")
+            else:
+                logger.info(f"✅ {timeframe} 数据验证通过：{len(df_valid)}条K线全部有效")
+            
+            return df_valid
+            
+        except Exception as e:
+            logger.error(f"❌ {timeframe} K线数据验证失败: {e}", exc_info=True)
+            return pd.DataFrame()
+    
     async def _prepare_training_data_for_timeframe(self, timeframe: str) -> pd.DataFrame:
         """为单个时间框架准备训练数据（差异化训练天数）"""
         try:
             symbol = settings.SYMBOL
             
-            # 🔑 超短线训练天数配置：确保足够的高频样本
-            training_days_config = {
-                '3m': 120,   # 超短期：120天（57,600条）
-                '5m': 120,   # 主时间框架：120天（34,560条）
-                '15m': 120   # 趋势确认：120天（11,520条）
-            }
-            training_days = training_days_config.get(timeframe, 120)
+            # 🔑 训练天数配置：从全局常量读取（符合开发规范）
+            training_days = TRAINING_BASE_DAYS_CONFIG.get(timeframe, 180)
             
             # 时间周期对应的分钟数
             interval_minutes = {
@@ -454,18 +569,15 @@ class MLService:
                 # ✅ 去重（防止批次边界重复）
                 df = df.drop_duplicates(subset=['timestamp'], keep='last')
                 
-                # 🔥 过滤未完成的K线（volume=0表示K线未完成）
-                rows_before_filter = len(df)
-                if 'volume' in df.columns:
-                    df = df[df['volume'] > 0]
-                    filtered_count = rows_before_filter - len(df)
-                    if filtered_count > 0:
-                        logger.warning(f"⚠️ 过滤掉{filtered_count}条未完成K线（volume=0）")
+                # 🔥 严格验证和过滤K线数据（检查价格、交易量、逻辑正确性）
+                df = self._validate_and_filter_kline_data(df, timeframe)
                 
                 # 设置索引
-                df = df.set_index('timestamp')
-                
-                logger.info(f"✅ {timeframe} 数据获取成功: {len(df)}条（已过滤未完成K线）")
+                if not df.empty:
+                    df = df.set_index('timestamp')
+                    logger.info(f"✅ {timeframe} 数据获取成功: {len(df)}条（已通过严格验证）")
+                else:
+                    logger.error(f"❌ {timeframe} 数据验证后为空，无法继续训练")
             else:
                 logger.warning(f"⚠️ {timeframe} 数据为空")
             
