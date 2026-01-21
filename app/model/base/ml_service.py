@@ -136,9 +136,29 @@ class MLService:
         self.model_dir = "models"
         os.makedirs(self.model_dir, exist_ok=True)
     
-    def _compute_effective_sample_weights(self, y: pd.Series, timeframe: str) -> np.ndarray:
-        """使用有效样本数计算样本权重（使用模块函数）"""
-        return compute_effective_sample_weights(y, timeframe)
+    def _compute_effective_sample_weights(
+        self, 
+        y: pd.Series, 
+        timeframe: str,
+        hold_multiplier: float = None
+    ) -> np.ndarray:
+        """
+        使用有效样本数计算样本权重（使用模块函数）
+        
+        Args:
+            y: 标签Series
+            timeframe: 时间框架
+            hold_multiplier: HOLD类别权重倍数（如果为None，从constants读取）
+        
+        Returns:
+            样本权重数组
+        """
+        if hold_multiplier is None:
+            # 从constants读取默认值
+            from app.core.constants import HOLD_WEIGHT_MULTIPLIER
+            hold_multiplier = HOLD_WEIGHT_MULTIPLIER
+        
+        return compute_effective_sample_weights(y, timeframe, hold_multiplier=hold_multiplier)
     
     def _get_model_paths(self, timeframe: str) -> Dict[str, str]:
         """获取指定时间框架的模型文件路径"""

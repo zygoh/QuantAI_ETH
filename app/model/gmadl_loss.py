@@ -156,6 +156,134 @@ class GMADLossWithClassWeight(nn.Module):
             return weighted_loss
 
 
+class GMADLossWithFatalErrorPenalty(nn.Module):
+    """
+    GMADL损失 + 致命错误惩罚 + HOLD权重（专为交易系统设计）
+    
+    核心思想：
+    - GMADL对难分样本给予更高关注
+    - 致命错误惩罚：对LONG↔SHORT错误施加5倍惩罚
+    - HOLD权重：增强HOLD类别的学习（15倍权重）
+    """
+    
+    def __init__(
+        self,
+        fatal_error_weight: float = 5.0,
+        hold_weight: float = 15.0,
+        alpha: float = 1.0,
+        beta: float = 0.5,
+        reduction: str = 'mean'
+    ):
+        """
+        初始化GMADL + 致命错误惩罚损失
+        
+        Args:
+            fatal_error_weight: 致命错误权重（LONG↔SHORT）
+            hold_weight: HOLD类别权重
+            alpha: GMADL参数
+            beta: GMADL参数
+            reduction: 'mean' 或 'sum'
+        """
+        super(GMADLossWithFatalErrorPenalty, self).__init__()
+        self.fatal_error_weight = fatal_error_weight
+        self.hold_weight = hold_weight
+        self.alpha = alpha
+        self.beta = beta
+        self.reduction = reduction
+        self._fallback_enabled = False
+        self._logger = logging.getLogger(__name__)
+    
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        计算GMADL + 致命错误惩罚损失
+        
+        Args:
+            logits: 模型输出 (batch_size, num_classes)
+            targets: 真实标签 (batch_size,) 其中0=SHORT, 1=HOLD, 2=LONG
+        
+        Returns:
+            损失值
+        """
+        # 0. 确保float32精度
+        logits = logits.float()
+        targets = targets.long()
+        
+        if self._fallback_enabled:
+            return self._cross_entropy_with_fatal_error(logits, targets)
+        
+        # 1. 计算softmax概率
+        probs = torch.softmax(logits, dim=1)
+        probs = torch.clamp(probs, min=GMADL_PROB_MIN, max=GMADL_PROB_MAX)
+        
+        # 2. 获取正确类别概率并计算误差
+        batch_size = targets.size(0)
+        target_probs = probs[torch.arange(batch_size, device=logits.device, dtype=torch.long), targets]
+        errors = torch.clamp(1.0 - target_probs, min=GMADL_ERROR_MIN, max=1.0)
+        
+        # 3. GMADL损失
+        abs_errors = torch.abs(errors)
+        numerator = torch.pow(abs_errors + 1e-8, self.beta)
+        denominator = self.alpha + torch.pow(abs_errors + 1e-8, 1.0 - self.beta)
+        loss = numerator / (denominator + 1e-7)
+        
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            if not self._fallback_enabled:
+                self._logger.warning("⚠️ GMADL损失出现nan/inf，后续迭代将降级为交叉熵损失")
+                self._fallback_enabled = True
+            return self._cross_entropy_with_fatal_error(logits, targets)
+        
+        # 4. 计算预测类别
+        pred_classes = torch.argmax(logits, dim=1)
+        
+        # 5. 应用致命错误惩罚和HOLD权重
+        weights = torch.ones_like(loss, dtype=torch.float32)
+        
+        # 致命错误掩码：LONG(2) → SHORT(0) 或 SHORT(0) → LONG(2)
+        fatal_mask = ((targets == 2) & (pred_classes == 0)) | ((targets == 0) & (pred_classes == 2))
+        weights = torch.where(fatal_mask, weights * self.fatal_error_weight, weights)
+        
+        # HOLD类别权重
+        hold_mask = (targets == 1)
+        weights = torch.where(hold_mask, weights * self.hold_weight, weights)
+        
+        # 6. 应用权重并聚合
+        weighted_loss = loss * weights
+        
+        if self.reduction == 'mean':
+            return weighted_loss.mean()
+        elif self.reduction == 'sum':
+            return weighted_loss.sum()
+        else:
+            return weighted_loss
+    
+    def _cross_entropy_with_fatal_error(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """降级路径：交叉熵 + 致命错误惩罚 + HOLD权重"""
+        ce_loss = F.cross_entropy(logits, targets, reduction='none')
+        
+        # 计算预测类别
+        pred_classes = torch.argmax(logits, dim=1)
+        
+        # 应用权重
+        weights = torch.ones_like(ce_loss, dtype=torch.float32)
+        
+        # 致命错误权重
+        fatal_mask = ((targets == 2) & (pred_classes == 0)) | ((targets == 0) & (pred_classes == 2))
+        weights = torch.where(fatal_mask, weights * self.fatal_error_weight, weights)
+        
+        # HOLD权重
+        hold_mask = (targets == 1)
+        weights = torch.where(hold_mask, weights * self.hold_weight, weights)
+        
+        weighted_loss = ce_loss * weights
+        
+        if self.reduction == 'mean':
+            return weighted_loss.mean()
+        elif self.reduction == 'sum':
+            return weighted_loss.sum()
+        else:
+            return weighted_loss
+
+
 class GMADLossWithHOLDPenalty(nn.Module):
     """
     GMADL损失 + HOLD惩罚（专为交易系统设计）
@@ -287,25 +415,54 @@ class CrossEntropyWithHoldPenalty(nn.Module):
 
 def create_trade_loss(
     use_gmadl: bool,
+    use_fatal_error_penalty: bool = True,
+    fatal_error_weight: float = 5.0,
+    hold_weight: float = 15.0,
     hold_penalty: float = 0.65,
     alpha: float = 1.0,
     beta: float = 0.5,
     reduction: str = 'mean'
 ) -> nn.Module:
-    """根据配置返回稳定的交易损失函数。"""
-
+    """
+    根据配置返回稳定的交易损失函数
+    
+    Args:
+        use_gmadl: 是否使用GMADL损失
+        use_fatal_error_penalty: 是否使用致命错误惩罚（推荐）
+        fatal_error_weight: 致命错误权重（LONG↔SHORT）
+        hold_weight: HOLD类别权重
+        hold_penalty: HOLD惩罚系数（旧版，仅在use_fatal_error_penalty=False时使用）
+        alpha: GMADL参数
+        beta: GMADL参数
+        reduction: 'mean' 或 'sum'
+    
+    Returns:
+        损失函数实例
+    """
     if use_gmadl:
-        return GMADLossWithHOLDPenalty(
+        if use_fatal_error_penalty:
+            # 推荐：GMADL + 致命错误惩罚 + HOLD权重
+            return GMADLossWithFatalErrorPenalty(
+                fatal_error_weight=fatal_error_weight,
+                hold_weight=hold_weight,
+                alpha=alpha,
+                beta=beta,
+                reduction=reduction
+            )
+        else:
+            # 旧版：GMADL + HOLD惩罚
+            return GMADLossWithHOLDPenalty(
+                hold_penalty=hold_penalty,
+                alpha=alpha,
+                beta=beta,
+                reduction=reduction
+            )
+    else:
+        # 交叉熵 + HOLD惩罚
+        return CrossEntropyWithHoldPenalty(
             hold_penalty=hold_penalty,
-            alpha=alpha,
-            beta=beta,
             reduction=reduction
         )
-
-    return CrossEntropyWithHoldPenalty(
-        hold_penalty=hold_penalty,
-        reduction=reduction
-    )
 
 
 def create_gmadl_loss(

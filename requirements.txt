@@ -41,6 +41,7 @@ pandas
 scipy
 optuna  # 超参数优化（支持所有4个模型）
 bitsandbytes #8-bit优化器
+imbalanced-learn>=0.11.0  # SMOTE过采样（用于处理类别不平衡）
 
 # GPU加速库（可选，用于XGBoost GPU预测避免设备不匹配警告）
 # 安装命令：pip install cupy-cuda12x  # 根据CUDA版本选择（cuda11x, cuda12x等）
@@ -73,6 +74,13 @@ socksio==1.0.0
 aiohttp
 python-dateutil
 pytz
+
+# ========================================
+# 测试库
+# ========================================
+pytest>=7.0.0
+hypothesis>=6.0.0
+pytest-asyncio
 
 # ========================================
 # 系统配置说明
