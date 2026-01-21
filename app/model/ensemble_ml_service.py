@@ -1310,9 +1310,16 @@ class EnsembleMLService(MLService):
             
             logger.info(f"预测类别形状验证通过: 验证集{lgb_pred_val.shape}, 测试集{lgb_pred_test.shape} (已统一为1D数组)")
             
-            # 🆕 生成元特征的辅助函数
+            # 🆕 生成元特征的辅助函数（增强版：+20个新特征）
             def _build_meta_features(lgb_proba, xgb_proba, cat_proba, inf_proba, lgb_pred, xgb_pred, cat_pred, y_labels, dataset_name):
-                """构建元特征"""
+                """
+                构建增强元特征（Phase 1修复：增加模型差异、统计、类别特定特征）
+                
+                新增特征：
+                1. 模型差异特征（6个）：两两模型预测差异、分歧度、一致性强度
+                2. 统计特征（8个）：概率分位数、偏度、峰度、概率排名、概率差距
+                3. 类别特定特征（6个）：每个类别的置信度、共识度、方差
+                """
                 # 🔑 验证输入形状一致性
                 n_samples = lgb_proba.shape[0]
                 assert xgb_proba.shape[0] == n_samples, f"{dataset_name} xgb_proba样本数不一致: {xgb_proba.shape[0]} != {n_samples}"
@@ -1322,6 +1329,8 @@ class EnsembleMLService(MLService):
                 assert cat_pred.shape[0] == n_samples, f"{dataset_name} cat_pred样本数不一致: {cat_pred.shape[0]} != {n_samples}"
                 if inf_proba is not None:
                     assert inf_proba.shape[0] == n_samples, f"{dataset_name} inf_proba样本数不一致: {inf_proba.shape[0]} != {n_samples}"
+                
+                # ========== 原有特征（基础25+新增20=45个，含Informer-2；基础20+新增20=40个，不含Informer-2） ==========
                 
                 # 1. 模型一致性
                 agreement_bool = (lgb_pred == xgb_pred) & (xgb_pred == cat_pred)
@@ -1343,33 +1352,126 @@ class EnsembleMLService(MLService):
                     prob_std = np.std(np.stack([lgb_proba, xgb_proba, cat_proba, inf_proba]), axis=0)
                     inf_max_prob = inf_proba.max(axis=1).reshape(-1, 1)
                     inf_entropy = entr(inf_proba).sum(axis=1).reshape(-1, 1)
+                    n_models = 4
                 else:
                     avg_proba = (lgb_proba + xgb_proba + cat_proba) / 3
                     prob_std = np.std(np.stack([lgb_proba, xgb_proba, cat_proba]), axis=0)
                     inf_max_prob = None
                     inf_entropy = None
+                    n_models = 3
                 
                 prob_std_max = prob_std.max(axis=1).reshape(-1, 1)
                 
-                # 拼接元特征
+                # ========== 🆕 新增特征（Phase 1修复） ==========
+                
+                # 5. 模型差异特征（6个）
+                # 5.1 两两模型预测差异（LGB vs XGB, LGB vs CAT, XGB vs CAT）
+                lgb_xgb_diff = (lgb_pred != xgb_pred).astype(float).reshape(-1, 1)
+                lgb_cat_diff = (lgb_pred != cat_pred).astype(float).reshape(-1, 1)
+                xgb_cat_diff = (xgb_pred != cat_pred).astype(float).reshape(-1, 1)
+                
+                # 5.2 模型预测分歧度（标准差）
+                pred_array = np.stack([lgb_pred, xgb_pred, cat_pred], axis=0)  # (3, n_samples)
+                pred_disagreement = np.std(pred_array, axis=0).reshape(-1, 1)
+                
+                # 5.3 一致性强度（全一致=1.0, 2/3一致=0.67, 全不一致=0.0）
+                agreement_strength = (
+                    (lgb_pred == xgb_pred).astype(float) +
+                    (lgb_pred == cat_pred).astype(float) +
+                    (xgb_pred == cat_pred).astype(float)
+                ) / 3.0
+                agreement_strength = agreement_strength.reshape(-1, 1)
+                
+                # 5.4 最大分歧模型对数量（0-3）
+                max_disagreement_pairs = (lgb_xgb_diff + lgb_cat_diff + xgb_cat_diff).reshape(-1, 1)
+                
+                # 6. 统计特征（8个）
+                # 6.1 概率分位数（Q25, Q50, Q75）- 使用平均概率
+                prob_q25 = np.quantile(avg_proba, 0.25, axis=1).reshape(-1, 1)
+                prob_q50 = np.quantile(avg_proba, 0.50, axis=1).reshape(-1, 1)
+                prob_q75 = np.quantile(avg_proba, 0.75, axis=1).reshape(-1, 1)
+                
+                # 6.2 概率偏度和峰度（使用平均概率）
+                prob_mean_per_sample = np.mean(avg_proba, axis=1)
+                prob_std_per_sample = np.std(avg_proba, axis=1)
+                # 偏度：E[(X-μ)³] / σ³
+                prob_skew = np.mean(((avg_proba - prob_mean_per_sample.reshape(-1, 1)) ** 3), axis=1) / (prob_std_per_sample ** 3 + 1e-8)
+                prob_skew = prob_skew.reshape(-1, 1)
+                # 峰度：E[(X-μ)⁴] / σ⁴ - 3
+                prob_kurt = np.mean(((avg_proba - prob_mean_per_sample.reshape(-1, 1)) ** 4), axis=1) / (prob_std_per_sample ** 4 + 1e-8) - 3.0
+                prob_kurt = prob_kurt.reshape(-1, 1)
+                
+                # 6.3 概率排名和差距
+                prob_sorted = np.sort(avg_proba, axis=1)  # 每行从小到大排序
+                prob_top = prob_sorted[:, -1].reshape(-1, 1)  # 最高概率
+                prob_second = prob_sorted[:, -2].reshape(-1, 1)  # 次高概率
+                prob_gap = (prob_top - prob_second).reshape(-1, 1)  # 概率差距
+                
+                # 7. 类别特定特征（6个）
+                # 7.1 每个类别的平均置信度（SHORT/LONG/HOLD）
+                class_confidence_short = avg_proba[:, 0].reshape(-1, 1)  # SHORT类别
+                class_confidence_hold = avg_proba[:, 1].reshape(-1, 1)  # HOLD类别
+                class_confidence_long = avg_proba[:, 2].reshape(-1, 1)  # LONG类别
+                
+                # 7.2 每个类别的模型共识度（预测为该类别的模型比例）
+                class_consensus_short = (
+                    (lgb_pred == 0).astype(float) +
+                    (xgb_pred == 0).astype(float) +
+                    (cat_pred == 0).astype(float)
+                ) / n_models
+                class_consensus_short = class_consensus_short.reshape(-1, 1)
+                
+                class_consensus_long = (
+                    (lgb_pred == 2).astype(float) +
+                    (xgb_pred == 2).astype(float) +
+                    (cat_pred == 2).astype(float)
+                ) / n_models
+                class_consensus_long = class_consensus_long.reshape(-1, 1)
+                
+                # 7.3 类别概率方差（每个样本的类别概率方差）
+                class_prob_variance = np.var(avg_proba, axis=1).reshape(-1, 1)
+                
+                # ========== 拼接所有元特征 ==========
+                
+                # 基础特征列表
+                base_meta_list = [
+                    lgb_proba, xgb_proba, cat_proba,
+                    agreement, lgb_max_prob, xgb_max_prob, cat_max_prob,
+                    lgb_entropy, xgb_entropy, cat_entropy,
+                    avg_proba, prob_std_max
+                ]
+                
+                # 新增特征列表
+                enhanced_meta_list = [
+                    # 模型差异特征（6个）
+                    lgb_xgb_diff, lgb_cat_diff, xgb_cat_diff,
+                    pred_disagreement, agreement_strength, max_disagreement_pairs,
+                    # 统计特征（8个）
+                    prob_q25, prob_q50, prob_q75,
+                    prob_skew, prob_kurt,
+                    prob_top, prob_second, prob_gap,
+                    # 类别特定特征（6个）
+                    class_confidence_short, class_confidence_hold, class_confidence_long,
+                    class_consensus_short, class_consensus_long, class_prob_variance
+                ]
+                
                 if inf_proba is not None:
-                    meta_list = [
+                    # 包含Informer-2的基础特征
+                    base_meta_list = [
                         lgb_proba, xgb_proba, cat_proba, inf_proba,
                         agreement, lgb_max_prob, xgb_max_prob, cat_max_prob, inf_max_prob,
                         lgb_entropy, xgb_entropy, cat_entropy, inf_entropy,
                         avg_proba, prob_std_max
                     ]
-                    expected_features = 25
+                    expected_features = 25 + 20  # 基础25 + 新增20 = 45
                 else:
-                    meta_list = [
-                        lgb_proba, xgb_proba, cat_proba,
-                        agreement, lgb_max_prob, xgb_max_prob, cat_max_prob,
-                        lgb_entropy, xgb_entropy, cat_entropy,
-                        avg_proba, prob_std_max
-                    ]
-                    expected_features = 20
+                    expected_features = 20 + 20  # 基础20 + 新增20 = 40
                 
-                meta_features = np.hstack(meta_list)
+                # 合并所有特征
+                all_meta_list = base_meta_list + enhanced_meta_list
+                meta_features = np.hstack(all_meta_list)
+                
+                # 验证特征数量
                 assert meta_features.shape == (len(y_labels), expected_features), \
                     f"{dataset_name}元特征形状错误: {meta_features.shape} != ({len(y_labels)}, {expected_features})"
                 
@@ -1393,9 +1495,11 @@ class EnsembleMLService(MLService):
             logger.info(f"✅ 元特征生成完成: 验证集{meta_features_val.shape}, 测试集{meta_features_test.shape}")
             
             if inf_model is not None:
-                logger.info(f"✅ 增强元特征生成完成: {meta_features_val.shape} (基础12+增强13=25个，含Informer-2)")
+                logger.info(f"✅ 增强元特征生成完成: {meta_features_val.shape} (基础25+新增20=45个，含Informer-2)")
+                logger.info(f"   Phase 1修复：新增模型差异特征(6) + 统计特征(8) + 类别特定特征(6) = 20个")
             else:
-                logger.info(f"✅ 增强元特征生成完成: {meta_features_val.shape} (基础9+增强11=20个)")
+                logger.info(f"✅ 增强元特征生成完成: {meta_features_test.shape} (基础20+新增20=40个)")
+                logger.info(f"   Phase 1修复：新增模型差异特征(6) + 统计特征(8) + 类别特定特征(6) = 20个")
             
             # 3️⃣ 训练元学习器（Stacking） - 升级为LightGBM + 动态HOLD惩罚
             logger.info(f"🧠 训练元学习器（LightGBM - 更强大的决策能力）...")
@@ -1467,11 +1571,12 @@ class EnsembleMLService(MLService):
                         logger.warning(f"⚠️ Fold {fold} 测试集太小（{len(meta_test)}个样本），跳过该fold")
                         continue
                         
-                    # 训练元学习器（每个fold）- 与最终模型完全一致的配置
+                    # 训练元学习器（每个fold）- 与最终模型完全一致的配置（Phase 2修复）
                     fold_meta = lgb.LGBMClassifier(
-                        n_estimators=50, max_depth=3, learning_rate=0.15,
-                        num_leaves=7, min_child_samples=30, subsample=0.7,
+                        n_estimators=200, max_depth=5, learning_rate=0.03,
+                        num_leaves=24, min_child_samples=30, subsample=0.7,
                         colsample_bytree=0.7, reg_alpha=0.3, reg_lambda=0.3,
+                        feature_fraction=0.8, bagging_freq=5,
                         random_state=42, verbose=-1
                     )
                     
@@ -1817,9 +1922,14 @@ class EnsembleMLService(MLService):
             logger.info(f"     模型一致性:     {model_agreement*100:.2f}% (基础模型共识)")
             logger.info(f"")
             logger.info(f"  📊 模型配置:")
-            n_base = 12 if inf_model else 9
-            n_enhanced = 11
-            logger.info(f"     元特征数量:     {meta_features_val.shape[1]}个（基础{n_base}+增强{n_enhanced}）")
+            # 🔑 修复：正确计算元特征数量（基础25+新增20=45个，含Informer-2；基础20+新增20=40个，不含Informer-2）
+            if inf_model is not None:
+                n_base = 25  # 基础特征：4个概率(4) + 1个一致性(1) + 4个最大概率(4) + 4个熵(4) + 3个平均概率(3) + 1个标准差(1) + 4个Informer特征(4) = 25
+                n_enhanced = 20  # 新增特征：模型差异(6) + 统计特征(8) + 类别特定(6) = 20
+            else:
+                n_base = 20  # 基础特征：3个概率(3) + 1个一致性(1) + 3个最大概率(3) + 3个熵(3) + 3个平均概率(3) + 1个标准差(1) = 20
+                n_enhanced = 20  # 新增特征：模型差异(6) + 统计特征(8) + 类别特定(6) = 20
+            logger.info(f"     元特征数量:     {meta_features_val.shape[1]}个（基础{n_base}+新增{n_enhanced}）")
             logger.info(f"     训练耗时:       {training_time:.2f}秒")
             
             # 🔄 生产级别：热更新模型（原子性替换）
@@ -2691,74 +2801,27 @@ class EnsembleMLService(MLService):
             
             # Stacking预测（使用元学习器）
             if 'meta' in models:
-                # 🆕 生成增强元特征（与训练时一致）
-                # 1. 模型一致性
-                if inf_proba is not None:
-                    agreement = float((lgb_pred == xgb_pred) and (xgb_pred == cat_pred) and (cat_pred == inf_pred))
-                else:
-                    agreement = float((lgb_pred == xgb_pred) and (xgb_pred == cat_pred))
+                # 🔑 关键修复：使用统一的增强元特征生成函数（确保训练和预测完全一致）
+                # Phase 1修复：生成45个特征（含Informer-2）或40个特征（不含Informer-2）
+                # 传入已计算的 inf_proba 和 inf_pred，避免重复计算
+                meta_features = self._generate_enhanced_meta_features(
+                    X_pred, models, 
+                    inf_proba=inf_proba if inf_proba is not None else None,
+                    inf_pred=inf_pred if inf_pred is not None else None
+                )
                 
-                # 2. 最大概率
-                lgb_max_prob = lgb_proba.max()
-                xgb_max_prob = xgb_proba.max()
-                cat_max_prob = cat_proba.max()
-                
-                # 3. 概率熵（单个样本）
-                lgb_entropy = entr(lgb_proba).sum()
-                xgb_entropy = entr(xgb_proba).sum()
-                cat_entropy = entr(cat_proba).sum()
-                
-                # 4. 平均概率
-                if inf_proba is not None:
-                    inf_max_prob = inf_proba.max()
-                    inf_entropy = entr(inf_proba).sum()
-                    avg_proba = (lgb_proba + xgb_proba + cat_proba + inf_proba) / 4
-                else:
-                    avg_proba = (lgb_proba + xgb_proba + cat_proba) / 3
-                
-                # 5. 概率标准差
-                if inf_proba is not None:
-                    prob_std = np.std(np.stack([lgb_proba, xgb_proba, cat_proba, inf_proba]), axis=0)
-                else:
-                    prob_std = np.std(np.stack([lgb_proba, xgb_proba, cat_proba]), axis=0)
-                prob_std_max = prob_std.max()
-                
-                # 🔑 拼接所有元特征（20个或23个）
-                if inf_proba is not None:
-                    # 包含Informer-2（23个特征）
-                    meta_features = np.hstack([
-                        lgb_proba,           # 3个
-                        xgb_proba,           # 3个
-                        cat_proba,           # 3个
-                        inf_proba,           # 3个 ← Informer-2
-                        [agreement],         # 1个
-                        [lgb_max_prob],      # 1个
-                        [xgb_max_prob],      # 1个
-                        [cat_max_prob],      # 1个
-                        [inf_max_prob],      # 1个 ← Informer-2
-                        [lgb_entropy],       # 1个
-                        [xgb_entropy],       # 1个
-                        [cat_entropy],       # 1个
-                        [inf_entropy],       # 1个 ← Informer-2
-                        avg_proba,           # 3个
-                        [prob_std_max]       # 1个
-                    ]).reshape(1, -1)  # (1, 23)
-                else:
-                    # 仅传统模型（20个特征）
-                    meta_features = np.hstack([
-                        lgb_proba,           # 3个
-                        xgb_proba,           # 3个
-                        cat_proba,           # 3个
-                        [agreement],         # 1个
-                        [lgb_max_prob],      # 1个
-                        [xgb_max_prob],      # 1个
-                        [cat_max_prob],      # 1个
-                        [lgb_entropy],       # 1个
-                        [xgb_entropy],       # 1个
-                        [cat_entropy],       # 1个
-                        avg_proba,           # 3个
-                        [prob_std_max]       # 1个
-                    ]).reshape(1, -1)  # (1, 20)
+                # 验证特征数量（确保与训练时一致）
+                # 🔑 关键修复：使用模型期望的特征数量，而不是根据inf_proba判断
+                model_expected_features = models['meta'].n_features_
+                actual_features = meta_features.shape[1]
+                if actual_features != model_expected_features:
+                    logger.error(
+                        f"❌ {timeframe} 元特征数量不匹配: 模型期望{model_expected_features}个，实际{actual_features}个。"
+                    )
+                    logger.error(f"   原因：预测时元特征生成逻辑与训练时不一致")
+                    logger.error(f"   解决方案：检查 _generate_enhanced_meta_features() 函数")
+                    logger.error(f"   提示：如果模型期望45个特征，即使没有inf_proba，也需要用占位符填充到45个")
+                    return None
                 
                 # 元学习器预测
                 stacking_proba = models['meta'].predict_proba(meta_features)[0]
@@ -3050,124 +3113,228 @@ class EnsembleMLService(MLService):
     def _generate_enhanced_meta_features(
         self, 
         X_pred: np.ndarray, 
-        models: Dict[str, Any]
+        models: Dict[str, Any],
+        inf_proba: Optional[np.ndarray] = None,
+        inf_pred: Optional[int] = None
     ) -> np.ndarray:
         """
-        生成增强元特征（与训练时保持一致）
+        生成增强元特征（Phase 1修复：与训练时完全一致，包含新增20个特征）
         
         Args:
-            X_pred: 预测特征数据
-            models: 模型字典
+            X_pred: 预测特征数据（单样本或批量样本）
+            models: 模型字典，包含 'lgb', 'xgb', 'cat', 'meta' 和可选的 'inf'
+            inf_proba: 可选的Informer-2预测概率数组 (3,)，如果提供则直接使用，避免重复计算
+            inf_pred: 可选的Informer-2预测结果 (int)，如果提供则直接使用，避免重复计算
         
         Returns:
-            np.ndarray: 增强元特征
+            np.ndarray: 增强元特征 (1, n_features)，n_features为45（含Informer-2）或40（不含Informer-2）
+        
+        Note:
+            - 如果 inf_proba 和 inf_pred 为 None，函数会尝试从 models['inf'] 获取
+            - 训练和预测必须使用完全相同的特征生成逻辑，确保特征数量一致
         """
         try:
-            # 基础模型预测概率
-            lgb_proba = models['lgb'].predict_proba(X_pred)[0]
+            # 基础模型预测概率（单样本，需要reshape为(1, 3)）
+            lgb_proba = models['lgb'].predict_proba(X_pred)[0]  # (3,)
             # ✅ 使用统一的XGBoost预测方法（修复设备不匹配问题，单样本预测）
             xgb_pred, xgb_proba = self._predict_xgboost(models['xgb'], X_pred, return_single=True)
-            cat_proba = models['cat'].predict_proba(X_pred)[0]
+            xgb_proba = xgb_proba[0] if len(xgb_proba.shape) > 1 else xgb_proba  # 确保是(3,)
+            cat_proba = models['cat'].predict_proba(X_pred)[0]  # (3,)
             
-            # 基础模型预测结果
-            lgb_pred = models['lgb'].predict(X_pred)[0]
-            # xgb_pred 已在上面获取
-            cat_pred = models['cat'].predict(X_pred)[0]
+            # 基础模型预测结果（单样本）
+            # 🔑 关键修复：确保所有预测值都是标量（int），而不是数组，避免后续类型不一致错误
+            lgb_pred_raw = models['lgb'].predict(X_pred)
+            lgb_pred = int(lgb_pred_raw[0] if isinstance(lgb_pred_raw, (np.ndarray, list)) and len(lgb_pred_raw) > 0 else lgb_pred_raw)
+            
+            # xgb_pred 可能已经是标量（如果return_single=True且len==1），但确保是标量
+            if isinstance(xgb_pred, (np.ndarray, list)):
+                xgb_pred = int(xgb_pred[0] if len(xgb_pred) > 0 else xgb_pred)
+            else:
+                xgb_pred = int(xgb_pred)
+            
+            cat_pred_raw = models['cat'].predict(X_pred)
+            cat_pred = int(cat_pred_raw[0] if isinstance(cat_pred_raw, (np.ndarray, list)) and len(cat_pred_raw) > 0 else cat_pred_raw)
             
             # Informer-2预测（如果存在）
-            if 'inf' in models:
-                try:
-                    # 尝试获取序列输入（需要从features中构造）
-                    seq_len = self.seq_len_config.get('15m', 96)  # 默认使用15m配置
-                    # 这里需要完整的序列数据，暂时使用默认值
-                    inf_proba = np.array([0.33, 0.34, 0.33])  # 默认均匀分布
-                    inf_pred = 1  # 默认HOLD
-                    logger.debug(f"⚠️ Informer-2使用默认预测（需要序列输入）")
-                except Exception as e:
-                    logger.warning(f"⚠️ Informer-2预测失败: {e}")
-                    inf_proba = np.array([0.33, 0.34, 0.33])
-                    inf_pred = 1
-            else:
-                inf_proba = None
-                inf_pred = None
+            # 🔑 优先使用传入的 inf_proba 和 inf_pred（避免重复计算）
+            if inf_proba is None and inf_pred is None:
+                if 'inf' in models:
+                    try:
+                        # 尝试获取序列输入（需要从features中构造）
+                        seq_len = self.seq_len_config.get('15m', 96)  # 默认使用15m配置
+                        # 这里需要完整的序列数据，暂时使用默认值
+                        inf_proba = np.array([0.33, 0.34, 0.33])  # 默认均匀分布
+                        inf_pred = 1  # 默认HOLD
+                        logger.debug(f"⚠️ Informer-2使用默认预测（需要序列输入）")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Informer-2预测失败: {e}")
+                        inf_proba = np.array([0.33, 0.34, 0.33])
+                        inf_pred = 1
+                else:
+                    inf_proba = None
+                    inf_pred = None
             
-            # 1. 基础元特征（如果有inf是12个，否则是9个，但为了与训练时一致，总是生成12个）
-            meta_features = np.concatenate([
-                lgb_proba,  # 3个
-                xgb_proba,  # 3个
-                cat_proba   # 3个
-            ])
+            # ========== 原有特征（与训练时一致） ==========
             
+            # 1. 模型一致性
+            # 🔑 修复：lgb_pred, xgb_pred, cat_pred 已经是标量（在上面已转换）
+            agreement_bool = (lgb_pred == xgb_pred) & (xgb_pred == cat_pred)
+            agreement = float(agreement_bool)
+            
+            # 2. 最大概率
+            lgb_max_prob = float(lgb_proba.max())
+            xgb_max_prob = float(xgb_proba.max())
+            cat_max_prob = float(cat_proba.max())
+            
+            # 3. 概率熵
+            lgb_entropy = float(entr(lgb_proba).sum())
+            xgb_entropy = float(entr(xgb_proba).sum())
+            cat_entropy = float(entr(cat_proba).sum())
+            
+            # 4. 平均概率和标准差
             if inf_proba is not None:
-                meta_features = np.concatenate([meta_features, inf_proba])  # +3个 = 12个
+                avg_proba = (lgb_proba + xgb_proba + cat_proba + inf_proba) / 4
+                prob_std = np.std(np.stack([lgb_proba, xgb_proba, cat_proba, inf_proba]), axis=0)
+                inf_max_prob = float(inf_proba.max())
+                inf_entropy = float(entr(inf_proba).sum())
+                n_models = 4
             else:
-                # 如果没有inf，用0填充以保持特征数量一致（如果模型期望25个特征）
-                # 但先检查模型期望的特征数量
-                meta_features = np.concatenate([meta_features, np.zeros(3)])  # +3个占位符 = 12个
+                avg_proba = (lgb_proba + xgb_proba + cat_proba) / 3
+                prob_std = np.std(np.stack([lgb_proba, xgb_proba, cat_proba]), axis=0)
+                inf_max_prob = 0.0
+                inf_entropy = 0.0
+                n_models = 3
             
-            # 2. 增强元特征（11个）
-            # 模型一致性
-            if inf_pred is not None:
-                agreement = float((lgb_pred == xgb_pred) and (xgb_pred == cat_pred) and (cat_pred == inf_pred))
+            prob_std_max = float(prob_std.max())
+            
+            # ========== 🆕 新增特征（Phase 1修复，与训练时一致） ==========
+            
+            # 5. 模型差异特征（6个）
+            # 🔑 修复：lgb_pred, xgb_pred, cat_pred 已经是标量（在上面已转换）
+            lgb_xgb_diff = float(lgb_pred != xgb_pred)
+            lgb_cat_diff = float(lgb_pred != cat_pred)
+            xgb_cat_diff = float(xgb_pred != cat_pred)
+            
+            # 预测分歧度（标准差）
+            # 🔑 修复：使用标量值创建数组，避免类型不一致错误
+            pred_array = np.array([lgb_pred, xgb_pred, cat_pred], dtype=np.float64)
+            pred_disagreement = float(np.std(pred_array))
+            
+            # 一致性强度
+            # 🔑 修复：使用标量值计算
+            agreement_strength = float((
+                (lgb_pred == xgb_pred) +
+                (lgb_pred == cat_pred) +
+                (xgb_pred == cat_pred)
+            ) / 3.0)
+            
+            # 最大分歧模型对数量
+            max_disagreement_pairs = float(lgb_xgb_diff + lgb_cat_diff + xgb_cat_diff)
+            
+            # 6. 统计特征（8个）
+            # 概率分位数（单样本，直接计算）
+            prob_q25 = float(np.quantile(avg_proba, 0.25))
+            prob_q50 = float(np.quantile(avg_proba, 0.50))
+            prob_q75 = float(np.quantile(avg_proba, 0.75))
+            
+            # 概率偏度和峰度（单样本）
+            prob_mean = float(np.mean(avg_proba))
+            prob_std_val = float(np.std(avg_proba))
+            prob_skew = float(np.mean(((avg_proba - prob_mean) ** 3)) / (prob_std_val ** 3 + 1e-8))
+            prob_kurt = float(np.mean(((avg_proba - prob_mean) ** 4)) / (prob_std_val ** 4 + 1e-8) - 3.0)
+            
+            # 概率排名和差距
+            prob_sorted = np.sort(avg_proba)
+            prob_top = float(prob_sorted[-1])
+            prob_second = float(prob_sorted[-2])
+            prob_gap = float(prob_top - prob_second)
+            
+            # 7. 类别特定特征（6个）
+            class_confidence_short = float(avg_proba[0])
+            class_confidence_hold = float(avg_proba[1])
+            class_confidence_long = float(avg_proba[2])
+            
+            # 🔑 修复：使用标量值计算共识度（lgb_pred, xgb_pred, cat_pred 已经是标量）
+            class_consensus_short = float((
+                (lgb_pred == 0) + (xgb_pred == 0) + (cat_pred == 0)
+            ) / n_models)
+            
+            class_consensus_long = float((
+                (lgb_pred == 2) + (xgb_pred == 2) + (cat_pred == 2)
+            ) / n_models)
+            
+            class_prob_variance = float(np.var(avg_proba))
+            
+            # ========== 拼接所有特征（与训练时完全一致） ==========
+            
+            # 🔑 关键修复：根据模型期望的特征数量决定是否包含inf特征
+            # 如果模型期望45个特征，说明训练时包含Informer-2，即使预测时没有inf_proba也要填充占位符
+            model_has_informer = 'inf' in models
+            # 检查模型期望的特征数量（如果模型已加载）
+            if hasattr(models.get('meta'), 'n_features_'):
+                model_expected = models['meta'].n_features_
+                # 如果模型期望45个特征，说明训练时包含Informer-2
+                if model_expected == 45:
+                    model_has_informer = True
+                elif model_expected == 40:
+                    model_has_informer = False
             else:
-                agreement = float((lgb_pred == xgb_pred) and (xgb_pred == cat_pred))
+                # 如果模型未加载，根据是否有inf_proba判断
+                model_has_informer = inf_proba is not None
             
-            # 最大概率
-            lgb_max_prob = lgb_proba.max()
-            xgb_max_prob = xgb_proba.max()
-            cat_max_prob = cat_proba.max()
+            # 基础特征
+            base_features = [
+                lgb_proba, xgb_proba, cat_proba,  # 9个
+                np.array([agreement]),  # 1个
+                np.array([lgb_max_prob, xgb_max_prob, cat_max_prob]),  # 3个
+                np.array([lgb_entropy, xgb_entropy, cat_entropy]),  # 3个
+                avg_proba,  # 3个
+                np.array([prob_std_max])  # 1个
+            ]
             
-            # 概率熵
-            lgb_entropy = entr(lgb_proba).sum()
-            xgb_entropy = entr(xgb_proba).sum()
-            cat_entropy = entr(cat_proba).sum()
-            
-            # 平均概率（保持与训练时一致：3个值，每个类别的平均概率）
-            avg_proba = np.mean([lgb_proba, xgb_proba, cat_proba], axis=0)
-            if inf_proba is not None:
-                avg_proba = np.mean([lgb_proba, xgb_proba, cat_proba, inf_proba], axis=0)
-            
-            # 概率标准差（保持与训练时一致：每个类别概率标准差的最大值）
-            prob_std = np.std([lgb_proba, xgb_proba, cat_proba], axis=0)
-            if inf_proba is not None:
-                prob_std = np.std([lgb_proba, xgb_proba, cat_proba, inf_proba], axis=0)
-            prob_std_max = prob_std.max()  # 取最大值（与训练时一致）
-            
-            # Informer-2增强特征（如果存在）
-            if inf_proba is not None:
-                inf_max_prob = inf_proba.max()
-                inf_entropy = entr(inf_proba).sum()
-                
-                # 与训练时保持一致：agreement(1) + max_prob(4) + entropy(4) + avg_proba(3) + prob_std_max(1) = 13个
-                enhanced_features = np.concatenate([
-                    np.array([agreement]),
-                    np.array([lgb_max_prob, xgb_max_prob, cat_max_prob, inf_max_prob]),
-                    np.array([lgb_entropy, xgb_entropy, cat_entropy, inf_entropy]),
-                    avg_proba,  # 3个值
-                    np.array([prob_std_max])
-                ])
+            if model_has_informer:
+                # 模型期望包含Informer-2特征（45个特征）
+                if inf_proba is not None:
+                    base_features.insert(3, inf_proba)  # +3个
+                    base_features.insert(5, np.array([inf_max_prob]))  # +1个
+                    base_features.insert(9, np.array([inf_entropy]))  # +1个
+                else:
+                    # 如果没有inf_proba，用占位符填充（确保特征数量一致）
+                    base_features.insert(3, np.zeros(3))  # +3个占位符
+                    base_features.insert(5, np.array([0.0]))  # +1个占位符
+                    base_features.insert(9, np.array([0.0]))  # +1个占位符
+                expected_features = 25 + 20  # 45个（基础25+新增20）
             else:
-                # 如果模型期望25个特征（训练时有inf），但回测时没有inf，用0填充inf相关特征
-                # 与训练时保持一致：agreement(1) + max_prob(4) + entropy(4) + avg_proba(3) + prob_std_max(1) = 13个
-                # 其中inf_max_prob和inf_entropy用0填充
-                enhanced_features = np.concatenate([
-                    np.array([agreement]),
-                    np.array([lgb_max_prob, xgb_max_prob, cat_max_prob, 0.0]),  # inf_max_prob用0填充
-                    np.array([lgb_entropy, xgb_entropy, cat_entropy, 0.0]),  # inf_entropy用0填充
-                    avg_proba,  # 3个值
-                    np.array([prob_std_max])
-                ])
+                # 模型不包含Informer-2特征（40个特征）
+                expected_features = 20 + 20  # 40个（基础20+新增20）
+            
+            # 新增特征
+            enhanced_features = [
+                np.array([lgb_xgb_diff, lgb_cat_diff, xgb_cat_diff]),  # 3个
+                np.array([pred_disagreement, agreement_strength, max_disagreement_pairs]),  # 3个
+                np.array([prob_q25, prob_q50, prob_q75]),  # 3个
+                np.array([prob_skew, prob_kurt]),  # 2个
+                np.array([prob_top, prob_second, prob_gap]),  # 3个
+                np.array([class_confidence_short, class_confidence_hold, class_confidence_long]),  # 3个
+                np.array([class_consensus_short, class_consensus_long, class_prob_variance])  # 3个
+            ]
             
             # 合并所有特征
-            all_features = np.concatenate([meta_features, enhanced_features])
+            all_features = np.concatenate(base_features + enhanced_features)
+            
+            # 验证特征数量
+            assert len(all_features) == expected_features, \
+                f"元特征数量错误: {len(all_features)} != {expected_features}"
             
             return all_features.reshape(1, -1)
             
         except Exception as e:
-            logger.error(f"❌ 增强元特征生成失败: {e}")
-            # 返回默认特征（与训练时保持一致：如果有inf是25个，否则是20个）
-            # 这里使用25个以确保与训练时一致（如果模型期望25个特征）
-            default_features = np.zeros(25)  # 12 + 13（有inf的情况）
+            logger.error(f"❌ 增强元特征生成失败: {e}", exc_info=True)
+            # 返回默认特征（与训练时保持一致）
+            if 'inf' in models:
+                default_features = np.zeros(45)  # 45个特征（基础25+新增20）
+            else:
+                default_features = np.zeros(40)  # 40个特征（基础20+新增20）
             return default_features.reshape(1, -1)
 
     def _get_recent_performance(self) -> Dict[str, float]:

@@ -355,15 +355,18 @@ ENSEMBLE_META_HOLD_PENALTY_WEIGHTS = {0.60: 0.45, 0.50: 0.55, 0.40: 0.65, 0.0: 0
 ENSEMBLE_META_TIME_DECAY_FACTOR = 0.1
 ENSEMBLE_MAX_SPLITS = 5
 ENSEMBLE_META_LEARNER_PARAMS = {
-    "n_estimators": 150,
-    "max_depth": 6,
-    "learning_rate": 0.05,
-    "num_leaves": 31,
-    "min_child_samples": 20,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "reg_alpha": 0.1,
-    "reg_lambda": 0.1,
+    # Phase 2修复：优化元学习器配置（防过拟合，提升泛化能力）
+    "n_estimators": 200,  # 增加（更强大）
+    "max_depth": 5,  # 降低（防过拟合）
+    "learning_rate": 0.03,  # 降低（更稳定）
+    "num_leaves": 24,  # 降低（防过拟合，2^5-1=31 → 2^4.5≈24）
+    "min_child_samples": 30,  # 增加（防过拟合）
+    "subsample": 0.7,  # 降低（防过拟合）
+    "colsample_bytree": 0.7,  # 降低（防过拟合）
+    "reg_alpha": 0.3,  # 增加（更强正则化）
+    "reg_lambda": 0.3,  # 增加（更强正则化）
+    "feature_fraction": 0.8,  # 新增（特征采样，防过拟合）
+    "bagging_freq": 5,  # 新增（Bagging频率）
     "random_state": 42,
     "verbose": -1
 }
