@@ -92,13 +92,14 @@ class TrainingResponse(BaseResponse):
 # 回测相关模型
 class BacktestRequest(BaseModel):
     """回测请求"""
-    symbol: Optional[str] = BACKTEST_DEFAULT_SYMBOL
-    days: int = BACKTEST_DEFAULT_DAYS
-    initial_balance: float = BACKTEST_INITIAL_BALANCE
-    leverage: float = BACKTEST_DEFAULT_LEVERAGE
-    primary_timeframe: str = BACKTEST_DEFAULT_PRIMARY_TIMEFRAME
-    timeframes: Optional[List[str]] = BACKTEST_DEFAULT_TIMEFRAMES
-    include_trades: bool = False
+    symbol: Optional[str] = Field(default=BACKTEST_DEFAULT_SYMBOL)
+    days: int = Field(default=BACKTEST_DEFAULT_DAYS)
+    initial_balance: Optional[float] = Field(default=BACKTEST_INITIAL_BALANCE)  # 🎯 支持 None（累积模式）
+    leverage: float = Field(default=BACKTEST_DEFAULT_LEVERAGE)
+    primary_timeframe: str = Field(default=BACKTEST_DEFAULT_PRIMARY_TIMEFRAME)
+    timeframes: Optional[List[str]] = Field(default_factory=lambda: BACKTEST_DEFAULT_TIMEFRAMES.copy())
+    include_trades: bool = Field(default=False)
+    cumulative_mode: bool = Field(default=False)  # 🎯 新增：是否使用累积模式（余额累积）
 
 class BacktestTrade(BaseModel):
     """回测交易明细"""
@@ -107,8 +108,10 @@ class BacktestTrade(BaseModel):
     side: str
     entry_price: float
     exit_price: float
+    position_value: float  # 🎯 开仓金额
     pnl: float
     pnl_percent: float
+    balance_after: float  # 🎯 平仓后余额
     reason: str
 
 class BacktestResult(BaseModel):

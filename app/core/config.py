@@ -11,6 +11,14 @@ try:
 except ImportError:
     from pydantic import BaseSettings
 
+# Local App
+from app.core.constants import (
+    DEFAULT_SYMBOL,
+    DEFAULT_LEVERAGE,
+    DEFAULT_CONFIDENCE_THRESHOLD,
+    DEFAULT_TIMEFRAMES
+)
+
 class Settings(BaseSettings):
     """系统配置"""
     
@@ -28,16 +36,14 @@ class Settings(BaseSettings):
     PROXY_PORT: int = 10808  # 代理端口（SOCKS5通常10808，HTTP通常10809）
     PROXY_TYPE: str = "socks5"  # 代理类型：http, https, socks5（V2Ray SOCKS5用socks5，HTTP用http）
     
-    # 交易配置
-    SYMBOL: str = "BTC/USDT"  # 使用标准格式，系统会自动转换为交易所格式
-    LEVERAGE: int = 50  # 🔥 提高杠杆到50倍
-    CONFIDENCE_THRESHOLD: float = 0.55  # 🔥 提高阈值到0.55以提高信号质量（目标胜率>60%，追求超高胜率）
+    # 🎯 交易配置（从 constants.py 读取默认值，确保回测和模拟交易一致）
+    SYMBOL: str = DEFAULT_SYMBOL  # 默认交易对
+    LEVERAGE: int = DEFAULT_LEVERAGE  # 杠杆倍数（回测和模拟交易都使用）
+    CONFIDENCE_THRESHOLD: float = DEFAULT_CONFIDENCE_THRESHOLD  # 置信度阈值（回测和模拟交易都使用）
+    TIMEFRAMES: list = DEFAULT_TIMEFRAMES  # 多时间框架配置（回测和模拟交易都使用）
     
     # 交易模式配置
     TRADING_MODE: str = "SIGNAL_ONLY"  # 默认交易模式：SIGNAL_ONLY（信号模式/虚拟交易）或 AUTO（自动交易/实盘）
-    
-    # 时间框架配置（以5m为主，3m和15m为辅助）
-    TIMEFRAMES: list = ["3m", "5m", "15m"]
     
     # PostgreSQL + TimescaleDB 配置
     PG_HOST: str = "172.22.22.93"
@@ -92,6 +98,19 @@ class Settings(BaseSettings):
         # 验证交易所配置
         self.validate_exchange_config()
         
+        # 🎯 验证配置一致性（确保与 constants.py 一致）
+        logger = logging.getLogger(__name__)
+        if self.LEVERAGE != DEFAULT_LEVERAGE:
+            logger.warning(f"⚠️ 杠杆倍数配置不一致: config.py={self.LEVERAGE}, constants.py={DEFAULT_LEVERAGE}")
+            logger.warning(f"   建议: 使用 constants.py 的默认值 {DEFAULT_LEVERAGE}，确保回测和模拟交易一致")
+        
+        if self.CONFIDENCE_THRESHOLD != DEFAULT_CONFIDENCE_THRESHOLD:
+            logger.warning(f"⚠️ 置信度阈值配置不一致: config.py={self.CONFIDENCE_THRESHOLD}, constants.py={DEFAULT_CONFIDENCE_THRESHOLD}")
+            logger.warning(f"   建议: 使用 constants.py 的默认值 {DEFAULT_CONFIDENCE_THRESHOLD}，确保回测和模拟交易一致")
+        
+        if self.TIMEFRAMES != DEFAULT_TIMEFRAMES:
+            logger.warning(f"⚠️ 多时间框架配置不一致: config.py={self.TIMEFRAMES}, constants.py={DEFAULT_TIMEFRAMES}")
+            logger.warning(f"   建议: 使用 constants.py 的默认值 {DEFAULT_TIMEFRAMES}，确保回测和模拟交易一致")
         
         # 如果有错误，抛出异常
         if errors:

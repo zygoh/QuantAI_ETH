@@ -33,9 +33,8 @@ from numpy.lib.format import open_memmap
 
 # Local application imports
 from app.model.base.ml_service import MLService
-from app.core.config import settings
-from app.core.constants import GMADL_ALPHA, GMADL_BETA, USE_GMADL_LOSS
 from app.core.cache import cache_manager
+from app.core.config import settings
 from app.core.constants import (
     ENSEMBLE_FALLBACK_WEIGHTS,
     ENSEMBLE_MAX_SPLITS,
@@ -44,6 +43,10 @@ from app.core.constants import (
     ENSEMBLE_META_TIME_DECAY_FACTOR,
     ENSEMBLE_TRAIN_SPLIT_RATIO,
     ENSEMBLE_VAL_SPLIT_RATIO,
+    GMADL_ALPHA,
+    GMADL_BETA,
+    GRAD_SCALER_GROWTH_FACTOR,
+    GRAD_SCALER_GROWTH_INTERVAL,
     INFORMER_BATCH_SIZE,
     INFORMER_D_MODEL,
     INFORMER_EPOCHS,
@@ -60,7 +63,8 @@ from app.core.constants import (
     OPTUNA_N_TRIALS,
     OPTUNA_TIMEOUT_SECONDS,
     TRAINING_BASE_DAYS_CONFIG,
-    TRAINING_DAYS_MULTIPLIER
+    TRAINING_DAYS_MULTIPLIER,
+    USE_GMADL_LOSS
 )
 from app.model.optimizers.hyperparameter_optimizer import HyperparameterOptimizer
 from app.services.direction_consistency_checker import TradingDirectionConsistencyChecker, ConsistencyCheck
@@ -2311,7 +2315,6 @@ class EnsembleMLService(MLService):
                 
                 # ✅ 修复：使用新的torch.amp.GradScaler API（PyTorch 2.0+）
                 # 🔧 优化：使用全局常量配置，更保守的增长策略
-                from app.core.constants import GRAD_SCALER_GROWTH_FACTOR, GRAD_SCALER_GROWTH_INTERVAL
                 scaler = torch.amp.GradScaler(
                     'cuda',
                     init_scale=init_scale,  # 动态调整的初始缩放
@@ -3502,6 +3505,8 @@ class EnsembleMLService(MLService):
         """启动集成ML服务"""
         try:
             logger.info("启动Stacking集成机器学习服务...")
+            # ✅ 健康检查依赖：标记服务运行状态
+            self.is_running = True
             
             # 尝试加载已有集成模型
             all_loaded = True
@@ -3518,6 +3523,7 @@ class EnsembleMLService(MLService):
             logger.info("Stacking集成ML服务启动完成（训练由scheduler管理）")
             
         except Exception as e:
+            self.is_running = False
             logger.error(f"❌ 集成ML服务启动失败: {e}")
             raise
 

@@ -15,20 +15,23 @@ logger = logging.getLogger(__name__)
 def compute_effective_sample_weights(
     y: pd.Series, 
     timeframe: str,
-    hold_multiplier: float = 15.0
+    hold_multiplier: float = None  # 保留参数以保持接口兼容性，但不再使用
 ) -> np.ndarray:
     """
     使用有效样本数(Effective Number of Samples)计算样本权重
     
-    增强版：对HOLD类别应用额外的权重倍数，提升HOLD识别能力
+    🔑 关键修复：移除双重加权问题
+    - HOLD 权重倍数只在损失函数（custom_objectives.py）中应用
+    - 此函数只计算基于有效样本数的基础类别权重
+    - 避免双重加权导致 HOLD 权重倍数过高（15x × 15x = 225x）
     
     Args:
         y: 标签Series或ndarray，取值{0: SHORT, 1: HOLD, 2: LONG}
         timeframe: 时间框架
-        hold_multiplier: HOLD类别额外权重倍数（默认15.0）
+        hold_multiplier: 已废弃，保留参数以保持接口兼容性
     
     Returns:
-        每个样本的权重向量
+        每个样本的权重向量（仅基于有效样本数，不包含 HOLD 倍数）
     """
     try:
         y_np = y.values if hasattr(y, 'values') else y
@@ -44,28 +47,29 @@ def compute_effective_sample_weights(
         else:
             beta = min(EFFECTIVE_SAMPLE_BETA_NON_3M, 1.0 - 1.0 / (total + 1))
         
-        # 计算有效样本数权重
+        # 计算有效样本数权重（基于类别不平衡）
         effective_num = (1.0 - np.power(beta, counts)) / (1.0 - beta)
         class_weights = 1.0 / effective_num
         class_weights = class_weights / class_weights.sum() * len(classes)
         
-        # 🔑 关键增强：对HOLD类别（类别1）应用额外倍数
-        class_weights[1] *= hold_multiplier
+        # 🔑 关键修复：移除双重加权
+        # HOLD 权重倍数只在损失函数（custom_objectives.py）中应用一次
+        # 此处只返回基于有效样本数的基础类别权重
+        # ❌ 已移除：class_weights[1] *= hold_multiplier
         
-        # 重新归一化（可选，保持权重总和一致）
-        # class_weights = class_weights / class_weights.sum() * len(classes)
-        
+        # 构建样本权重映射
         weight_map = {c: class_weights[i] for i, c in enumerate(classes)}
         sample_weights = np.array([weight_map[int(label)] for label in y_np], dtype=np.float64)
         
-        # 记录权重信息
+        # 记录权重信息（用于调试）
         hold_count = int(counts[1])
         hold_ratio = hold_count / total
-        logger.debug(f"📊 类别权重计算完成:")
+        logger.debug(f"📊 有效样本数权重计算完成:")
         logger.debug(f"   SHORT权重: {class_weights[0]:.4f}")
-        logger.debug(f"   HOLD权重:  {class_weights[1]:.4f} (×{hold_multiplier}倍)")
+        logger.debug(f"   HOLD权重:  {class_weights[1]:.4f} (仅基础权重，倍数在损失函数中应用)")
         logger.debug(f"   LONG权重:  {class_weights[2]:.4f}")
         logger.debug(f"   HOLD样本比例: {hold_ratio:.2%} ({hold_count}/{total})")
+        logger.debug(f"   Beta参数: {beta:.6f}")
         
         return sample_weights
     except Exception as e:
@@ -75,17 +79,22 @@ def compute_effective_sample_weights(
 
 def compute_class_weights_dict(
     y: np.ndarray,
-    hold_multiplier: float = 15.0,
+    hold_multiplier: float = None,  # 保留参数以保持接口兼容性，但不再使用
     beta: float = 0.999
 ) -> dict:
     """
     计算类别权重字典（用于模型训练）
     
-    使用Effective Number of Samples方法，并对HOLD类别应用额外倍数
+    使用Effective Number of Samples方法计算基础类别权重
+    
+    🔑 关键修复：移除双重加权问题
+    - HOLD 权重倍数只在损失函数（custom_objectives.py）中应用
+    - 此函数只计算基于有效样本数的基础类别权重
+    - 避免双重加权导致 HOLD 权重倍数过高（15x × 15x = 225x）
     
     Args:
         y: 标签数组，取值{0: SHORT, 1: HOLD, 2: LONG}
-        hold_multiplier: HOLD类别额外权重倍数（默认15.0）
+        hold_multiplier: 已废弃，保留参数以保持接口兼容性
         beta: 平滑参数（默认0.999）
     
     Returns:
@@ -113,22 +122,18 @@ def compute_class_weights_dict(
             if cls not in class_weights:
                 class_weights[cls] = 1.0
         
-        # 🔑 关键修复：应用hold_multiplier并确保至少是其他类别的hold_multiplier倍
-        # 方法1：直接乘以倍数
-        hold_weight_multiplied = class_weights[1] * hold_multiplier
+        # 🔑 关键修复：移除双重加权
+        # HOLD 权重倍数只在损失函数（custom_objectives.py）中应用一次
+        # 此处只返回基于有效样本数的基础类别权重
+        # ❌ 已移除以下代码：
+        # hold_weight_multiplied = class_weights[1] * hold_multiplier
+        # non_hold_max_weight = max(class_weights.get(0, 1.0), class_weights.get(2, 1.0))
+        # hold_weight_min = non_hold_max_weight * hold_multiplier
+        # class_weights[1] = max(hold_weight_multiplied, hold_weight_min)
         
-        # 方法2：确保至少是其他类别的hold_multiplier倍
-        non_hold_max_weight = max(
-            class_weights.get(0, 1.0),
-            class_weights.get(2, 1.0)
-        )
-        hold_weight_min = non_hold_max_weight * hold_multiplier
-        
-        # 取两者中的较大值，确保两个条件都满足
-        class_weights[1] = max(hold_weight_multiplied, hold_weight_min)
-        
-        logger.debug(f"📊 类别权重字典: SHORT={class_weights[0]:.4f}, "
-                    f"HOLD={class_weights[1]:.4f}, LONG={class_weights[2]:.4f}")
+        logger.debug(f"📊 类别权重字典计算完成: SHORT={class_weights[0]:.4f}, "
+                    f"HOLD={class_weights[1]:.4f} (仅基础权重，倍数在损失函数中应用), "
+                    f"LONG={class_weights[2]:.4f}")
         
         return class_weights
     except Exception as e:

@@ -94,6 +94,9 @@ class ProbSparseSelfAttention(nn.Module):
         B, H, L_Q, d = Q.shape
         _, _, L_K, _ = K.shape
         
+        # 🔧 边界情况处理：确保 sample_k 至少为 1
+        sample_k = max(1, min(sample_k, L_K))
+        
         # 1. 计算Query的Sparsity Measurement
         # 随机采样K个Key
         K_sample = K[:, :, torch.randperm(L_K)[:sample_k], :]  # (B, H, sample_k, d)
@@ -103,7 +106,12 @@ class ProbSparseSelfAttention(nn.Module):
         
         # 2. 计算Query的重要性（Sparsity Score）
         # M(q_i) = max(Q·K) - mean(Q·K)
-        M = Q_K.max(dim=-1)[0] - Q_K.mean(dim=-1)  # (B, H, L_Q)
+        # 🔧 边界情况处理：当 sample_k = 1 时，max 和 mean 相同，M 为 0
+        if sample_k == 1:
+            # 所有 Query 重要性相同，直接选择最后 n_top 个（包含最后时间步）
+            M = torch.zeros(B, H, L_Q, device=Q.device, dtype=Q.dtype)
+        else:
+            M = Q_K.max(dim=-1)[0] - Q_K.mean(dim=-1)  # (B, H, L_Q)
         
         # 3. 选择Top-N个重要的Query
         M_top = M.topk(n_top, dim=-1)[1]  # (B, H, n_top)
@@ -431,7 +439,7 @@ class Informer2ForClassification(nn.Module):
         1. 输入投影：特征维度转换
         2. 多层Encoder：ProbSparse自注意力处理（支持梯度检查点）
         3. 蒸馏层：序列长度压缩，提取关键信息（支持梯度检查点）
-        4. 全局池化：聚合序列信息
+        4. Last Step Pooling：提取最后时间步（捕捉突破信号）
         5. 分类头：输出类别概率
         
         Args:
@@ -440,6 +448,15 @@ class Informer2ForClassification(nn.Module):
         Returns:
             logits: (batch, n_classes) - 分类logits
         """
+        # 🔒 严格模式：输入维度验证
+        if len(x.shape) != 3:
+            raise ValueError(
+                f"❌ 输入维度错误：期望 (batch, seq_len, n_features)，"
+                f"实际 {x.shape}"
+            )
+        
+        batch_size = x.shape[0]
+        
         # 1. 输入投影：(batch, seq_len, n_features) → (batch, seq_len, d_model)
         x = self.input_projection(x)
         
@@ -461,11 +478,30 @@ class Informer2ForClassification(nn.Module):
                 else:
                     x = self.distilling_layers[i](x)  # (batch, seq_len//4, d_model)
         
-        # 3. 全局池化（聚合序列信息）
-        x = x.mean(dim=1)  # (batch, d_model)
+        # 3. Last Step Pooling（提取最后时间步）
+        # 🎯 关键修复：使用最后时间步而非平均池化
+        # 原因：
+        # - 平均池化会稀释当前时间步的信号，导致反应迟钝
+        # - 最后时间步包含最新的市场信息，能够捕捉价格突破等瞬时信号
+        # - 对于交易信号预测，当前时刻的信息最重要，历史信息已经通过注意力机制融合
+        x = x[:, -1, :]  # (batch, d_model) - 提取最后时间步
+        
+        # 🔒 严格模式：中间维度验证
+        if x.shape != (batch_size, self.d_model):
+            raise ValueError(
+                f"❌ Last step pooling 后维度错误：期望 ({batch_size}, {self.d_model})，"
+                f"实际 {x.shape}"
+            )
         
         # 4. 分类
         logits = self.classifier(x)  # (batch, n_classes)
+        
+        # 🔒 严格模式：输出维度验证
+        if logits.shape != (batch_size, self.n_classes):
+            raise ValueError(
+                f"❌ 输出维度错误：期望 ({batch_size}, {self.n_classes})，"
+                f"实际 {logits.shape}"
+            )
         
         return logits
     

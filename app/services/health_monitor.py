@@ -515,11 +515,10 @@ class HealthMonitor:
         try:
             exchange_client = ExchangeFactory.get_current_client()
             
-            # 检查WebSocket连接状态
-            ws_connected = False
-            if hasattr(exchange_client, 'ws_client') and exchange_client.ws_client:
-                if hasattr(exchange_client.ws_client, 'is_connected'):
-                    ws_connected = exchange_client.ws_client.is_connected
+            # ✅ 严格模式：交易所 WebSocket 连接状态以“数据源单例”作为唯一口径
+            # 原因：系统实时数据来自 binance_ws_client（用于 signal_generator 缓冲区）
+            # 如果这里检查 exchange_client.ws_client（UMFuturesWebsocketClient）会造成误判：缓冲区✅但exchange ws❌
+            ws_connected = bool(getattr(binance_ws_client, "is_connected", False))
             
             # 检查REST API连接（通过检查market_api是否存在）
             rest_connected = False
@@ -566,8 +565,14 @@ class HealthMonitor:
                     ml_service = self.signal_generator.ml_service
                     if ml_service:
                         ml_service_running = getattr(ml_service, 'is_running', False)
-                        if hasattr(ml_service, 'models'):
-                            model_loaded = len(ml_service.models) > 0
+                        # ✅ 兼容 Stacking 集成服务：优先检查 ensemble_models，其次检查 models
+                        if hasattr(ml_service, 'ensemble_models'):
+                            try:
+                                model_loaded = len(getattr(ml_service, 'ensemble_models', {}) or {}) > 0
+                            except Exception:
+                                model_loaded = False
+                        elif hasattr(ml_service, 'models'):
+                            model_loaded = len(getattr(ml_service, 'models', {}) or {}) > 0
                         if hasattr(ml_service, 'training_task'):
                             training_in_progress = ml_service.training_task is not None and not ml_service.training_task.done()
             

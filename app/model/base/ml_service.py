@@ -28,6 +28,7 @@ from app.core.config import settings
 from app.core.constants import (
     FEATURE_IMPORTANCE_THRESHOLD_HIGH,
     FEATURE_IMPORTANCE_THRESHOLD_LOW,
+    HOLD_WEIGHT_MULTIPLIER,
     LABEL_PT_SL_CONFIG,
     LABEL_VOLATILITY_DEFAULT,
     LABEL_VOLATILITY_MIN,
@@ -155,7 +156,6 @@ class MLService:
         """
         if hold_multiplier is None:
             # 从constants读取默认值
-            from app.core.constants import HOLD_WEIGHT_MULTIPLIER
             hold_multiplier = HOLD_WEIGHT_MULTIPLIER
         
         return compute_effective_sample_weights(y, timeframe, hold_multiplier=hold_multiplier)
@@ -1001,13 +1001,123 @@ class MLService:
             selected = list(feature_importance.keys())[:top_n]
             return selected
     
-    def _scale_features(self, X: pd.DataFrame, timeframe: str, fit: bool = False) -> np.ndarray:
-        """特征缩放（多时间框架独立Scaler）
+    def _rolling_scale_features(
+        self, 
+        X: pd.DataFrame, 
+        window_size: int, 
+        timeframe: str
+    ) -> np.ndarray:
+        """
+        使用滚动窗口标准化特征（避免数据泄露）
+        
+        核心原理：
+        - 对于时间点 t，只使用 [t-window_size+1, t] 的历史数据计算均值和标准差
+        - 不使用未来数据（t+1, t+2, ...），确保时序数据无泄露
+        - 当遇到新高/新低时，模型仍能正常预测（因为使用最近窗口的统计量）
+        
+        Args:
+            X: 特征DataFrame（时间序列数据，按时间升序排列）
+            window_size: 滚动窗口大小（从 constants.py 读取 ROLLING_SCALER_WINDOW_SIZE）
+            timeframe: 时间框架（用于日志）
+        
+        Returns:
+            缩放后的特征数组（numpy.ndarray）
+        
+        边界情况处理：
+        - 如果数据量 < window_size：使用全部数据计算统计量（降级方案）
+        - 如果标准差为 0：使用 1e-10 避免除零错误
+        """
+        try:
+            n_samples = len(X)
+            
+            # 边界情况：数据量小于窗口大小
+            # 注意：即使数据量小于窗口大小，我们也使用滚动窗口（扩展窗口）
+            # 而不是全局统计量，以避免数据泄露
+            if n_samples < window_size:
+                logger.warning(
+                    f"⚠️ {timeframe} 数据量 {n_samples} 小于窗口大小 {window_size}，"
+                    f"使用扩展窗口（避免数据泄露）"
+                )
+                # 将窗口大小调整为数据量，这样就会使用扩展窗口
+                window_size = n_samples
+            
+            # 正常情况：使用滚动窗口标准化
+            X_scaled = np.zeros_like(X.values, dtype=np.float64)
+            
+            # 对于前 window_size 个样本，使用扩展窗口（从第1个到当前）
+            for i in range(window_size):
+                # 使用 [0, i+1] 的数据计算统计量
+                window_data = X.iloc[:i+1]
+                rolling_mean = window_data.mean().values  # 转换为 numpy 数组
+                rolling_std = window_data.std(ddof=1).values  # 使用 ddof=1（样本标准差）
+                
+                # 🔑 关键修复：处理 NaN 标准差（当窗口大小为 1 时）
+                rolling_std = np.where(np.isnan(rolling_std), 0.0, rolling_std)
+                
+                # 🔑 关键修复：标准差为 0 时，标准化结果应该为 0
+                # 原因：标准差为 0 表示窗口内所有值相同，(x - mean) / std = 0 / 0 应该定义为 0
+                # 边界情况：第一个样本（i=0）、窗口大小为 1、常量特征
+                current_values = X.iloc[i].values
+                
+                # 使用 np.where 向量化处理，避免除零
+                X_scaled[i] = np.where(
+                    (rolling_std == 0) | (rolling_std < 1e-10),
+                    0.0,  # 标准差为 0 时返回 0
+                    (current_values - rolling_mean) / rolling_std  # 标准差非 0 时正常标准化
+                )
+            
+            # 对于后续样本，使用固定大小的滚动窗口
+            for i in range(window_size, n_samples):
+                # 使用 [i-window_size+1, i+1] 的数据计算统计量（包含当前样本）
+                window_data = X.iloc[i-window_size+1:i+1]
+                rolling_mean = window_data.mean().values  # 转换为 numpy 数组
+                rolling_std = window_data.std(ddof=1).values  # 使用 ddof=1（样本标准差）
+                
+                # 🔑 关键修复：处理 NaN 标准差（理论上不应该发生，但为了安全）
+                rolling_std = np.where(np.isnan(rolling_std), 0.0, rolling_std)
+                
+                # 🔑 关键修复：标准差为 0 时，标准化结果应该为 0
+                current_values = X.iloc[i].values
+                
+                X_scaled[i] = np.where(
+                    (rolling_std == 0) | (rolling_std < 1e-10),
+                    0.0,  # 标准差为 0 时返回 0
+                    (current_values - rolling_mean) / rolling_std  # 标准差非 0 时正常标准化
+                )
+            
+            logger.debug(
+                f"✅ {timeframe} 滚动窗口标准化完成: "
+                f"样本数={n_samples}, 窗口大小={window_size}"
+            )
+            
+            return X_scaled
+            
+        except Exception as e:
+            logger.error(f"❌ {timeframe} 滚动窗口标准化失败: {e}", exc_info=True)
+            # 降级：使用全局标准化
+            logger.warning(f"⚠️ {timeframe} 降级到全局标准化")
+            scaler = StandardScaler()
+            return scaler.fit_transform(X)
+    
+    def _scale_features(
+        self, 
+        X: pd.DataFrame, 
+        timeframe: str, 
+        fit: bool = False,
+        use_rolling: bool = False
+    ) -> np.ndarray:
+        """
+        特征缩放（多时间框架独立Scaler）
+        
+        支持两种模式：
+        1. 传统模式（use_rolling=False）：使用全局 StandardScaler（训练集的均值/标准差）
+        2. 滚动窗口模式（use_rolling=True）：使用滚动窗口计算均值/标准差（避免数据泄露）
         
         Args:
             X: 特征DataFrame
             timeframe: 时间框架（必需）
-            fit: 是否拟合新的scaler
+            fit: 是否拟合新的scaler（仅在传统模式下有效）
+            use_rolling: 是否使用滚动窗口模式（默认 False，保持向后兼容）
             
         Returns:
             缩放后的特征数组
@@ -1059,6 +1169,16 @@ class MLService:
                 logger.error(f"❌ {timeframe} 特征数据为空，无法进行缩放")
                 raise ValueError(f"{timeframe} 特征数据为空，无法进行缩放")
             
+            # 🎯 滚动窗口模式：避免数据泄露（用于 Informer-2 训练和预测）
+            if use_rolling:
+                from app.core.constants import ROLLING_SCALER_WINDOW_SIZE
+                logger.debug(
+                    f"📊 {timeframe} 使用滚动窗口标准化模式 "
+                    f"(window_size={ROLLING_SCALER_WINDOW_SIZE})"
+                )
+                return self._rolling_scale_features(X, ROLLING_SCALER_WINDOW_SIZE, timeframe)
+            
+            # 🎯 传统模式：使用全局 StandardScaler（保持向后兼容）
             # 每个时间框架独立的scaler
             # 🔧 修复：支持字典结构的scaler（用于Informer-2）
             if fit or timeframe not in self.scalers or self.scalers[timeframe] is None:

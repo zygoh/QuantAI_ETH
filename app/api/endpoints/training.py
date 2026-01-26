@@ -123,14 +123,18 @@ async def run_backtest(
         }
         
         logger.info(f"🚀 创建回测任务: {task_id} | {symbol} {request.days}天 | "
-                   f"初始资金={request.initial_balance} | 杠杆={request.leverage}x")
+                   f"初始资金={request.initial_balance} | 杠杆={request.leverage}x | "
+                   f"累积模式={'是' if request.cumulative_mode else '否'}")
+        
+        # 🎯 累积模式：initial_balance 设为 None，从 Redis 读取上次余额
+        actual_initial_balance = None if request.cumulative_mode else request.initial_balance
         
         # ✅ 后台异步执行回测（不阻塞接口返回）
         asyncio.create_task(_execute_backtest_task(
             task_id=task_id,
             symbol=symbol,
             days=request.days,
-            initial_balance=request.initial_balance,
+            initial_balance=actual_initial_balance,
             leverage=request.leverage,
             primary_timeframe=request.primary_timeframe,
             timeframes=request.timeframes,
@@ -159,23 +163,28 @@ async def _execute_backtest_task(
     task_id: str,
     symbol: str,
     days: int,
-    initial_balance: float,
+    initial_balance: Optional[float],  # 🎯 支持 None（累积模式）
     leverage: float,
     primary_timeframe: str,
     timeframes: Optional[list],
     include_trades: bool
 ):
-    """后台执行回测任务"""
+    """后台执行回测任务（在独立线程中执行，完全不阻塞主事件循环）"""
     try:
         # 更新任务状态为运行中
         if task_id in _backtest_tasks:
             _backtest_tasks[task_id]['status'] = 'running'
             _backtest_tasks[task_id]['started_at'] = datetime.now().isoformat()
         
-        logger.info(f"🔄 开始执行回测任务: {task_id}")
+        mode_desc = "累积模式（余额累积）" if initial_balance is None else f"独立模式（初始余额={initial_balance}）"
+        logger.info(f"🔄 开始执行回测任务: {task_id}（{mode_desc}，独立线程执行，完全不阻塞实时预测）")
         
-        # 执行回测
-        result = await backtest_service.run_backtest(
+        # ✅ 在独立线程中执行回测（创建新的事件循环）
+        # 这样数据库操作在新的事件循环中执行，不会冲突
+        from app.core.executor import global_executor
+        
+        result = await global_executor.run_async_in_thread(
+            backtest_service.run_backtest,
             symbol=symbol,
             days=days,
             initial_balance=initial_balance,
@@ -194,6 +203,11 @@ async def _execute_backtest_task(
         logger.info(f"✅ 回测任务完成: {task_id} | 胜率={result.get('win_rate', 0):.2%} | "
                    f"总收益={result.get('total_return', 0):.2%} | "
                    f"交易次数={result.get('total_trades', 0)}")
+        
+        # 🎯 独立回测模式：自动清理累积余额（避免影响下次回测）
+        if initial_balance is not None:
+            backtest_service.reset_backtest_balance()
+            logger.info(f"🔄 独立回测模式：已自动清理累积余额")
         
     except Exception as e:
         # 更新任务状态为失败

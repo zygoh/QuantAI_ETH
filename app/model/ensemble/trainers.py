@@ -14,6 +14,7 @@ import xgboost as xgb
 from catboost import CatBoostClassifier
 
 # Local App
+from app.core.constants import HOLD_WEIGHT_MULTIPLIER
 from app.model.ensemble.informer_wrapper import InformerWrapper
 from app.model.ensemble.utils import clear_gpu_memory
 
@@ -50,16 +51,14 @@ def train_lightgbm(
         class_weights = compute_effective_sample_weights(y_train, timeframe)
         time_decay = np.exp(-np.arange(len(X_train)) / (len(X_train) * 0.1))[::-1]
         
-        hold_ratio = float((y_train == 1).sum()) / max(len(y_train), 1)
-        if timeframe == '3m':
-            hold_weight = float(max(0.35, min(0.70, 0.80 - 0.6 * hold_ratio)))
-        else:
-            hold_weight = float(max(0.50, min(0.75, 0.85 - 0.5 * hold_ratio)))
-        hold_penalty = np.where(y_train == 1, hold_weight, 1.0)
+        # 样本加权：有效样本数 × 时间衰减
+        # 注意：HOLD 权重惩罚只在损失函数中应用（避免双重加权导致模型永远预测 HOLD）
+        sample_weights = class_weights * time_decay
         
-        sample_weights = class_weights * time_decay * hold_penalty
-        
-        logger.info(f"样本加权已启用：有效样本数 × 时间衰减 × HOLD惩罚({hold_weight:.2f})")
+        hold_count = int((y_train == 1).sum())
+        hold_ratio = hold_count / max(len(y_train), 1)
+        logger.info(f"✅ 样本加权已启用：有效样本数 × 时间衰减（HOLD权重×{HOLD_WEIGHT_MULTIPLIER}仅在损失函数中应用）")
+        logger.info(f"📊 HOLD样本: {hold_count}个 ({hold_ratio:.2%})")
         
         if custom_params:
             params = custom_params
@@ -105,14 +104,14 @@ def train_xgboost(
         class_weights = compute_effective_sample_weights(y_train, timeframe)
         time_decay = np.exp(-np.arange(len(X_train)) / (len(X_train) * 0.1))[::-1]
         
-        hold_ratio = float((y_train == 1).sum()) / max(len(y_train), 1)
-        if timeframe == '3m':
-            hold_weight = float(max(0.35, min(0.70, 0.80 - 0.6 * hold_ratio)))
-        else:
-            hold_weight = float(max(0.50, min(0.75, 0.85 - 0.5 * hold_ratio)))
-        hold_penalty = np.where(y_train == 1, hold_weight, 1.0)
+        # 样本加权：有效样本数 × 时间衰减
+        # 注意：HOLD 权重惩罚只在损失函数中应用（避免双重加权导致模型永远预测 HOLD）
+        sample_weights = class_weights * time_decay
         
-        sample_weights = class_weights * time_decay * hold_penalty
+        hold_count = int((y_train == 1).sum())
+        hold_ratio = hold_count / max(len(y_train), 1)
+        logger.info(f"✅ 样本加权已启用：有效样本数 × 时间衰减（HOLD权重×{HOLD_WEIGHT_MULTIPLIER}仅在损失函数中应用）")
+        logger.info(f"📊 HOLD样本: {hold_count}个 ({hold_ratio:.2%})")
         
         if custom_params:
             params = custom_params.copy()
@@ -187,14 +186,14 @@ def train_catboost(
         class_weights = compute_effective_sample_weights(y_train, timeframe)
         time_decay = np.exp(-np.arange(len(X_train)) / (len(X_train) * 0.1))[::-1]
         
-        hold_ratio = float((y_train == 1).sum()) / max(len(y_train), 1)
-        if timeframe == '3m':
-            hold_weight = float(max(0.35, min(0.70, 0.80 - 0.6 * hold_ratio)))
-        else:
-            hold_weight = float(max(0.50, min(0.75, 0.85 - 0.5 * hold_ratio)))
-        hold_penalty = np.where(y_train == 1, hold_weight, 1.0)
+        # 样本加权：有效样本数 × 时间衰减
+        # 注意：HOLD 权重惩罚只在损失函数中应用（避免双重加权导致模型永远预测 HOLD）
+        sample_weights = class_weights * time_decay
         
-        sample_weights = class_weights * time_decay * hold_penalty
+        hold_count = int((y_train == 1).sum())
+        hold_ratio = hold_count / max(len(y_train), 1)
+        logger.info(f"✅ 样本加权已启用：有效样本数 × 时间衰减（HOLD权重×{HOLD_WEIGHT_MULTIPLIER}仅在损失函数中应用）")
+        logger.info(f"📊 HOLD样本: {hold_count}个 ({hold_ratio:.2%})")
         
         if custom_params:
             params = custom_params.copy()

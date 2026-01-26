@@ -25,6 +25,8 @@ from app.services.backtest_service import BacktestService
 from app.services.drawdown_monitor import drawdown_monitor
 from app.services.health_monitor import health_monitor
 from app.core.database import init_database, cleanup_database, close_database
+from app.core.executor import global_executor  # 🆕 全局线程池
+from app.core.gpu_config import log_gpu_config  # 🆕 GPU配置
 
 # 配置日志
 
@@ -90,6 +92,10 @@ async def lifespan(app: FastAPI):
     logger.info("启动量化交易系统...")
 
     try:
+        # 🎮 记录GPU配置
+        if settings.USE_GPU:
+            log_gpu_config()
+        
         # 初始化数据库
         await init_database()
         logger.info("数据库初始化完成")
@@ -113,17 +119,20 @@ async def lifespan(app: FastAPI):
         # 2. 清理Redis缓存
         try:
             cache_patterns = [
-                "market_data:*",
-                "prediction:*",
-                "signal:*",
-                "model_metrics:*",
-                "account_info",
-                "position_info",
-                "risk_metrics",
-                "system_status",
-                "virtual_account:*",
-                "recent_trades:*",
-                "system:trading_mode"
+                "market_data:*",          # 市场数据
+                "prediction:*",           # 模型预测
+                "signal:*",               # 交易信号
+                "model_metrics:*",        # 模型指标
+                "account_info",           # 账户信息
+                "position_info",          # 持仓信息
+                "risk_metrics",           # 风险指标
+                "system_status",          # 系统状态
+                "virtual_account:*",      # 虚拟账户
+                "recent_trades:*",        # 最近交易
+                "system:trading_mode",    # 交易模式
+                "warmup:*",               # 🔥 预热阶段数据（信号计数器等）
+                "alert:*",                # 🔥 健康监控告警
+                "lock:*"                  # 🔥 资源锁
             ]
             
             cleared_count = 0
@@ -150,6 +159,14 @@ async def lifespan(app: FastAPI):
             logger.info("✅ 虚拟账户余额已重置")
         except Exception as e:
             logger.error(f"❌ 虚拟账户余额重置失败: {e}", exc_info=True)
+        
+        # 4. 🔥 重置回测累积余额（内存清理）
+        try:
+            # 注意：backtest_service 在后面才创建，这里只是记录需要重置
+            # 实际重置会在 backtest_service 创建后执行
+            logger.info("✅ 回测累积余额将在服务创建后重置")
+        except Exception as e:
+            logger.error(f"❌ 回测余额重置失败: {e}", exc_info=True)
         
         logger.info("✅ 系统启动清理完成")
         logger.info("=" * 70)
@@ -218,6 +235,10 @@ async def lifespan(app: FastAPI):
         )
         scheduler = TaskScheduler(ml_service, data_service, signal_generator)  # 🔥 传入signal_generator
         backtest_service = BacktestService(ml_service)
+        
+        # 🔥 重置回测累积余额（确保每次启动都是干净状态）
+        backtest_service.reset_backtest_balance()
+        logger.info("✅ 回测累积余额已重置（内存清理）")
 
         # 设置API端点的服务依赖（已移除account端点，仅支持模拟交易）
         from app.api.endpoints import positions, signals, trading, training, performance, system, websocket
@@ -296,6 +317,9 @@ async def lifespan(app: FastAPI):
             await ml_service.stop()
         if data_service:
             await data_service.stop()
+
+        # 关闭全局线程池
+        global_executor.shutdown(wait=True)
 
         # 关闭数据库连接
         await close_database()

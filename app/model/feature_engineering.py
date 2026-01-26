@@ -223,40 +223,145 @@ class FeatureEngineer:
             logger.error(traceback.format_exc())
             return df
     
-    def get_feature_importance(self, df: pd.DataFrame) -> Dict[str, float]:
-        """获取特征重要性（基于方差）"""
+    def _calculate_coefficient_of_variation(self, df: pd.DataFrame, col: str) -> float:
+        """
+        计算变异系数（Coefficient of Variation，尺度无关）
+        
+        变异系数 = 标准差 / |均值|，用于衡量不同尺度特征的相对变异性
+        
+        Args:
+            df: 数据框
+            col: 列名
+            
+        Returns:
+            变异系数（均值接近零时返回标准化后的方差）
+        """
         try:
-            exclude_cols = ['timestamp', 'datetime', 'open', 'high', 'low', 'close', 'volume', 'quote_volume']
-            feature_cols = [col for col in df.columns if col not in exclude_cols]
+            mean_val = df[col].mean()
+            std_val = df[col].std()
             
-            feature_variance = {}
-            for col in feature_cols:
-                if pd.api.types.is_numeric_dtype(df[col]):
-                    variance = df[col].var()
-                    feature_variance[col] = variance if not np.isnan(variance) else 0
+            # 边界情况：均值接近零（如震荡指标中心化后）
+            if abs(mean_val) < 1e-10:
+                logger.debug(f"⚠️ 特征 {col} 均值接近零 ({mean_val:.2e})，使用标准化后的方差")
+                # 使用标准化后的方差作为备选方案
+                if std_val > 1e-10:
+                    normalized = (df[col] - mean_val) / std_val
+                    return normalized.var()
+                else:
+                    return 0.0
             
-            total_variance = sum(feature_variance.values())
-            if total_variance > 0:
-                feature_importance = {k: v/total_variance for k, v in feature_variance.items()}
-            else:
-                feature_importance = feature_variance
-            
-            return dict(sorted(feature_importance.items(), key=lambda x: x[1], reverse=True))
+            # 正常情况：返回变异系数
+            cv = std_val / abs(mean_val)
+            return cv if not np.isnan(cv) else 0.0
             
         except Exception as e:
-            logger.error(f"计算特征重要性失败: {e}")
+            logger.warning(f"⚠️ 计算特征 {col} 的变异系数失败: {e}")
+            return 0.0
+    
+    def get_feature_importance(self, df: pd.DataFrame) -> Dict[str, float]:
+        """
+        获取特征重要性（基于变异系数，尺度无关）
+        
+        修复原因：
+        - 原方法使用原始方差，对尺度敏感（RSI 0-100 vs EMA 90000）
+        - 导致丢弃 RSI、MACD 等重要形态指标
+        - 新方法使用变异系数（CV = std/mean），尺度无关
+        
+        Args:
+            df: 数据框
+            
+        Returns:
+            特征重要性字典（按重要性降序排列）
+        """
+        try:
+            # 排除基础价格和时间列
+            exclude_cols = ['timestamp', 'datetime', 'open', 'high', 'low', 'close', 'volume', 'quote_volume', 'clean_close']
+            feature_cols = [col for col in df.columns if col not in exclude_cols]
+            
+            # 计算每个特征的变异系数
+            feature_cv = {}
+            for col in feature_cols:
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    cv = self._calculate_coefficient_of_variation(df, col)
+                    feature_cv[col] = cv
+            
+            # 归一化：转换为相对重要性（总和为1）
+            total_cv = sum(feature_cv.values())
+            if total_cv > 0:
+                feature_importance = {k: v/total_cv for k, v in feature_cv.items()}
+            else:
+                feature_importance = feature_cv
+            
+            # 按重要性降序排列
+            sorted_importance = dict(sorted(feature_importance.items(), key=lambda x: x[1], reverse=True))
+            
+            return sorted_importance
+            
+        except Exception as e:
+            logger.error(f"❌ 计算特征重要性失败: {e}")
             return {}
     
-    def select_features(self, df: pd.DataFrame, top_n: int = 50) -> List[str]:
-        """选择重要特征"""
+    def select_features(self, df: pd.DataFrame, top_n: int = None) -> List[str]:
+        """
+        选择重要特征（基于变异系数）
+        
+        Args:
+            df: 数据框
+            top_n: 保留的特征数量（默认从 constants.py 读取 FEATURE_SELECTION_TOP_N）
+            
+        Returns:
+            选中的特征列表
+        """
         try:
+            # 如果未指定 top_n，从 constants.py 读取配置
+            if top_n is None:
+                from app.core.constants import FEATURE_SELECTION_TOP_N
+                top_n = FEATURE_SELECTION_TOP_N
+            
+            # 计算特征重要性
             feature_importance = self.get_feature_importance(df)
+            
+            if not feature_importance:
+                logger.warning("⚠️ 特征重要性为空，返回空列表")
+                return []
+            
+            # 选择 top-N 特征
             selected_features = list(feature_importance.keys())[:top_n]
-            logger.debug(f"选择了{len(selected_features)}个重要特征")
+            excluded_features = list(feature_importance.keys())[top_n:]
+            
+            # 📊 记录特征选择结果
+            logger.info(f"✅ 特征选择完成：保留 {len(selected_features)}/{len(feature_importance)} 个特征")
+            
+            # 记录被选中的 top-10 特征及其重要性
+            if len(selected_features) > 0:
+                top_10_selected = selected_features[:10]
+                top_10_scores = [f"{feat}({feature_importance[feat]:.4f})" for feat in top_10_selected]
+                logger.info(f"📊 Top-10 选中特征: {', '.join(top_10_scores)}")
+            
+            # 记录被排除的特征（仅记录前5个）
+            if len(excluded_features) > 0:
+                excluded_sample = excluded_features[:5]
+                excluded_scores = [f"{feat}({feature_importance[feat]:.4f})" for feat in excluded_sample]
+                logger.debug(f"🚫 排除特征示例（前5个）: {', '.join(excluded_scores)}")
+            
+            # 检查重要形态指标是否被保留
+            important_indicators = ['RSI', 'MACD', 'Stochastic', 'ADX', 'ATR', 'BB', 'CCI']
+            preserved_indicators = []
+            for indicator in important_indicators:
+                matching_features = [f for f in selected_features if indicator.lower() in f.lower()]
+                if matching_features:
+                    preserved_indicators.append(f"{indicator}({len(matching_features)})")
+            
+            if preserved_indicators:
+                logger.info(f"✅ 保留的形态指标: {', '.join(preserved_indicators)}")
+            else:
+                logger.warning("⚠️ 未检测到常见形态指标（RSI/MACD等），请检查特征工程")
+            
             return selected_features
             
         except Exception as e:
-            logger.error(f"特征选择失败: {e}")
+            logger.error(f"❌ 特征选择失败: {e}")
+            logger.error(traceback.format_exc())
             return []
 
 

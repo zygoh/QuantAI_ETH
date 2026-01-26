@@ -30,13 +30,19 @@ from app.core.constants import (
     RISK_VAR_LIMIT_PCT,
     VAR_CONFIDENCE,
     POSITION_MAX_SIZE,
-    STOP_LOSS_PCT_FALLBACK,
-    TAKE_PROFIT_PCT_FALLBACK
+    STOP_LOSS_PCT,
+    TAKE_PROFIT_PCT,
+    STOP_LOSS_ATR_MULTIPLIER,
+    TAKE_PROFIT_ATR_MULTIPLIER
 )
 from app.core.database import postgresql_manager
 from app.exchange.base_exchange_client import UnifiedKlineData
 from app.exchange.exchange_factory import ExchangeFactory
 from app.services.data_service import DataService
+from app.services.risk_calculations import (
+    calculate_atr_based_stop_levels,
+    calculate_fixed_pct_stop_levels,
+)
 from app.trading.position_manager import position_manager
 
 logger = logging.getLogger(__name__)
@@ -621,12 +627,16 @@ class RiskService:
         confidence: float
     ) -> Dict[str, float]:
         """
-        动态止损止盈计算（优化目标：盈亏比3:1）
+        动态止损止盈计算（严格模式：回测/实盘公式一致）。
         
-        基于ATR（Average True Range）的自适应止损止盈：
-        - 止损：1.2倍ATR（收紧止损，减少单笔亏损）
-        - 止盈：根据置信度调整（高置信度3倍ATR，低置信度2.5倍ATR）
-        - 跟踪止损：1倍ATR距离
+        基于 ATR（Average True Range）的自适应止损止盈：
+        - 止损：ATR × STOP_LOSS_ATR_MULTIPLIER
+        - 止盈：ATR × TAKE_PROFIT_ATR_MULTIPLIER
+        - 跟踪止损：ATR × RISK_ATR_TRAILING_STOP_MULTIPLIER
+        
+        数据不足时降级为固定百分比止盈止损（仍保持与回测一致）：
+        - 止损：STOP_LOSS_PCT
+        - 止盈：TAKE_PROFIT_PCT
         
         Args:
             symbol: 交易对
@@ -679,60 +689,31 @@ class RiskService:
             
             logger.info(f"📊 当前ATR: {current_atr:.2f} ({current_atr/entry_price*100:.2f}%)")
             
-            # 3. ✅ 同步回测逻辑：优化止损止盈计算（追求超高胜率）
-            # 回测中使用：止损 ATR×1.5（放宽止损，减少被止损概率），止盈 ATR×3.0（适度降低止盈，提高达成率）
-            # 盈亏比 2:1，但胜率会提高
-            if signal_type == 'LONG':
-                # 做多：止损在下方，止盈在上方
-                # ✅ 同步回测：放宽止损到1.5倍ATR，减少被止损概率
-                stop_loss = entry_price - (current_atr * 1.5)
-                
-                # ✅ 同步回测：适度降低止盈到3.0倍ATR，提高达成率
-                take_profit = entry_price + (current_atr * 3.0)
-                logger.debug(f"  置信度({confidence:.2f})：使用1.5倍ATR止损，3.0倍ATR止盈（盈亏比2:1，追求超高胜率）")
-                
-                # 跟踪止损初始距离
-                trailing_stop_distance = current_atr * RISK_ATR_TRAILING_STOP_MULTIPLIER
-                
-            elif signal_type == 'SHORT':
-                # 做空：止损在上方，止盈在下方
-                # ✅ 同步回测：放宽止损到1.5倍ATR，减少被止损概率
-                stop_loss = entry_price + (current_atr * 1.5)
-                
-                # ✅ 同步回测：适度降低止盈到3.0倍ATR，提高达成率
-                take_profit = entry_price - (current_atr * 3.0)
-                logger.debug(f"  置信度({confidence:.2f})：使用1.5倍ATR止损，3.0倍ATR止盈（盈亏比2:1，追求超高胜率）")
-                
-                trailing_stop_distance = current_atr * RISK_ATR_TRAILING_STOP_MULTIPLIER
-            else:
-                logger.warning(f"未知信号类型: {signal_type}")
-                return {}
+            # 3. ✅ 严格模式：止损止盈“公式层”统一为共享纯函数（回测/实盘共用）
+            stop_levels = calculate_atr_based_stop_levels(
+                entry_price=float(entry_price),
+                atr=float(current_atr),
+                signal_type=signal_type,
+                stop_loss_atr_multiplier=STOP_LOSS_ATR_MULTIPLIER,
+                take_profit_atr_multiplier=TAKE_PROFIT_ATR_MULTIPLIER,
+                trailing_stop_atr_multiplier=RISK_ATR_TRAILING_STOP_MULTIPLIER,
+            )
             
-            # 4. 计算盈亏比
-            risk = abs(entry_price - stop_loss)
-            reward = abs(take_profit - entry_price)
-            risk_reward_ratio = reward / risk if risk > 0 else 0
-            
-            # 5. 组装结果
-            stop_levels = {
-                'entry_price': entry_price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'trailing_stop_enabled': True,
-                'trailing_stop_distance': trailing_stop_distance,
-                'atr': current_atr,
-                'atr_percent': (current_atr / entry_price) * 100,
-                'risk_reward_ratio': risk_reward_ratio,
-                'max_loss_percent': (risk / entry_price) * 100,
-                'max_profit_percent': (reward / entry_price) * 100
-            }
+            # 记录止盈止损配置
+            logger.info(
+                f"📊 止盈止损配置: 止损={STOP_LOSS_ATR_MULTIPLIER}×ATR, 止盈={TAKE_PROFIT_ATR_MULTIPLIER}×ATR, "
+                f"盈亏比=1:{stop_levels.get('risk_reward_ratio', 0):.2f}"
+            )
             
             logger.info(f"🎯 动态止损止盈已计算:")
             logger.info(f"  入场价: {entry_price:.2f}")
-            logger.info(f"  止损价: {stop_loss:.2f} (风险: {stop_levels['max_loss_percent']:.2f}%)")
-            logger.info(f"  止盈价: {take_profit:.2f} (收益: {stop_levels['max_profit_percent']:.2f}%)")
-            logger.info(f"  盈亏比: 1:{risk_reward_ratio:.2f}")
-            logger.info(f"  跟踪止损: {trailing_stop_distance:.2f} ({trailing_stop_distance/entry_price*100:.2f}%)")
+            logger.info(f"  止损价: {stop_levels['stop_loss']:.2f} (风险: {stop_levels['max_loss_percent']:.2f}%)")
+            logger.info(f"  止盈价: {stop_levels['take_profit']:.2f} (收益: {stop_levels['max_profit_percent']:.2f}%)")
+            logger.info(f"  盈亏比: 1:{stop_levels.get('risk_reward_ratio', 0):.2f}")
+            logger.info(
+                f"  跟踪止损: {stop_levels['trailing_stop_distance']:.2f} "
+                f"({stop_levels['trailing_stop_distance']/entry_price*100:.2f}%)"
+            )
             
             return stop_levels
             
@@ -749,34 +730,19 @@ class RiskService:
     ) -> Dict[str, float]:
         """固定百分比止损（备用方案）"""
         try:
-            stop_loss_pct = STOP_LOSS_PCT_FALLBACK
+            stop_levels = calculate_fixed_pct_stop_levels(
+                entry_price=float(entry_price),
+                signal_type=signal_type,
+                stop_loss_pct=STOP_LOSS_PCT,
+                take_profit_pct=TAKE_PROFIT_PCT,
+                fixed_trailing_stop_pct=RISK_FIXED_TRAILING_STOP_PCT,
+            )
             
-            # 🔥 统一使用3:1盈亏比（所有置信度级别）
-            take_profit_pct = TAKE_PROFIT_PCT_FALLBACK
+            logger.warning(
+                f"⚠️ 使用固定百分比止损: ±{STOP_LOSS_PCT*100:.1f}% / ±{TAKE_PROFIT_PCT*100:.1f}%"
+            )
             
-            if signal_type == 'LONG':
-                stop_loss = entry_price * (1 - stop_loss_pct)
-                take_profit = entry_price * (1 + take_profit_pct)
-            else:  # SHORT
-                stop_loss = entry_price * (1 + stop_loss_pct)
-                take_profit = entry_price * (1 - take_profit_pct)
-            
-            risk_reward = take_profit_pct / stop_loss_pct
-            
-            logger.warning(f"⚠️ 使用固定百分比止损: ±{stop_loss_pct*100:.1f}% / ±{take_profit_pct*100:.1f}%")
-            
-            return {
-                'entry_price': entry_price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'trailing_stop_enabled': False,
-                'trailing_stop_distance': entry_price * RISK_FIXED_TRAILING_STOP_PCT,
-                'atr': None,
-                'atr_percent': None,
-                'risk_reward_ratio': risk_reward,
-                'max_loss_percent': stop_loss_pct * 100,
-                'max_profit_percent': take_profit_pct * 100
-            }
+            return stop_levels
             
         except Exception as e:
             logger.error(f"固定止损计算失败: {e}")

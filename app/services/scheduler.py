@@ -66,11 +66,11 @@ class TaskScheduler:
     def _init_scheduled_tasks(self):
         """初始化调度任务"""
         try:
-            # 模型训练任务（每周五晚上24点执行，即周六00:00）
+            # 模型训练任务（每周训练：00:30执行，避开00:00任务拥挤）
             self.tasks['model_training'] = ScheduledTask(
                 name='模型训练',
                 func=self._run_model_training,
-                scheduled_time=dt_time(0, 0),  # 00:00（即周五晚上24点，周六凌晨00:00）
+                scheduled_time=dt_time(0, 30),  # 00:30
                 weekly_day=SCHEDULER_MODEL_TRAINING_DAY
             )
             
@@ -452,13 +452,21 @@ class TaskScheduler:
             task.is_running = False
     
     async def _run_model_training(self):
-        """运行模型训练任务"""
+        """运行模型训练任务（在独立线程中执行，完全不阻塞预测）"""
         try:
-            logger.info("开始自动模型训练")
+            logger.info("开始自动模型训练（独立线程执行，完全不阻塞实时预测）")
             
             # 检查是否有足够的新数据
             if await self._should_retrain_model():
-                metrics = await self.ml_service.train_model()
+                # 🔑 在独立线程中执行训练（创建新的事件循环）
+                from app.core.executor import global_executor
+                
+                logger.info("🔄 在独立线程中执行模型训练...")
+                
+                # 在独立线程中执行异步训练函数
+                metrics = await global_executor.run_async_in_thread(
+                    self.ml_service.train_model
+                )
                 
                 if metrics:
                     logger.info(f"模型训练完成，准确率: {metrics.get('accuracy', 0):.4f}")
@@ -478,7 +486,7 @@ class TaskScheduler:
                 logger.info("数据不足，跳过模型训练")
                 
         except Exception as e:
-            logger.error(f"自动模型训练失败: {e}")
+            logger.error(f"自动模型训练失败: {e}", exc_info=True)
             raise
     
     async def _run_data_update(self):
@@ -633,7 +641,8 @@ class TaskScheduler:
             
             # 检查是否所有时间框架都有完整的集成模型（4个模型）
             missing_timeframes = []
-            required_models = ['lightgbm', 'xgboost', 'catboost', 'meta_learner']
+            # ✅ 与 EnsembleMLService 的模型字典结构保持一致：{'lgb','xgb','cat','meta', 可选'inf'}
+            required_models = ['lgb', 'xgb', 'cat', 'meta']
             
             for timeframe in settings.TIMEFRAMES:
                 if timeframe not in self.ml_service.ensemble_models:

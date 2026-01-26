@@ -19,10 +19,26 @@ BACKTEST_INITIAL_BALANCE = 20.0
 BACKTEST_DEFAULT_LEVERAGE = 20.0
 BACKTEST_DEFAULT_PRIMARY_TIMEFRAME = "5m"
 BACKTEST_DEFAULT_TIMEFRAMES = ["3m", "5m", "15m"]
+BACKTEST_POSITION_RATIO = 0.5  # 回测仓位管理配置默认使用 50% 仓位
 
 # =========================
 # 交易信号与交易执行
 # =========================
+# 🎯 交易配置（统一管理，回测和实盘都使用）
+DEFAULT_SYMBOL = "BTC/USDT"  # 默认交易对
+DEFAULT_LEVERAGE = 20  # 默认杠杆倍数（回测和模拟交易都使用）
+DEFAULT_CONFIDENCE_THRESHOLD = 0.6  # 默认置信度阈值（回测和模拟交易都使用）
+DEFAULT_TIMEFRAMES = ["3m", "5m", "15m"]  # 默认多时间框架配置（回测和模拟交易都使用）
+
+# 🎯 信号质量过滤阈值（统一管理，确保回测和实盘一致）
+SIGNAL_PRIMARY_TIMEFRAME_MIN_CONFIDENCE = 0.50  # 主时间框架（5m）最低置信度要求
+SIGNAL_TREND_CONSISTENCY_MIN_CONFIDENCE = 0.5  # 趋势一致性检查的最低置信度
+SIGNAL_HIGH_CONFIDENCE_THRESHOLD = 0.6  # 高置信度信号阈值（触发量能确认）
+SIGNAL_HOLD_HIGH_CONFIDENCE_THRESHOLD = 0.65  # HOLD高置信度阈值（触发权重衰减）
+SIGNAL_VOLUME_RATIO_THRESHOLD = 0.7  # 量能比例阈值（当前量能/平均量能）
+SIGNAL_MAX_DAILY_VOLATILITY = 0.08  # 最大日波动率（8%）
+SIGNAL_MIN_DAILY_VOLATILITY = 0.005  # 最小日波动率（0.5%）
+
 SIGNAL_MIN_INTERVAL_SECONDS = 180
 SIGNAL_WARMUP_COUNT = 5
 SIGNAL_BUFFER_DAYS = 30
@@ -32,10 +48,18 @@ SIGNAL_TIMEFRAME_WEIGHTS = {"3m": 0.15, "5m": 0.70, "15m": 0.15}
 SIGNAL_PREDICTION_DAYS = {"3m": 10, "5m": 10, "15m": 10}
 SIGNAL_MIN_REQUIRED_KLINES = 250
 
+# 🎯 固定止盈止损百分比（严格模式：回测/实盘/风控 fallback 使用同一套配置）
+# 当前配置：3:1 盈亏比（0.012/0.036）
 STOP_LOSS_PCT = 0.012
 TAKE_PROFIT_PCT = 0.036
-STOP_LOSS_PCT_FALLBACK = 0.015
-TAKE_PROFIT_PCT_FALLBACK = 0.045
+
+# ✅ 兼容旧命名：严格模式下与主配置保持一致（禁止分叉）
+STOP_LOSS_PCT_FALLBACK = STOP_LOSS_PCT
+TAKE_PROFIT_PCT_FALLBACK = TAKE_PROFIT_PCT
+
+# 🎯 动态止盈止损 ATR 倍数配置（用于回测和实盘）
+STOP_LOSS_ATR_MULTIPLIER = 1.5  # 止损距离：entry_price ± ATR × 1.5
+TAKE_PROFIT_ATR_MULTIPLIER = 1.5  # 止盈距离：entry_price ± ATR × 1.5（1:1盈亏比，提升震荡行情胜率）
 
 ADX_TRENDING_THRESHOLD = 30
 ADX_RANGING_THRESHOLD = 25
@@ -95,14 +119,28 @@ MAX_DRAWDOWN_LIMIT = 0.15  # 最大回撤比例（15%）
 KELLY_MULTIPLIER = 0.25  # Kelly系数乘数
 
 # =========================
+# 系统执行器与并发
+# =========================
+# 🔑 全局线程池配置（根据硬件优化）
+# 硬件：8核CPU + 16GB GPU
+EXECUTOR_MAX_WORKERS = 8  # 最大并发任务数（充分利用8核CPU + GPU并行能力）
+# 并发能力：
+#   - 1个训练任务（GPU密集，8-12GB显存）
+#   - 3-4个回测任务（GPU并行，2-3GB显存/任务）
+#   - 3-4个预测任务（GPU轻量，<1GB显存/任务）
+# GPU并发策略：
+#   - LightGBM/XGBoost/CatBoost 支持多任务并发（OpenCL/CUDA独立流）
+#   - PyTorch (Informer-2) 使用显存池管理，支持有限并发
+
+# =========================
 # 机器学习与特征
 # =========================
 # 训练数据天数配置（统一使用270天，最大化数据利用）
 TRAINING_BASE_DAYS_CONFIG = {"3m": 180, "5m": 180, "15m": 180}  # 基础天数
 TRAINING_DAYS_MULTIPLIER = 1.5  # Ensemble模型统一倍数（180 × 1.5 = 270天）
 
-LABEL_WINDOW_CONFIG = {"3m": 20, "5m": 24, "15m": 32}
-LABEL_PT_SL_CONFIG = {"3m": (2.2, 1.6), "5m": (2.2, 1.8), "15m": (2.5, 2.0)}
+LABEL_WINDOW_CONFIG = {"3m": 8, "5m": 10, "15m": 12}
+LABEL_PT_SL_CONFIG = {"3m": (1.8, 1.4), "5m": (1.8, 1.5), "15m": (1.8, 1.5)}
 LABEL_VOLATILITY_WINDOW = 20
 LABEL_VOLATILITY_DEFAULT = 0.002
 LABEL_VOLATILITY_MIN = 0.001
@@ -121,6 +159,12 @@ LGB_MIN_SPLIT_GAIN = 0.02
 
 FEATURE_IMPORTANCE_THRESHOLD_HIGH = 0.1
 FEATURE_IMPORTANCE_THRESHOLD_LOW = 0.01
+
+# 🔧 特征工程配置
+FEATURE_SELECTION_TOP_N = 50  # 特征选择：保留 top-N 个最重要的特征（基于变异系数）
+
+# 📊 滚动窗口标准化配置（避免数据泄露）
+ROLLING_SCALER_WINDOW_SIZE = 500  # 滚动窗口大小：使用最近 N 个时间步计算均值和标准差
 
 EFFECTIVE_SAMPLE_BETA_BASE = 0.999
 EFFECTIVE_SAMPLE_BETA_NON_3M = 0.995
@@ -164,7 +208,7 @@ GMADL_ERROR_MIN = 1e-7
 # 致命错误惩罚配置（用于降低LONG↔SHORT错误率）
 USE_FATAL_ERROR_PENALTY = True  # 是否启用致命错误惩罚
 FATAL_ERROR_WEIGHT = 5.0  # 致命错误权重（LONG↔SHORT错误的惩罚倍数）
-HOLD_WEIGHT_MULTIPLIER = 15.0  # HOLD类别权重倍数（提升HOLD识别能力）
+HOLD_WEIGHT_MULTIPLIER = 15.0  # HOLD类别权重倍数（修复双重加权问题后恢复到15.0）
 
 MOMENTUM_ROC_PERIODS = [5, 10, 20]
 MOMENTUM_MOMENTUM_PERIODS = [5, 10, 20]

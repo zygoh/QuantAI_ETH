@@ -1,382 +1,254 @@
-# QuantAI - 量化AI交易系统
+QuantAI 量化交易系统（Strict Mode）
 
-<p align="center">
-  <strong>基于机器学习的合约中频智能交易系统</strong>
-</p>
+## 项目简介
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.12+-blue.svg" alt="Python">
-  <img src="https://img.shields.io/badge/FastAPI-0.100+-green.svg" alt="FastAPI">
-  <img src="https://img.shields.io/badge/PyTorch-2.5+-red.svg" alt="PyTorch">
-  <img src="https://img.shields.io/badge/CUDA-12.1-76B900.svg" alt="CUDA">
-  <img src="https://img.shields.io/badge/License-Proprietary-yellow.svg" alt="License">
-</p>
+本项目是一个基于 **FastAPI** 的量化交易/信号系统，核心能力：
 
----
+- **多时间框架信号生成**：默认 `["3m", "5m", "15m"]`，以 5m 为主框架合成信号。
+- **虚拟交易（默认）**：默认模式为 `SIGNAL_ONLY`，走完整的“信号→下单→成交→仓位更新”流程，但不依赖交易所下单权限。
+- **模型体系**：以 Stacking 集成（`lgb/xgb/cat/meta`）为主，支持 GPU 加速（LightGBM/XGBoost/CatBoost/PyTorch）。
+- **数据与存储**：WebSocket 实时行情 + PostgreSQL/TimescaleDB（K线/信号/订单/仓位）+ Redis（缓存/状态）。
+- **严格模式（Strict Mode）**：训练、回测、实时预测共享同一条特征工程与预测路径，避免回测“特供逻辑”带来的偏差。
 
-## 📖 项目概述
+## 严格模式原则（必须读）
 
-QuantAI 是一个生产级的量化交易系统，采用 **Stacking 集成学习** 策略，结合多个机器学习模型（LightGBM、XGBoost、CatBoost）和深度学习模型（Informer-2），实现高精度的交易信号生成。
+- **训练 / 回测 / 实盘预测**：必须走同一套特征工程与预测逻辑（禁止分支逻辑）。
+- **防未来函数**：特征只允许使用 \(t-1\) 及更早数据（详见项目规则与测试）。
+- 关键对比文档：
+  - `docs/backtest_vs_realtime_config.md`
+  - `docs/config_unification_and_cumulative_backtest.md`
 
-### 核心特性
+## 重要行为（⚠️ 启动即清理）
 
-- 🚀 **四模型集成**: LightGBM + XGBoost + CatBoost + Meta Learner
-- 🧠 **深度学习增强**: Informer-2 时序预测模型
-- ⚡ **GPU 加速**: 完整支持 CUDA 12.1，训练速度提升 4x
-- 📊 **14 维特征工程**: 价格、成交量、动量、波动率等多维度特征
-- 🔄 **多时间框架**: 3m/5m/15m 多周期信号合成
-- 🛡️ **风险管理**: 实时止盈止损、回撤监控、Kelly 仓位
-- 🌐 **多交易所支持**: Binance、OKX 统一接口
+启动 `main.py` 时会进行 **系统启动清理**（用于保证“干净启动”）：
 
----
+- **清空数据库交易相关表**（如 `klines / virtual_positions / orders / trading_signals` 等，含序列重置）
+- **清理 Redis 缓存**（多个 `pattern`）
+- **重置虚拟账户余额**
+- **重置回测累积余额（内存）**
 
-## 🏗️ 系统架构
+因此：
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         QuantAI System                          │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-│  │   FastAPI   │  │  WebSocket  │  │    REST API Endpoints   │  │
-│  │   Server    │  │   Server    │  │  /signals /trading ...  │  │
-│  └──────┬──────┘  └──────┬──────┘  └────────────┬────────────┘  │
-│         │                │                      │               │
-│  ┌──────┴────────────────┴──────────────────────┴──────┐        │
-│  │                   Trading Layer                      │        │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌────────────┐ │        │
-│  │  │SignalGenerat│  │TradingEngine │  │PositionMgr │ │        │
-│  │  └──────┬───────┘  └──────┬───────┘  └─────┬──────┘ │        │
-│  └─────────┴─────────────────┴────────────────┴────────┘        │
-│                              │                                   │
-│  ┌───────────────────────────┴───────────────────────────┐      │
-│  │                    Model Layer                         │      │
-│  │  ┌────────────────────────────────────────────────┐   │      │
-│  │  │           Ensemble ML Service                   │   │      │
-│  │  │  ┌─────┐  ┌─────┐  ┌─────┐  ┌──────┐  ┌─────┐  │   │      │
-│  │  │  │ LGB │  │ XGB │  │ CAT │  │ META │  │ INF │  │   │      │
-│  │  │  └─────┘  └─────┘  └─────┘  └──────┘  └─────┘  │   │      │
-│  │  └────────────────────────────────────────────────┘   │      │
-│  │  ┌────────────────────────────────────────────────┐   │      │
-│  │  │           Feature Engineering                   │   │      │
-│  │  │  14 Feature Modules (Price, Volume, Momentum..)│   │      │
-│  │  └────────────────────────────────────────────────┘   │      │
-│  └───────────────────────────────────────────────────────┘      │
-│                              │                                   │
-│  ┌───────────────────────────┴───────────────────────────┐      │
-│  │                  Exchange Layer                        │      │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐│      │
-│  │  │   Binance   │  │     OKX     │  │   SymbolMapper  ││      │
-│  │  │   Client    │  │   Client    │  │ IntervalMapper  ││      │
-│  │  └─────────────┘  └─────────────┘  └─────────────────┘│      │
-│  └───────────────────────────────────────────────────────┘      │
-│                              │                                   │
-│  ┌───────────────────────────┴───────────────────────────┐      │
-│  │                  Data Layer                            │      │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐│      │
-│  │  │ PostgreSQL  │  │    Redis    │  │   TimescaleDB   ││      │
-│  │  │  (Storage)  │  │   (Cache)   │  │  (Time Series)  ││      │
-│  │  └─────────────┘  └─────────────┘  └─────────────────┘│      │
-│  └───────────────────────────────────────────────────────┘      │
-└─────────────────────────────────────────────────────────────────┘
+- **不要把 `PG_* / REDIS_*` 指向你想保留数据的生产库**。
+- 回测结果写库后也会在下一次回测/启动时被清理（回测表会被 TRUNCATE）。
+
+## 环境要求
+
+- **Windows 10/11 + PowerShell**
+- Python **3.12**（推荐与当前工程一致）
+- （可选）NVIDIA GPU（CUDA 环境用于加速训练/预测）
+- PostgreSQL（建议启用 TimescaleDB 扩展）+ Redis
+
+## 安装依赖
+
+```powershell
+cd "f:\AI\20251007"
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
----
+### GPU（可选）
 
-## 📁 项目结构
+`requirements.txt` 已包含 `torch/cupy-cuda12x` 等依赖；如你的环境需要使用官方 CUDA 轮子，可参考 `requirements.txt` 注释里的 PyTorch 安装方式。
 
-```
-backend/
-├── main.py                    # 应用入口
-├── requirements.txt           # 依赖包
-├── init_timescaledb.sql      # 数据库初始化脚本
-│
-├── app/
-│   ├── api/                   # API 层
-│   │   ├── routes.py          # 路由注册
-│   │   ├── middleware.py      # 中间件
-│   │   ├── models.py          # API 数据模型
-│   │   └── endpoints/         # API 端点
-│   │       ├── signals.py     # 信号接口
-│   │       ├── trading.py     # 交易接口
-│   │       ├── training.py    # 训练接口
-│   │       ├── positions.py   # 持仓接口
-│   │       ├── performance.py # 绩效接口
-│   │       ├── system.py      # 系统接口
-│   │       └── websocket.py   # WebSocket 接口
-│   │
-│   ├── core/                  # 核心配置
-│   │   ├── config.py          # 系统配置
-│   │   ├── database.py        # 数据库连接
-│   │   ├── cache.py           # 缓存管理
-│   │   └── constants.py       # 常量定义
-│   │
-│   ├── model/                 # 模型层 (Layer 2)
-│   │   ├── base/              # 基础 ML 服务
-│   │   │   ├── ml_service.py  # ML 服务基类
-│   │   │   └── utils.py       # 工具函数
-│   │   │
-│   │   ├── ensemble/          # 集成学习
-│   │   │   ├── trainers.py    # 模型训练器
-│   │   │   ├── predictors.py  # 模型预测器
-│   │   │   ├── model_managers.py  # 模型管理
-│   │   │   ├── informer_wrapper.py  # Informer 封装
-│   │   │   └── utils.py       # 集成工具
-│   │   │
-│   │   ├── optimizers/        # 超参数优化
-│   │   │   └── hyperparameter_optimizer.py
-│   │   │
-│   │   ├── features/          # 特征工程层 (Layer 1)
-│   │   │   ├── price_features.py      # 价格特征
-│   │   │   ├── volume_features.py     # 成交量特征
-│   │   │   ├── momentum_features.py   # 动量特征
-│   │   │   ├── volatility_features.py # 波动率特征
-│   │   │   ├── trend_features.py      # 趋势特征
-│   │   │   ├── pattern_features.py    # 形态特征
-│   │   │   ├── technical_indicators.py# 技术指标
-│   │   │   ├── time_features.py       # 时间特征
-│   │   │   ├── swing_features.py      # 摆动特征
-│   │   │   ├── order_flow_features.py # 订单流特征
-│   │   │   ├── microstructure_features.py  # 微观结构
-│   │   │   ├── sentiment_features.py  # 情绪特征
-│   │   │   ├── multi_timeframe_features.py # 多周期特征
-│   │   │   └── utils.py               # 特征工具
-│   │   │
-│   │   ├── ensemble_ml_service.py  # 集成 ML 服务入口
-│   │   ├── informer2_model.py      # Informer-2 模型
-│   │   ├── gmadl_loss.py           # GMADL 损失函数
-│   │   └── model_stability_enhancer.py  # 模型稳定性
-│   │
-│   ├── trading/               # 交易层 (Layer 3)
-│   │   ├── trading_engine.py      # 交易引擎
-│   │   ├── signal_generator.py    # 信号生成器
-│   │   ├── trading_controller.py  # 交易控制器
-│   │   └── position_manager.py    # 仓位管理器
-│   │
-│   ├── services/              # 服务层 (Layer 3)
-│   │   ├── data_service.py        # 数据服务
-│   │   ├── risk_service.py        # 风险服务
-│   │   ├── scheduler.py           # 任务调度
-│   │   ├── health_monitor.py      # 健康监控
-│   │   ├── drawdown_monitor.py    # 回撤监控
-│   │   ├── historical_data.py     # 历史数据
-│   │   ├── direction_consistency_checker.py  # 方向一致性
-│   │   └── adaptive_frequency_controller.py  # 自适应频率
-│   │
-│   ├── exchange/              # 交易所层
-│   │   ├── base_exchange_client.py  # 基础客户端
-│   │   ├── exchange_factory.py      # 工厂模式
-│   │   ├── mappers.py               # 格式映射器
-│   │   ├── exceptions.py            # 异常定义
-│   │   └── clients/                 # 交易所客户端
-│   │       ├── binance/             # Binance
-│   │       │   └── binance_client.py
-│   │       └── okx/                 # OKX
-│   │           └── okx_client.py
-│   │
-│   └── utils/                 # 工具层
-│       └── helpers.py         # 辅助函数
-│
-├── models/                    # 模型文件存储
-└── logs/                      # 日志文件
+## 配置（推荐使用 .env 覆盖）
+
+项目使用 `pydantic-settings` 读取 `.env`，环境变量会覆盖默认值（见 `app/core/config.py`）。
+
+建议在项目根目录创建 `.env`（**不要提交到 git**），示例：
+
+```dotenv
+# 服务
+HOST=0.0.0.0
+PORT=8000
+
+# 交易对/信号
+SYMBOL=BTC/USDT
+LEVERAGE=20
+CONFIDENCE_THRESHOLD=0.6
+TIMEFRAMES=["3m","5m","15m"]
+
+# 数据库（⚠️ 请使用测试库/本地库，避免被启动清理误删）
+PG_HOST=127.0.0.1
+PG_PORT=5432
+PG_USER=postgres
+PG_PASSWORD=your_password
+PG_DATABASE=trading-data
+
+# Redis
+REDIS_URL=redis://127.0.0.1:6379
+REDIS_DB=0
+
+# GPU
+USE_GPU=true
+GPU_DEVICE=cuda:0
+
+# 代理（可选）
+USE_PROXY=false
+USE_PROXY_WS=false
+PROXY_HOST=127.0.0.1
+PROXY_PORT=10808
+PROXY_TYPE=socks5
 ```
 
----
+## 数据库初始化
 
-## 🚀 快速开始
+- 系统启动会自动初始化表结构（见 `app/core/database.py`、`app/core/database_schema.py`）。
+- 也可以手动执行 `init_timescaledb.sql`：
 
-### 环境要求
-
-- Python 3.12+
-- CUDA 12.1+ (GPU 加速)
-- PostgreSQL 15+ (TimescaleDB)
-- Redis 7+
-
-### 安装步骤
-
-```bash
-# 1. 克隆项目
-git clone <repository-url>
-cd 20251007
-
-# 2. 创建虚拟环境
-python -m venv venv
-.\venv\Scripts\activate  # Windows
-
-# 3. 安装依赖
-pip install -r backend/requirements.txt
-
-# 4. 安装 PyTorch GPU 版本
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# 5. 配置数据库
-psql -U postgres -f backend/init_timescaledb.sql
-
-# 6. 配置环境变量（可选）
-cp .env.example .env
-# 编辑 .env 文件
-
-# 7. 启动服务
-cd backend
-python main.py
+```powershell
+psql -U postgres -d trading-data -f .\init_timescaledb.sql
 ```
 
-### 验证安装
+## 启动服务
 
-```bash
-# 检查 GPU 支持
-python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
-
-# 健康检查
-curl http://localhost:8000/health
+```powershell
+python .\main.py
 ```
 
----
+启动后可访问：
 
-## 📊 API 端点
+- `GET /health`（基础健康检查）
+- `GET /api/system/info`（环境与配置）
 
-| 端点 | 方法 | 描述 |
-|------|------|------|
-| `/api/signals` | GET | 获取交易信号 |
-| `/api/signals/predict` | POST | 触发预测 |
-| `/api/trading/status` | GET | 交易状态 |
-| `/api/trading/mode` | POST | 切换模式 |
-| `/api/positions` | GET | 持仓信息 |
-| `/api/training/start` | POST | 开始训练 |
-| `/api/training/status` | GET | 训练状态 |
-| `/api/performance/metrics` | GET | 绩效指标 |
-| `/api/system/status` | GET | 系统状态 |
-| `/api/ws/market` | WS | 实时行情 |
+日志默认写入 `.\logs\trading_system.log`。
 
----
+## API 快速参考
 
-## ⚙️ 配置说明
+说明：接口依赖 `HTTP Bearer`，但当前鉴权为简化实现（`app/api/dependencies.py`），**Authorization 可不传**。
 
-### 核心配置 (`app/core/config.py`)
+### 训练
 
-```python
-# 交易配置
-SYMBOL: str = "BTC/USDT"      # 交易对
-LEVERAGE: int = 50            # 杠杆倍数
-CONFIDENCE_THRESHOLD: float = 0.45  # 信号阈值
+- `POST /api/training/start`：训练模型
+  - body：`{"force_retrain": false}`
+- `GET /api/training/status`：模型状态
+- `GET /api/training/metrics`：训练指标
+- `GET /api/training/features`：特征重要性（训练后）
+- `GET /api/training/schedule`：调度状态
+- `POST /api/training/schedule/run`：手动触发训练任务
 
-# 时间框架
-TIMEFRAMES: list = ["3m", "5m", "15m"]
+### 回测（异步任务）
 
-# GPU 配置
-USE_GPU: bool = True
-GPU_DEVICE: str = "cuda:0"
+- `POST /api/training/backtest`：创建回测任务（立即返回 `task_id`）
+- `GET /api/training/backtest/{task_id}`：查询任务状态/结果
+- `GET /api/training/backtest`：列出任务
 
-# 风险管理
-MAX_DRAWDOWN_LIMIT: float = 0.15  # 最大回撤 15%
-KELLY_MULTIPLIER: float = 0.25   # Kelly 系数
+回测请求体（核心字段）：
+
+```json
+{
+  "symbol": "BTC/USDT",
+  "days": 60,
+  "initial_balance": 20.0,
+  "leverage": 20.0,
+  "primary_timeframe": "5m",
+  "timeframes": ["3m", "5m", "15m"],
+  "include_trades": false,
+  "cumulative_mode": false
+}
 ```
 
----
+说明：
 
-## 🧠 模型架构
+- `cumulative_mode=true` 时，回测会以 **累积模式**运行：接口侧把 `initial_balance` 置为 `null`，由回测服务使用“内存累积余额”继续跑；独立模式会在任务完成后自动重置累积余额。
 
-### Stacking 集成学习
+### 信号
 
+- `GET /api/signals`：信号历史（默认查最近 24h）
+- `GET /api/signals/latest`：最新信号
+- `POST /api/signals/generate`：手动生成信号（`{"symbol":"BTC/USDT","force":false}`）
+- `GET /api/signals/performance`：信号表现统计
+- `GET /api/signals/statistics`：信号统计摘要
+- `GET /api/signals/model/prediction`：取最新数据做一次模型预测（用于调试）
+
+### 仓位（虚拟仓位）
+
+- `GET /api/positions`
+- `GET /api/positions/summary`
+- `GET /api/positions/risk`
+- `GET /api/positions/{symbol}`
+- `GET /api/positions/{symbol}/value`
+
+### 交易（手动/模式切换）
+
+- `POST /api/trading/execute`：手动下单（`LONG/SHORT/CLOSE`）
+- `POST /api/trading/mode`：切换交易模式（`AUTO` / `SIGNAL_ONLY`）
+- `GET /api/trading/status`
+- `GET /api/trading/performance`
+- `POST /api/trading/close/{symbol}`
+- `GET /api/trading/limits`
+
+⚠️ 注意：工程默认以“信号/虚拟交易”为主；若切换 `AUTO`，请先确认你的交易所客户端与密钥配置，避免产生真实下单风险。
+
+### 绩效/风险
+
+- `GET /api/performance`
+- `GET /api/performance/risk`
+- `GET /api/performance/drawdown`
+- `GET /api/performance/returns`
+- `GET /api/performance/ratios`
+- `GET /api/performance/summary`
+
+### 系统
+
+- `GET /api/system/status`
+- `POST /api/system/control`（`START/STOP/PAUSE/RESUME`）
+- `GET /api/system/health`（详细健康检查）
+- `GET /api/system/info`
+- `GET /api/system/tasks` / `POST /api/system/tasks/{task_name}/run`
+- `GET /api/system/cache/stats`
+
+### WebSocket
+
+- 连接：`/api/ws/connect`
+- 订阅消息示例：
+
+```json
+{"type":"subscribe","channel":"signals"}
 ```
-           ┌─────────────────────────────────────────┐
-           │            原始特征 (200+)               │
-           └───────────────────┬─────────────────────┘
-                               │
-    ┌──────────────────────────┼──────────────────────────┐
-    │                          │                          │
-    ▼                          ▼                          ▼
-┌───────────┐            ┌───────────┐            ┌───────────┐
-│  LightGBM │            │  XGBoost  │            │  CatBoost │
-│   (lgb)   │            │   (xgb)   │            │   (cat)   │
-└─────┬─────┘            └─────┬─────┘            └─────┬─────┘
-      │                        │                        │
-      │         ┌──────────────┼──────────────┐         │
-      │         │              │              │         │
-      └─────────┴──────────────┴──────────────┴─────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │    Meta Learner     │
-                    │   (Ridge/Logistic)  │
-                    └──────────┬──────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │    Final Signal     │
-                    │  (LONG/SHORT/HOLD)  │
-                    └─────────────────────┘
+
+可用频道（服务端使用频道名过滤广播）：
+
+- `price`、`signals`、`orders`、`risk`、`system`
+
+查看连接统计：
+
+- `GET /api/ws/stats`
+
+## 回测分析脚本
+
+优先推荐“无需数据库”的简化分析：
+
+```powershell
+python .\test\analyze_backtest_simple.py
 ```
 
-### 特征工程模块
+如果你已跑过回测并写入数据库，可运行完整版分析：
 
-| 模块 | 特征数 | 描述 |
-|------|--------|------|
-| price_features | 15+ | 价格变化、收益率 |
-| volume_features | 12+ | 成交量分析 |
-| momentum_features | 20+ | RSI、MACD、动量 |
-| volatility_features | 15+ | ATR、布林带 |
-| trend_features | 10+ | 均线、趋势强度 |
-| pattern_features | 8+ | K线形态识别 |
-| technical_indicators | 25+ | 综合技术指标 |
-| time_features | 5+ | 时间周期特征 |
-| order_flow_features | 10+ | 买卖压力 |
+```powershell
+python .\test\analyze_backtest_trades.py
+```
 
----
+更多说明见：`docs/how_to_analyze_backtest.md`
 
-## 📈 性能指标
+## 测试
 
-### 训练性能 (RTX 4060 Ti)
+```powershell
+pytest -q
+```
 
-| 指标 | CPU | GPU | 加速比 |
-|------|-----|-----|--------|
-| Optuna 优化 | 45min | 10min | 4.5x |
-| 模型训练 | 60min | 15min | 4.0x |
-| 总时间 | 130min | 30min | 4.3x |
+## 代码结构（3 层架构）
 
-### 预测性能
+- **Features（纯函数）**：`app/model/features/`
+- **Model（有状态）**：`app/model/`
+- **External（服务/交易）**：`app/services/`、`app/trading/`
+- **API**：`app/api/`
+- **Core（配置/数据库/缓存）**：`app/core/`
 
-| 指标 | 数值 |
-|------|------|
-| 预测延迟 | <100ms |
-| 信号频率 | 5min |
-| 内存占用 | <4GB |
+依赖方向：`Features → Model → External`（禁止反向依赖）。
 
----
+## 风险声明
 
-## 🛡️ 风险管理
+本项目用于研究与工程实现参考，不构成投资建议。实盘交易存在巨大风险（特别是高杠杆与高频策略），请在隔离环境中验证并自行承担后果。
 
-- **实时止盈止损**: 每次 WebSocket 消息触发检查
-- **最大回撤限制**: 15% 自动暂停
-- **Kelly 仓位管理**: 动态调整仓位大小
-- **方向一致性检查**: 防止信号震荡
-
----
-
-## 📝 开发规范
-
-详见 [.cursor/rules/general.mdc](.cursor/rules/general.mdc)
-
-### 核心原则
-
-1. **Alpha First**: ROI > 稳定性
-2. **Signal Fidelity**: 精度 > 优化
-3. **Environmental Hygiene**: 零冗余
-4. **Architectural Integrity**: 根因 > 补丁
-
----
-
-## 📄 License
-
-Proprietary - All Rights Reserved
-
----
-
-## 🤝 贡献
-
-本项目为私有项目，暂不接受外部贡献。
-
----
-
-<p align="center">
-  <strong>QuantAI</strong> - Built for Alpha Generation 🚀
-</p>

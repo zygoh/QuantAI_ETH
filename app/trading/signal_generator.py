@@ -44,13 +44,21 @@ from app.core.constants import (
     SIGNAL_TIMEFRAME_WEIGHTS,
     SIGNAL_WARMUP_COUNT,
     STOP_LOSS_PCT,
-    TAKE_PROFIT_PCT
+    TAKE_PROFIT_PCT,
+    SIGNAL_HOLD_HIGH_CONFIDENCE_THRESHOLD,
+    SIGNAL_PRIMARY_TIMEFRAME_MIN_CONFIDENCE,
+    SIGNAL_TREND_CONSISTENCY_MIN_CONFIDENCE,
+    SIGNAL_HIGH_CONFIDENCE_THRESHOLD,
+    SIGNAL_VOLUME_RATIO_THRESHOLD,
+    SIGNAL_MAX_DAILY_VOLATILITY,
+    SIGNAL_MIN_DAILY_VOLATILITY
 )
 from app.model.base.ml_service import MLService
 from app.services.data_service import DataService, KlineData
 from app.exchange.exchange_factory import ExchangeFactory
 from app.utils.helpers import format_signal_type
 from app.services.risk_service import RiskService
+from app.services.risk_calculations import calculate_fixed_pct_stop_levels
 from app.trading.position_manager import position_manager
 import pytz
 
@@ -112,6 +120,9 @@ class SignalGenerator:
         
         # 🔥 信号缓存过期时间（秒）- 根据时间框架设置不同的TTL
         self.prediction_cache_ttl = SIGNAL_PREDICTION_CACHE_TTL
+        
+        # 🔑 K线去重：记录已处理的K线时间戳（防止循环预测）
+        self.processed_klines: Dict[str, int] = {}  # {timeframe: last_processed_timestamp}
         
         # 🔒 安全保护：前5个信号仅记录，不交易（仅首次部署时启用）
         self.warmup_signals = SIGNAL_WARMUP_COUNT
@@ -245,6 +256,19 @@ class SignalGenerator:
             if not self.is_running:
                 logger.warning("⚠️ 信号生成器未运行，跳过处理")
                 return
+            
+            # 🔑 K线去重检查：防止重复处理同一根K线
+            timeframe = kline_data.interval
+            kline_timestamp = kline_data.open_time
+            
+            last_processed = self.processed_klines.get(timeframe, 0)
+            if kline_timestamp <= last_processed:
+                logger.debug(f"⏭️ 跳过已处理的K线: {timeframe} timestamp={kline_timestamp} (上次={last_processed})")
+                return
+            
+            # 记录当前K线时间戳
+            self.processed_klines[timeframe] = kline_timestamp
+            logger.debug(f"✅ K线去重通过: {timeframe} timestamp={kline_timestamp}")
             
             # 1. 将WebSocket数据添加到缓冲区
             await self._update_kline_buffer(kline_data)
@@ -398,6 +422,7 @@ class SignalGenerator:
                     prediction = await self._predict_single_timeframe(symbol, timeframe)
                     if prediction:
                         self.cached_predictions[timeframe] = prediction
+                        self.cached_predictions_time[timeframe] = time.time()  # 🎯 记录缓存时间
                         logger.info(f"✅ {timeframe} 首次预测完成: {format_signal_type(prediction.get('signal_type'))} (置信度={prediction.get('confidence'):.4f})")
                     else:
                         logger.warning(f"⚠️ {timeframe} 首次预测返回空结果")
@@ -652,7 +677,7 @@ class SignalGenerator:
                 # 🔑 动态权重调整：如果长周期（15m）是HOLD且置信度高，大幅降低权重
                 if timeframe in ['15m'] and signal == 'HOLD':
                     hold_confidence = pred_confidence
-                    if hold_confidence > 0.65:
+                    if hold_confidence > SIGNAL_HOLD_HIGH_CONFIDENCE_THRESHOLD:
                         # HOLD置信度很高时，权重减半（避免压制5m）
                         weight = base_weight * SIGNAL_HOLD_WEIGHT_DECAY
                         logger.debug(f"   {timeframe} HOLD高置信度({hold_confidence:.2f})，权重{base_weight}→{weight}")
@@ -690,8 +715,8 @@ class SignalGenerator:
             # ✅ 同步回测逻辑：增强信号质量检查（追求超高胜率）
             # 1. 主时间框架（5m）必须达到较高置信度
             primary_confidence = timeframe_confidences.get('5m', 0.0)
-            if primary_confidence < 0.50:
-                logger.info(f"⚠️ 主时间框架置信度过低: {primary_confidence:.4f} < 0.50，拒绝信号")
+            if primary_confidence < SIGNAL_PRIMARY_TIMEFRAME_MIN_CONFIDENCE:
+                logger.info(f"⚠️ 主时间框架置信度过低: {primary_confidence:.4f} < {SIGNAL_PRIMARY_TIMEFRAME_MIN_CONFIDENCE}，拒绝信号")
                 return None
             
             # 2. 至少两个时间框架方向一致
@@ -743,13 +768,15 @@ class SignalGenerator:
             
             if not stop_levels:
                 logger.warning("⚠️ 止损止盈计算失败，使用固定百分比")
-                # 降级方案
-                if signal_type == 'LONG':
-                    stop_loss = current_price * (1 - self.stop_loss_pct)
-                    take_profit = current_price * (1 + self.take_profit_pct)
-                else:  # SHORT
-                    stop_loss = current_price * (1 + self.stop_loss_pct)
-                    take_profit = current_price * (1 - self.take_profit_pct)
+                # ✅ 严格模式：固定百分比止损止盈公式与回测/风控 fallback 完全一致
+                fallback_levels = calculate_fixed_pct_stop_levels(
+                    entry_price=float(current_price),
+                    signal_type=signal_type,
+                    stop_loss_pct=self.stop_loss_pct,
+                    take_profit_pct=self.take_profit_pct,
+                )
+                stop_loss = fallback_levels["stop_loss"]
+                take_profit = fallback_levels["take_profit"]
             else:
                 stop_loss = stop_levels['stop_loss']
                 take_profit = stop_levels['take_profit']
@@ -1053,7 +1080,7 @@ class SignalGenerator:
             # 如果最终信号是通过权重计算得出的，说明已经考虑了各时间框架的贡献
             # 因此不应该因为某个时间框架有反向信号就过滤掉
             # 只有在权重信号置信度很低时才需要额外检查
-            if confidence < 0.5:  # 只有置信度很低时才检查趋势一致性
+            if confidence < SIGNAL_TREND_CONSISTENCY_MIN_CONFIDENCE:  # 只有置信度很低时才检查趋势一致性
                 if len(predictions) >= 2:
                     signal_types = [pred['signal_type'] for pred in predictions.values()]
                     # 如果所有时间框架都是反向信号，才过滤
@@ -1075,16 +1102,16 @@ class SignalGenerator:
                     # 日波动率估算（5分钟 → 日，假设288个5分钟周期）
                     daily_volatility = current_volatility * np.sqrt(288)
                     
-                    if daily_volatility > 0.08:  # 日波动率>8%
+                    if daily_volatility > SIGNAL_MAX_DAILY_VOLATILITY:
                         return {'pass': False, 'reason': f'市场波动过大 (日波动率={daily_volatility*100:.2f}%)'}
                     
-                    if daily_volatility < 0.005:  # 日波动率<0.5%
+                    if daily_volatility < SIGNAL_MIN_DAILY_VOLATILITY:
                         return {'pass': False, 'reason': f'市场波动过小 (日波动率={daily_volatility*100:.2f}%)'}
             except Exception as e:
                 logger.debug(f"波动率计算失败（跳过此过滤）: {e}")
             
             # 4. 量能确认（高置信度信号需要量能配合）
-            if confidence > 0.6:  # 高置信度信号
+            if confidence > SIGNAL_HIGH_CONFIDENCE_THRESHOLD:  # 高置信度信号
                 try:
                     buffer_data = self.kline_buffers.get('5m', [])
                     if len(buffer_data) >= 60:  # 5m需要更多样本
@@ -1092,92 +1119,28 @@ class SignalGenerator:
                         current_volume = buffer_data[-1]['volume']
                         avg_volume = np.mean(recent_volumes)
                         
-                        # 高置信度信号需要量能至少达到平均的70%
-                        if current_volume < avg_volume * 0.7:
+                        # 高置信度信号需要量能至少达到平均的指定比例
+                        if current_volume < avg_volume * SIGNAL_VOLUME_RATIO_THRESHOLD:
                             return {'pass': False, 'reason': f'量能不足（当前={current_volume:.0f}, 平均={avg_volume:.0f}）'}
                 except Exception as e:
                     logger.debug(f"量能检查失败（跳过此过滤）: {e}")
             
             # 5. 🔥 已移除信号频率限制
             # 原因：
-            # 1. 系统已有ADX检测震荡行情，会自动过滤不适合的信号
-            # 2. 与上一个信号相同的话也不会产生新的交易信号（已有重复信号检查）
-            # 3. 频率限制会导致错过盈利机会，反而增加亏损风险
-            # 4. 开仓时会自动平掉现有仓位，确保始终只有一个OPEN仓位
+            # 1. 与上一个信号相同的话也不会产生新的交易信号（已有重复信号检查）
+            # 2. 频率限制会导致错过盈利机会，反而增加亏损风险
+            # 3. 开仓时会自动平掉现有仓位，确保始终只有一个OPEN仓位
             
-            # 6. 🆕 市场状态过滤（Market Regime Filtering）
-            # 根据ADX指标判断市场状态，过滤不匹配的信号
-            try:
-                # 获取最新5m K线数据（主时间框架）来计算ADX
-                buffer_data = self.kline_buffers.get('5m', [])
-                if len(buffer_data) >= 14:  # ADX需要至少14个周期
-                    # 转换为DataFrame以便计算ADX
-                    df_buffer = pd.DataFrame(buffer_data[-50:])  # 取最近50条用于计算
-                    if 'timestamp' in df_buffer.columns:
-                        df_buffer['timestamp'] = pd.to_datetime(df_buffer['timestamp'], unit='ms')
-                    df_buffer = df_buffer.set_index('timestamp') if 'timestamp' in df_buffer.columns else df_buffer
-                    
-                    # 计算ADX（使用ta库，与feature_engineering保持一致）
-                    try:
-                        adx_indicator = ta.trend.ADXIndicator(
-                            df_buffer['high'], 
-                            df_buffer['low'], 
-                            df_buffer['close']
-                        )
-                        current_adx = adx_indicator.adx().iloc[-1]
-                        
-                        # 验证ADX值有效性
-                        if pd.isna(current_adx) or np.isinf(current_adx):
-                            raise ValueError("ADX计算结果无效")
-                        
-                        # 🔥 提高市场状态判断阈值（更严格过滤震荡市场）
-                        TRENDING_THRESHOLD = ADX_TRENDING_THRESHOLD
-                        RANGING_THRESHOLD = ADX_RANGING_THRESHOLD
-                        
-                        # 判断市场状态
-                        if current_adx >= TRENDING_THRESHOLD:
-                            market_regime = 'TRENDING'
-                        elif current_adx <= RANGING_THRESHOLD:
-                            market_regime = 'RANGING'
-                        else:
-                            market_regime = 'MIXED'  # 20 < ADX < 25: 混合状态
-                        
-                        logger.debug(f"📊 市场状态: {market_regime} (ADX={current_adx:.2f})")
-                        
-                        # 根据市场状态过滤信号
-                        if market_regime == 'TRENDING':
-                            # 趋势市场：只接受LONG/SHORT信号，拒绝HOLD
-                            if signal_type == 'HOLD':
-                                return {
-                                    'pass': False, 
-                                    'reason': f'趋势市场(ADX={current_adx:.2f})拒绝HOLD信号'
-                                }
-                            logger.debug(f"✅ 趋势市场信号匹配: {signal_type}")
-                            
-                        elif market_regime == 'RANGING':
-                            # 震荡市场：只接受HOLD信号，拒绝LONG/SHORT
-                            if signal_type in ['LONG', 'SHORT']:
-                                return {
-                                    'pass': False, 
-                                    'reason': f'震荡市场(ADX={current_adx:.2f})拒绝{signal_type}信号'
-                                }
-                            logger.debug(f"✅ 震荡市场信号匹配: {signal_type}")
-                            
-                        else:  # MIXED
-                            # 混合状态：接受所有信号，但降低置信度要求
-                            logger.debug(f"⚠️ 混合市场状态(ADX={current_adx:.2f})，接受所有信号")
-                            
-                    except ImportError:
-                        logger.warning("pandas_ta未安装，跳过ADX计算（市场状态过滤失效）")
-                    except Exception as e:
-                        logger.debug(f"ADX计算失败（跳过市场状态过滤）: {e}")
-                else:
-                    logger.debug(f"缓冲区数据不足({len(buffer_data)}条 < 14条)，跳过市场状态过滤")
-            except Exception as e:
-                logger.debug(f"市场状态过滤失败（跳过此过滤）: {e}")
+            # 6. ❌ 已移除 ADX 市场状态过滤器
+            # 移除原因：
+            # 1. 模型训练时已包含 ADX 特征，模型已学会如何处理不同市场状态
+            # 2. 人为添加 ADX 硬性过滤器会导致训练/回测/实盘逻辑不一致（违反严格模式）
+            # 3. 震荡市场也有盈利机会，不应硬性拒绝所有信号
+            # 4. 过度限制导致信号稀缺，错过盈利机会
+            # 5. ADX < 25 的时间占比很高（>60%），会拒绝大部分信号
             
             # 7. 所有过滤器通过
-            logger.info(f"✅ 信号通过所有增强过滤器（包括市场状态过滤）")
+            logger.info(f"✅ 信号通过所有增强过滤器")
             return {'pass': True, 'reason': '通过所有过滤条件'}
             
         except Exception as e:

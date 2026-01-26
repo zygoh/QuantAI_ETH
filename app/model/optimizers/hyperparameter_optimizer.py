@@ -34,6 +34,7 @@ from app.core.constants import (
     GRAD_SCALER_MAX_CONSECUTIVE_OVERFLOW,
     GRAD_SCALER_MAX_SCALE,
     GRAD_SCALER_RESET_THRESHOLD_EPOCHS,
+    HOLD_WEIGHT_MULTIPLIER,
     OPTIMIZER_LR_REDUCE_FACTOR,
     OPTIMIZER_LR_REDUCE_THRESHOLD,
     USE_GMADL_LOSS
@@ -738,13 +739,8 @@ class HyperparameterOptimizer:
                 class_weights = compute_sample_weight('balanced', y_train)
             # ✅ 添加时间衰减权重（与基础模型训练保持一致）
             time_decay = np.exp(-np.arange(len(X_train)) / (len(X_train) * 0.1))[::-1]
-            # HOLD惩罚自适应
-            hold_ratio_tmp = float((y_train == 1).sum()) / max(len(y_train), 1)
-            if self.timeframe == '3m':
-                hold_weight_tmp = float(max(0.35, min(0.70, 0.80 - 0.6 * hold_ratio_tmp)))
-            else:
-                hold_weight_tmp = float(max(0.50, min(0.75, 0.85 - 0.5 * hold_ratio_tmp)))
-            hold_penalty_weights = np.where(y_train == 1, hold_weight_tmp, 1.0)
+            # HOLD增强权重
+            hold_penalty_weights = np.where(y_train == 1, HOLD_WEIGHT_MULTIPLIER, 1.0)
             sample_weights = class_weights * time_decay * hold_penalty_weights
             
             # 训练模型
@@ -945,30 +941,72 @@ class HyperparameterOptimizer:
                     # 3D序列输入：(n_samples, seq_len, n_features)
                     n_features = X_train.shape[2]
                     
-                    # ✅ 关键修复：对3D序列数据进行归一化（防止数值溢出）
-                    logger.info(f"🔧 Trial {trial.number} Fold {fold_idx+1}/5 对序列数据进行归一化...")
-                    logger.info(f"   归一化前统计: 范围=[{X_train.min():.4f}, {X_train.max():.4f}], 均值={X_train.mean():.4f}, 标准差={X_train.std():.4f}")
+                    # 🎯 使用滚动窗口标准化（避免数据泄露）
+                    # 核心原理：对于时间点 t，只使用 [t-window_size+1, t] 的历史数据计算均值和标准差
+                    # 不使用未来数据（t+1, t+2, ...），确保时序数据无泄露
+                    logger.info(f"🔧 Trial {trial.number} Fold {fold_idx+1}/5 使用滚动窗口标准化...")
+                    logger.info(f"   标准化前统计: 范围=[{X_train.min():.4f}, {X_train.max():.4f}], 均值={X_train.mean():.4f}, 标准差={X_train.std():.4f}")
                     
-                    # 方法：将3D数据reshape为2D，按特征归一化，再reshape回3D
-                    # 这样每个特征在所有样本和时间步上都被归一化
+                    # 从 constants.py 读取滚动窗口大小
+                    from app.core.constants import ROLLING_SCALER_WINDOW_SIZE
+                    window_size = ROLLING_SCALER_WINDOW_SIZE
+                    
+                    # 方法：对每个样本的序列，使用滚动窗口计算均值和标准差
+                    # 输入：(n_samples, seq_len, n_features)
+                    # 输出：(n_samples, seq_len, n_features)
                     original_shape_train = X_train.shape
                     original_shape_val = X_val.shape
+                    n_samples_train, seq_len, n_features = original_shape_train
+                    n_samples_val = original_shape_val[0]
                     
-                    # Reshape为2D: (n_samples * seq_len, n_features)
-                    X_train_2d = X_train.reshape(-1, n_features)
-                    X_val_2d = X_val.reshape(-1, n_features)
+                    # 初始化标准化后的数组
+                    X_train_scaled = np.zeros_like(X_train, dtype=np.float32)
+                    X_val_scaled = np.zeros_like(X_val, dtype=np.float32)
                     
-                    # 使用StandardScaler归一化
-                    scaler = StandardScaler()
-                    X_train_2d_scaled = scaler.fit_transform(X_train_2d)
-                    X_val_2d_scaled = scaler.transform(X_val_2d)
+                    # 对训练集进行滚动窗口标准化
+                    for sample_idx in range(n_samples_train):
+                        sample_seq = X_train[sample_idx]  # (seq_len, n_features)
+                        
+                        # 对序列中的每个时间步，使用滚动窗口标准化
+                        for t in range(seq_len):
+                            if t < window_size:
+                                # 前 window_size 个时间步：使用扩展窗口 [0, t+1]
+                                window_data = sample_seq[:t+1]  # (t+1, n_features)
+                            else:
+                                # 后续时间步：使用固定大小的滚动窗口 [t-window_size+1, t+1]
+                                window_data = sample_seq[t-window_size+1:t+1]  # (window_size, n_features)
+                            
+                            # 计算窗口内的均值和标准差（按特征维度）
+                            window_mean = window_data.mean(axis=0)  # (n_features,)
+                            window_std = window_data.std(axis=0)  # (n_features,)
+                            # 防止除零
+                            window_std = np.where(window_std < 1e-10, 1e-10, window_std)
+                            
+                            # 标准化当前时间步
+                            X_train_scaled[sample_idx, t] = (sample_seq[t] - window_mean) / window_std
                     
-                    # Reshape回3D: (n_samples, seq_len, n_features)
-                    X_train = X_train_2d_scaled.reshape(original_shape_train).astype(np.float32)
-                    X_val = X_val_2d_scaled.reshape(original_shape_val).astype(np.float32)
+                    # 对验证集进行滚动窗口标准化（使用相同的逻辑）
+                    for sample_idx in range(n_samples_val):
+                        sample_seq = X_val[sample_idx]  # (seq_len, n_features)
+                        
+                        for t in range(seq_len):
+                            if t < window_size:
+                                window_data = sample_seq[:t+1]
+                            else:
+                                window_data = sample_seq[t-window_size+1:t+1]
+                            
+                            window_mean = window_data.mean(axis=0)
+                            window_std = window_data.std(axis=0)
+                            window_std = np.where(window_std < 1e-10, 1e-10, window_std)
+                            
+                            X_val_scaled[sample_idx, t] = (sample_seq[t] - window_mean) / window_std
                     
-                    logger.info(f"   ✅ 归一化完成")
-                    logger.info(f"   归一化后统计: 范围=[{X_train.min():.4f}, {X_train.max():.4f}], 均值={X_train.mean():.4f}, 标准差={X_train.std():.4f}")
+                    # 更新数据
+                    X_train = X_train_scaled
+                    X_val = X_val_scaled
+                    
+                    logger.info(f"   ✅ 滚动窗口标准化完成 (window_size={window_size})")
+                    logger.info(f"   标准化后统计: 范围=[{X_train.min():.4f}, {X_train.max():.4f}], 均值={X_train.mean():.4f}, 标准差={X_train.std():.4f}")
                     
                     # 转换为PyTorch张量（内存优化）
                     device = torch.device('cuda:0' if self.use_gpu and torch.cuda.is_available() else 'cpu')

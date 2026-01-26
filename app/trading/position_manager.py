@@ -20,6 +20,7 @@ from typing import Dict, List, Any, Optional
 from app.core.cache import cache_manager
 from app.core.config import settings
 from app.core.constants import (
+    BACKTEST_POSITION_RATIO,
     POSITION_MAX_VALUE_USDT,
     POSITION_MIN_VALUE_USDT,
     VIRTUAL_ACCOUNT_INITIAL_BALANCE,
@@ -144,14 +145,15 @@ class PositionManager:
         confidence: float,
         current_price: float,
         is_virtual: bool = True,
-        use_full_position: bool = True  # 🔥 默认使用全仓策略
+        use_full_position: bool = False  # 🔥 默认使用 50% 仓位（与回测一致）
     ) -> float:
         """
-        仓位计算（全仓策略）
+        仓位计算（与回测一致的仓位策略）
         
-        全仓模式：
-        - 仓位价值 = 全部可用余额 × 杠杆
+        仓位模式：
+        - 仓位价值 = 可用余额 × 杠杆 × 仓位比例（默认 50%）
         - 适合：中频交易、高置信度策略
+        - 🎯 与回测保持一致：使用 BACKTEST_POSITION_RATIO（50%）
         
         Args:
             symbol: 交易对
@@ -159,7 +161,7 @@ class PositionManager:
             confidence: 信号置信度
             current_price: 当前价格
             is_virtual: 是否使用虚拟余额
-            use_full_position: 是否使用全仓策略（默认True）
+            use_full_position: 是否使用全仓策略（默认False，使用50%仓位）
             
         Returns:
             仓位大小（USDT）
@@ -186,14 +188,22 @@ class PositionManager:
             
             logger.info(f"📊 使用虚拟余额: {available_balance:.2f} USDT")
             
-            # 2. 全仓策略计算
-            position_value = available_balance * self.leverage
+            # 2. 仓位计算（与回测一致：使用 BACKTEST_POSITION_RATIO）
+            if use_full_position:
+                # 全仓模式（不推荐，风险高）
+                position_ratio = 1.0
+                logger.warning(f"⚠️ 使用全仓模式（风险高，不推荐）")
+            else:
+                # 默认使用与回测一致的仓位比例（50%）
+                position_ratio = BACKTEST_POSITION_RATIO
+            
+            position_value = available_balance * self.leverage * position_ratio
             original_value = position_value
             
             # 限制最大仓位价值（安全保护）
             position_value = min(position_value, self.max_position_value)
             
-            logger.info(f"💰 全仓仓位计算: {symbol} | 余额: {available_balance:.2f} USDT | 杠杆: {self.leverage}x | 仓位价值: {position_value:.2f} USDT" + 
+            logger.info(f"💰 仓位计算: {symbol} | 余额: {available_balance:.2f} USDT | 杠杆: {self.leverage}x | 仓位比例: {position_ratio*100:.0f}% | 仓位价值: {position_value:.2f} USDT" + 
                        (f" (已限制，原始: {original_value:.2f})" if original_value > self.max_position_value else ""))
             
             # 3. 检查最小仓位要求

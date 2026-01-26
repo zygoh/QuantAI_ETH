@@ -25,6 +25,7 @@ from app.core.constants import (
     VIRTUAL_CLOSE_FEE_RATE,
     VIRTUAL_OPEN_FEE_RATE
 )
+from app.core.database_schema import init_database_schema
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +37,13 @@ class PostgreSQLManager:
         self.engine = None
         self.SessionLocal = None
         
-    async def connect(self):
-        """连接到PostgreSQL"""
+    async def connect(self, skip_schema_init: bool = False):
+        """
+        连接到PostgreSQL
+        
+        Args:
+            skip_schema_init: 是否跳过数据库结构初始化（用于回测线程等场景）
+        """
         try:
             # 创建异步引擎
             database_url = (
@@ -64,8 +70,11 @@ class PostgreSQLManager:
             # 测试连接
             await self.health_check()
             
-            # 初始化数据库结构
-            await self._init_schema()
+            # 初始化数据库结构（可选）
+            if not skip_schema_init:
+                await self._init_schema()
+            else:
+                logger.debug("⏭️ 跳过数据库结构初始化（回测线程模式）")
             
             logger.info("PostgreSQL连接成功")
             
@@ -88,286 +97,11 @@ class PostgreSQLManager:
         """初始化数据库表结构（如果不存在）"""
         try:
             async with self.engine.begin() as conn:
-                # 1. 启用 TimescaleDB 扩展
-                await conn.execute(text("""
-                    CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE
-                """))
-                
-                # 2. 创建 klines 表
-                # ✅ 使用 BIGINT 存储 Binance 原始毫秒时间戳
-                await conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS klines (
-                        time BIGINT NOT NULL,
-                        symbol TEXT NOT NULL,
-                        interval TEXT NOT NULL,
-                        open NUMERIC(20, 8) NOT NULL,
-                        high NUMERIC(20, 8) NOT NULL,
-                        low NUMERIC(20, 8) NOT NULL,
-                        close NUMERIC(20, 8) NOT NULL,
-                        volume NUMERIC(30, 8) NOT NULL,
-                        close_time BIGINT NOT NULL,
-                        quote_volume NUMERIC(30, 8),
-                        trades INTEGER DEFAULT 0,
-                        taker_buy_base_volume NUMERIC(30, 8) DEFAULT 0,
-                        taker_buy_quote_volume NUMERIC(30, 8) DEFAULT 0,
-                        PRIMARY KEY (symbol, interval, time)
-                    )
-                """))
-                
-                # 3. TimescaleDB hypertable（由于time改为BIGINT，不使用hypertable）
-                # 注意：TimescaleDB的hypertable要求时间列为TIMESTAMP类型
-                # 由于我们使用BIGINT存储原始时间戳，不启用hypertable
-                # PostgreSQL 的 B-tree 索引对于我们的查询已经足够快
-                logger.debug("跳过 hypertable 创建（time列为BIGINT类型）")
-                
-                # 4. 创建索引
-                await conn.execute(text("""
-                    CREATE INDEX IF NOT EXISTS idx_klines_symbol_interval_time 
-                        ON klines (symbol, interval, time DESC)
-                """))
-                
-                # 5. 添加表和字段注释（klines表）- 每个COMMENT语句单独执行
-                await conn.execute(text("COMMENT ON TABLE klines IS 'K线数据表：存储历史K线数据，用于模型训练和特征工程。使用BIGINT存储毫秒时间戳（不使用hypertable）'"))
-                await conn.execute(text("COMMENT ON COLUMN klines.time IS '开盘时间（毫秒时间戳）'"))
-                await conn.execute(text("COMMENT ON COLUMN klines.symbol IS '交易对（如：BTC/USDT）'"))
-                await conn.execute(text("COMMENT ON COLUMN klines.interval IS '时间周期（3m, 5m, 15m等）'"))
-                await conn.execute(text("COMMENT ON COLUMN klines.open IS '开盘价'"))
-                await conn.execute(text("COMMENT ON COLUMN klines.high IS '最高价'"))
-                await conn.execute(text("COMMENT ON COLUMN klines.low IS '最低价'"))
-                await conn.execute(text("COMMENT ON COLUMN klines.close IS '收盘价'"))
-                await conn.execute(text("COMMENT ON COLUMN klines.volume IS '成交量（基础货币）'"))
-                await conn.execute(text("COMMENT ON COLUMN klines.close_time IS '收盘时间（毫秒时间戳）'"))
-                await conn.execute(text("COMMENT ON COLUMN klines.quote_volume IS '成交额（计价货币）'"))
-                await conn.execute(text("COMMENT ON COLUMN klines.trades IS '成交笔数'"))
-                await conn.execute(text("COMMENT ON COLUMN klines.taker_buy_base_volume IS '主动买入成交量'"))
-                await conn.execute(text("COMMENT ON COLUMN klines.taker_buy_quote_volume IS '主动买入成交额'"))
-                
-                # 6. 创建交易信号表
-                await conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS trading_signals (
-                        id BIGSERIAL PRIMARY KEY,
-                        symbol TEXT NOT NULL,
-                        signal_type TEXT NOT NULL,
-                        confidence NUMERIC(5, 4) NOT NULL,
-                        entry_price NUMERIC(20, 8) NOT NULL,
-                        stop_loss NUMERIC(20, 8) DEFAULT 0,
-                        take_profit NUMERIC(20, 8) DEFAULT 0,
-                        position_size NUMERIC(20, 8) DEFAULT 0,
-                        timestamp TIMESTAMPTZ NOT NULL,
-                        predictions JSONB,
-                        created_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai')::TIMESTAMPTZ
-                    )
-                """))
-                
-                await conn.execute(text("""
-                    CREATE INDEX IF NOT EXISTS idx_signals_symbol_time 
-                        ON trading_signals (symbol, timestamp DESC)
-                """))
-                
-                # 7. 添加表和字段注释（trading_signals表）- 每个COMMENT语句单独执行
-                await conn.execute(text("COMMENT ON TABLE trading_signals IS '交易信号表：存储生成的交易信号，包含多时间框架预测结果（JSONB格式）'"))
-                await conn.execute(text("COMMENT ON COLUMN trading_signals.id IS '主键ID'"))
-                await conn.execute(text("COMMENT ON COLUMN trading_signals.symbol IS '交易对'"))
-                await conn.execute(text("COMMENT ON COLUMN trading_signals.signal_type IS '信号类型：LONG, SHORT, HOLD, CLOSE'"))
-                await conn.execute(text("COMMENT ON COLUMN trading_signals.confidence IS '置信度（0.0000-1.0000）'"))
-                await conn.execute(text("COMMENT ON COLUMN trading_signals.entry_price IS '入场价格'"))
-                await conn.execute(text("COMMENT ON COLUMN trading_signals.stop_loss IS '止损价格'"))
-                await conn.execute(text("COMMENT ON COLUMN trading_signals.take_profit IS '止盈价格'"))
-                await conn.execute(text("COMMENT ON COLUMN trading_signals.position_size IS '仓位大小（USDT价值）'"))
-                await conn.execute(text("COMMENT ON COLUMN trading_signals.timestamp IS '信号生成时间'"))
-                await conn.execute(text("COMMENT ON COLUMN trading_signals.predictions IS '多时间框架预测详情（3m/5m/15m），JSONB格式'"))
-                await conn.execute(text("COMMENT ON COLUMN trading_signals.created_at IS '记录创建时间'"))
-                
-                # 8. 创建虚拟仓位表（必须在orders表之前创建，因为orders表有外键引用）
-                await conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS virtual_positions (
-                        id BIGSERIAL PRIMARY KEY,
-                        symbol TEXT NOT NULL,
-                        side TEXT NOT NULL,
-                        entry_price NUMERIC(20, 8) NOT NULL,
-                        quantity NUMERIC(20, 8) NOT NULL,
-                        entry_time TIMESTAMPTZ NOT NULL,
-                        exit_price NUMERIC(20, 8),
-                        exit_time TIMESTAMPTZ,
-                        stop_loss NUMERIC(20, 8),
-                        take_profit NUMERIC(20, 8),
-                        pnl NUMERIC(20, 8) DEFAULT 0,
-                        pnl_percent NUMERIC(10, 4) DEFAULT 0,
-                        status TEXT NOT NULL DEFAULT 'OPEN',
-                        signal_id TEXT,
-                        created_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai')::TIMESTAMPTZ,
-                        updated_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai')::TIMESTAMPTZ
-                    )
-                """))
-                
-                await conn.execute(text("""
-                    CREATE INDEX IF NOT EXISTS idx_virtual_positions_symbol_status 
-                        ON virtual_positions (symbol, status)
-                """))
-                
-                # 9. 添加表和字段注释（virtual_positions表）- 每个COMMENT语句单独执行
-                await conn.execute(text("COMMENT ON TABLE virtual_positions IS '虚拟仓位表：存储SIGNAL_ONLY模式下的虚拟仓位，支持止损止盈监控、盈亏计算'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.id IS '主键ID'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.symbol IS '交易对'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.side IS '仓位方向：LONG, SHORT'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.entry_price IS '开仓价格'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.quantity IS '仓位数量（USDT价值）'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.entry_time IS '开仓时间'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.exit_price IS '平仓价格'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.exit_time IS '平仓时间'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.stop_loss IS '止损价格'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.take_profit IS '止盈价格'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.pnl IS '盈亏金额'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.pnl_percent IS '盈亏百分比'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.status IS '仓位状态：OPEN, CLOSED'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.signal_id IS '关联的信号ID'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.created_at IS '记录创建时间'"))
-                await conn.execute(text("COMMENT ON COLUMN virtual_positions.updated_at IS '记录更新时间'"))
-                
-                # 10. 创建订单表（在virtual_positions之后，因为orders表有外键引用virtual_positions）
-                await conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS orders (
-                        id BIGSERIAL PRIMARY KEY,
-                        order_id BIGINT,
-                        symbol TEXT NOT NULL,
-                        side TEXT NOT NULL,
-                        order_type TEXT NOT NULL,
-                        status TEXT NOT NULL,
-                        quantity NUMERIC(20, 8) NOT NULL,
-                        price NUMERIC(20, 8) DEFAULT 0,
-                        filled_quantity NUMERIC(20, 8) DEFAULT 0,
-                        commission NUMERIC(20, 8) DEFAULT 0,
-                        timestamp TIMESTAMPTZ NOT NULL,
-                        created_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai')::TIMESTAMPTZ,
-                        is_virtual BOOLEAN DEFAULT FALSE,
-                        signal_id TEXT,
-                        position_id BIGINT,
-                        order_action TEXT,
-                        entry_price NUMERIC(20, 8),
-                        exit_price NUMERIC(20, 8),
-                        pnl NUMERIC(20, 8),
-                        pnl_percent NUMERIC(10, 4),
-                        FOREIGN KEY (position_id) REFERENCES virtual_positions(id) ON DELETE SET NULL
-                    )
-                """))
-                
-                await conn.execute(text("""
-                    CREATE INDEX IF NOT EXISTS idx_orders_symbol_time 
-                        ON orders (symbol, timestamp DESC)
-                """))
-                
-                await conn.execute(text("""
-                    CREATE INDEX IF NOT EXISTS idx_orders_position_id 
-                        ON orders (position_id)
-                """))
-                
-                await conn.execute(text("""
-                    CREATE INDEX IF NOT EXISTS idx_orders_order_action 
-                        ON orders (order_action)
-                """))
-                
-                # 11. 添加表和字段注释（orders表）- 每个COMMENT语句单独执行
-                await conn.execute(text("COMMENT ON TABLE orders IS '订单表：存储所有订单（包括虚拟订单和实盘订单），支持虚拟交易模式（SIGNAL_ONLY）和实盘交易模式（AUTO）。注意：虚拟订单只在平仓时创建（order_action=CLOSE），开仓时只创建virtual_positions记录'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.id IS '主键ID'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.order_id IS '交易所订单ID（实盘订单）'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.symbol IS '交易对'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.side IS '订单方向：BUY, SELL'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.order_type IS '订单类型：MARKET, LIMIT, STOP_MARKET等'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.status IS '订单状态：NEW, FILLED, PARTIALLY_FILLED, CANCELED等'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.quantity IS '订单数量（虚拟订单：USDT价值；实盘订单：币的数量）'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.price IS '订单价格（限价单）'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.filled_quantity IS '已成交数量（虚拟订单：USDT价值；实盘订单：币的数量）'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.commission IS '手续费'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.timestamp IS '订单时间'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.created_at IS '记录创建时间'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.is_virtual IS '是否为虚拟订单（SIGNAL_ONLY模式）'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.signal_id IS '关联的信号ID'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.position_id IS '关联的虚拟仓位ID（用于关联同一仓位的开仓和平仓订单）'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.order_action IS '订单动作：OPEN（开仓，仅实盘订单）, CLOSE（平仓，虚拟订单只在平仓时创建）'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.entry_price IS '开仓价格（虚拟订单）'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.exit_price IS '平仓价格（虚拟订单）'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.pnl IS '盈亏金额（虚拟订单）'"))
-                await conn.execute(text("COMMENT ON COLUMN orders.pnl_percent IS '盈亏百分比（虚拟订单）'"))
-
-                # 11. 创建回测结果表
-                await conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS backtest_runs (
-                        id BIGSERIAL PRIMARY KEY,
-                        symbol TEXT NOT NULL,
-                        days INTEGER NOT NULL,
-                        initial_balance NUMERIC(20, 8) NOT NULL,
-                        final_balance NUMERIC(20, 8) NOT NULL,
-                        total_return NUMERIC(10, 6) NOT NULL,
-                        win_rate NUMERIC(10, 6) NOT NULL,
-                        profit_factor NUMERIC(20, 8) NOT NULL,
-                        max_drawdown NUMERIC(10, 6) NOT NULL,
-                        total_trades INTEGER NOT NULL,
-                        avg_trade_return NUMERIC(20, 8) NOT NULL,
-                        created_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai')::TIMESTAMPTZ
-                    )
-                """))
-
-                await conn.execute(text("""
-                    CREATE INDEX IF NOT EXISTS idx_backtest_runs_symbol_time
-                        ON backtest_runs (symbol, created_at DESC)
-                """))
-
-                await conn.execute(text("COMMENT ON TABLE backtest_runs IS '回测结果表：存储每次回测的汇总指标'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_runs.id IS '主键ID'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_runs.symbol IS '交易对'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_runs.days IS '回测天数'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_runs.initial_balance IS '初始资金'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_runs.final_balance IS '最终资金'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_runs.total_return IS '总收益率'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_runs.win_rate IS '胜率'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_runs.profit_factor IS '盈亏因子'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_runs.max_drawdown IS '最大回撤'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_runs.total_trades IS '总交易次数'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_runs.avg_trade_return IS '平均单笔回报'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_runs.created_at IS '记录创建时间'"))
-
-                # 12. 创建回测交易明细表
-                await conn.execute(text("""
-                    CREATE TABLE IF NOT EXISTS backtest_trades (
-                        id BIGSERIAL PRIMARY KEY,
-                        run_id BIGINT NOT NULL,
-                        entry_time TIMESTAMPTZ NOT NULL,
-                        exit_time TIMESTAMPTZ NOT NULL,
-                        side TEXT NOT NULL,
-                        entry_price NUMERIC(20, 8) NOT NULL,
-                        exit_price NUMERIC(20, 8) NOT NULL,
-                        pnl NUMERIC(20, 8) NOT NULL,
-                        pnl_percent NUMERIC(20, 8) NOT NULL,
-                        reason TEXT,
-                        created_at TIMESTAMPTZ DEFAULT (NOW() AT TIME ZONE 'Asia/Shanghai')::TIMESTAMPTZ,
-                        FOREIGN KEY (run_id) REFERENCES backtest_runs(id) ON DELETE CASCADE
-                    )
-                """))
-
-                await conn.execute(text("""
-                    CREATE INDEX IF NOT EXISTS idx_backtest_trades_run_id
-                        ON backtest_trades (run_id)
-                """))
-
-                await conn.execute(text("COMMENT ON TABLE backtest_trades IS '回测交易明细表：存储每次回测的交易记录'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_trades.id IS '主键ID'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_trades.run_id IS '关联回测ID'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_trades.entry_time IS '开仓时间'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_trades.exit_time IS '平仓时间'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_trades.side IS '方向：LONG/SHORT'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_trades.entry_price IS '开仓价格'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_trades.exit_price IS '平仓价格'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_trades.pnl IS '盈亏金额'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_trades.pnl_percent IS '盈亏百分比'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_trades.reason IS '平仓原因'"))
-                await conn.execute(text("COMMENT ON COLUMN backtest_trades.created_at IS '记录创建时间'"))
-                
-                logger.info("数据库表结构初始化完成")
-                
+                await init_database_schema(conn)
         except Exception as e:
             logger.error(f"初始化数据库结构失败: {e}")
             logger.error(f"错误详情: {type(e).__name__}: {str(e)}")
-            raise  # 🔥 重新抛出异常，确保问题被发现
+            raise
     
     async def write_kline_data(self, data: List[Dict[str, Any]]):
         """批量写入K线数据（🚀 一条 VALUES 列表 SQL，最快速度）"""
@@ -616,11 +350,15 @@ class PostgreSQLManager:
                         trade_sql = text("""
                             INSERT INTO backtest_trades (
                                 run_id, entry_time, exit_time, side,
-                                entry_price, exit_price, pnl, pnl_percent, reason
+                                entry_price, exit_price, position_value,
+                                open_fee, close_fee, total_fee,
+                                pnl, pnl_percent, balance_after, reason
                             )
                             VALUES (
                                 :run_id, :entry_time, :exit_time, :side,
-                                :entry_price, :exit_price, :pnl, :pnl_percent, :reason
+                                :entry_price, :exit_price, :position_value,
+                                :open_fee, :close_fee, :total_fee,
+                                :pnl, :pnl_percent, :balance_after, :reason
                             )
                         """)
                         trade_rows = []
@@ -654,6 +392,10 @@ class PostgreSQLManager:
                                 raise ValueError("entry_price 或 exit_price 为空")
                             if trade.get('entry_price') <= 0 or trade.get('exit_price') <= 0:
                                 raise ValueError(f"价格必须大于0: entry={trade.get('entry_price')}, exit={trade.get('exit_price')}")
+                            if trade.get('position_value') is None or trade.get('position_value') <= 0:
+                                raise ValueError(f"position_value 必须大于0: {trade.get('position_value')}")
+                            if trade.get('balance_after') is None or trade.get('balance_after') <= 0:
+                                raise ValueError(f"balance_after 必须大于0: {trade.get('balance_after')}")
                             
                             trade_rows.append({
                                 'run_id': run_id,
@@ -662,8 +404,13 @@ class PostgreSQLManager:
                                 'side': trade.get('side'),
                                 'entry_price': trade.get('entry_price'),
                                 'exit_price': trade.get('exit_price'),
+                                'position_value': trade.get('position_value'),
+                                'open_fee': trade.get('open_fee', 0),
+                                'close_fee': trade.get('close_fee', 0),
+                                'total_fee': trade.get('total_fee', 0),
                                 'pnl': trade.get('pnl'),
                                 'pnl_percent': trade.get('pnl_percent'),
+                                'balance_after': trade.get('balance_after'),
                                 'reason': trade.get('reason')
                             })
 
