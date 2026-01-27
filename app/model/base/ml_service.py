@@ -100,28 +100,37 @@ class MLService:
             'is_unbalance': True  # 自动处理不平衡类别
         }
 
-        # ✅ 差异化配置：防止过拟合的保守策略（仅3m/5m/15m）
+        # ✅ 差异化配置：根据时间框架特性优化参数（防止过拟合）
+        # 3m: 样本多但噪声大，需要更强正则化
+        # 5m: 主时间框架，保持较高复杂度
+        # 15m: 样本相对少，需要更简单的模型
         self.lgb_params_by_timeframe = {
             '3m': {
-                'num_leaves': 110,       # 样本充足，保持较高复杂度
-                'min_child_samples': 45,
-                'max_depth': 8,
-                'reg_alpha': 0.4,
-                'reg_lambda': 0.4
+                'num_leaves': 80,            # 从110降低到80（减少过拟合）
+                'min_child_samples': 70,     # 从45增加到70（更稳定）
+                'max_depth': 7,              # 从8降低到7
+                'reg_alpha': 0.6,            # 从0.4增加到0.6（更强正则化）
+                'reg_lambda': 0.6,           # 从0.4增加到0.6
+                'feature_fraction': 0.75,    # 新增：特征采样
+                'bagging_fraction': 0.75     # 新增：样本采样
             },
             '5m': {
-                'num_leaves': 110,       # 样本充足，保持较高复杂度
-                'min_child_samples': 45,
-                'max_depth': 8,
-                'reg_alpha': 0.4,
-                'reg_lambda': 0.4
+                'num_leaves': 95,            # 从110降低到95
+                'min_child_samples': 55,     # 从45增加到55
+                'max_depth': 8,              # 保持
+                'reg_alpha': 0.5,            # 从0.4增加到0.5
+                'reg_lambda': 0.5,           # 从0.4增加到0.5
+                'feature_fraction': 0.8,     # 新增
+                'bagging_fraction': 0.8      # 新增
             },
             '15m': {
-                'num_leaves': 110,       # 样本充足(33k+)，保持较高复杂度
-                'min_child_samples': 45,
-                'max_depth': 8,
-                'reg_alpha': 0.4,
-                'reg_lambda': 0.4
+                'num_leaves': 70,            # 从110降低到70（样本少需简化）
+                'min_child_samples': 60,     # 从45增加到60
+                'max_depth': 6,              # 从8降低到6
+                'reg_alpha': 0.7,            # 从0.4增加到0.7（更强正则化）
+                'reg_lambda': 0.7,           # 从0.4增加到0.7
+                'feature_fraction': 0.75,    # 新增
+                'bagging_fraction': 0.75     # 新增
             }
         }
         
