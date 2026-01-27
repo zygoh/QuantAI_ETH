@@ -887,16 +887,6 @@ class BinanceWebSocketClient:
                 "on_open": self._on_open,
                 "on_ping": self._on_ping,
                 "on_pong": self._on_pong,
-                # "sslopt": {
-                #     "context": ssl_context,
-                #     "check_hostname": True,
-                #     "cert_reqs": ssl.CERT_REQUIRED,
-                #     "ssl_version": ssl.PROTOCOL_TLS,  # 使用最新TLS版本
-                #     "timeout": WS_SSL_TIMEOUT  # SSL握手超时
-                # },
-                # "timeout": WS_SSL_TIMEOUT,  # 整体超时
-                # "ping_interval": WS_PING_INTERVAL,  # 启用内置ping
-                # "ping_timeout": WS_PONG_TIMEOUT
             }
             
             # 添加代理配置（仅在USE_PROXY_WS启用时）

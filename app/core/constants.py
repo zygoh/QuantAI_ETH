@@ -326,10 +326,8 @@ DEBUG_LOG_PROBABILITY = 0.01
 WS_RECONNECT_INITIAL_DELAY = 1.0  # 初始重连延迟（秒）
 WS_RECONNECT_MAX_DELAY = 60.0  # 最大重连延迟（秒）
 WS_RECONNECT_BACKOFF_FACTOR = 2.0  # 退避因子
-WS_RECONNECT_MAX_RETRIES = 10  # 最大重试次数
 WS_PING_INTERVAL = 30  # 心跳ping间隔（秒）
 WS_PONG_TIMEOUT = 10  # pong超时时间（秒）
-WS_SSL_TIMEOUT = 30  # SSL握手超时（秒）
 
 # =========================
 # GradScaler配置（自动混合精度）
@@ -427,3 +425,14 @@ ENSEMBLE_META_LEARNER_PARAMS = {
 OPTIMIZER_LR_REDUCE_FACTOR = 0.5
 OPTIMIZER_LR_REDUCE_THRESHOLD = 1e-4
 
+# =========================
+# Walk-Forward 验证配置
+# =========================
+# 🧪 Walk-Forward 验证模式（用于检测模型过拟合）
+# - True: 训练数据截止到回测开始日期之前（验证模式）
+# - False: 使用最新数据训练（生产模式，默认）
+WALK_FORWARD_VALIDATION_ENABLED = True
+
+# Walk-Forward 验证的数据间隔天数
+# 训练数据截止日期 = 当前时间 - WALK_FORWARD_GAP_DAYS
+WALK_FORWARD_GAP_DAYS = 60

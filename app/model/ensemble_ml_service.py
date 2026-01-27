@@ -12,7 +12,7 @@ import tempfile
 import time
 import traceback
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
@@ -64,7 +64,9 @@ from app.core.constants import (
     OPTUNA_TIMEOUT_SECONDS,
     TRAINING_BASE_DAYS_CONFIG,
     TRAINING_DAYS_MULTIPLIER,
-    USE_GMADL_LOSS
+    USE_GMADL_LOSS,
+    WALK_FORWARD_GAP_DAYS,
+    WALK_FORWARD_VALIDATION_ENABLED
 )
 from app.model.optimizers.hyperparameter_optimizer import HyperparameterOptimizer
 from app.services.direction_consistency_checker import TradingDirectionConsistencyChecker, ConsistencyCheck
@@ -138,20 +140,25 @@ class EnsembleMLService(MLService):
     
     def __init__(self):
         super().__init__()
-        
+
         # 集成模型字典 {timeframe: {lgb, xgb, cat, inf, meta}}
         self.ensemble_models = {}
-        
+
         # 🔒 训练状态管理（生产级别：后台训练，不影响预测）
         self.training_in_progress = {}  # {timeframe: bool}
         self.models_ready = {}  # {timeframe: bool}
         self.background_training = False  # 🔥 后台训练标志（不阻止预测）
+        self.is_first_training = True  # 🔑 首次训练标志（首次需等待所有模型完成）
+        self.all_models_ready = False  # 🔑 所有模型就绪标志（首次训练完成后设为True）
         for tf in settings.TIMEFRAMES:
             self.training_in_progress[tf] = False
             self.models_ready[tf] = False
-        
+
         # 🔥 模型版本管理（支持热更新）
         self.model_versions = {}  # {timeframe: version_number}
+
+        # 🔄 临时模型存储（定时训练时使用，全部完成后才替换）
+        self.pending_models = {}  # {timeframe: models_dict}
         
         # 集成权重（Stacking自动学习，这里作为降级方案）
         self.fallback_weights = ENSEMBLE_FALLBACK_WEIGHTS
@@ -436,14 +443,21 @@ class EnsembleMLService(MLService):
         """监控GPU内存使用情况"""
         return monitor_gpu_memory()
     
-    async def _prepare_diverse_training_data(self, timeframe: str, days_multiplier: float = 1.0) -> pd.DataFrame:
+    async def _prepare_diverse_training_data(
+        self,
+        timeframe: str,
+        days_multiplier: float = 1.0,
+        end_time: Optional[int] = None
+    ) -> pd.DataFrame:
         """
         准备差异化训练数据（不同天数）
-        
+
         Args:
             timeframe: 时间框架
             days_multiplier: 天数倍数（1.0=标准，1.5=+50%，2.0=+100%）
-        
+            end_time: 训练数据截止时间（毫秒时间戳，可选）
+                      用于 Walk-Forward 验证模式
+
         Returns:
             K线数据DataFrame
         """
@@ -472,6 +486,7 @@ class EnsembleMLService(MLService):
                 symbol=symbol,
                 interval=timeframe,
                 limit=required_klines,
+                end_time=end_time,
                 rate_limit_delay=0.1
             )
             
@@ -633,10 +648,18 @@ class EnsembleMLService(MLService):
             logger.error(traceback.format_exc())
             return np.array([]), np.array([])
     
-    async def train_all_timeframes(self) -> Dict[str, Any]:
+    async def train_all_timeframes(self, end_time: Optional[int] = None) -> Dict[str, Any]:
         """
         训练所有时间框架的集成模型
-        
+
+        训练策略：
+        - 首次训练：训练完成后立即生效，所有模型就绪后才允许预测
+        - 定时训练：训练到临时存储，全部完成后备份旧模型并热加载新模型
+
+        Args:
+            end_time: 训练数据截止时间（毫秒时间戳，可选）
+                      用于 Walk-Forward 验证模式
+
         Returns:
             训练结果和指标
         """
@@ -649,58 +672,227 @@ class EnsembleMLService(MLService):
             else:
                 logger.info(f"三模型融合: LightGBM + XGBoost + CatBoost")
             logger.info(f"时间框架: {settings.TIMEFRAMES}")
+
+            # 🔑 判断训练模式
+            is_first_training = self.is_first_training
+            if is_first_training:
+                logger.info(f"📌 首次训练模式：所有模型训练完成后才允许预测")
+            else:
+                logger.info(f"🔄 定时训练模式：训练期间使用旧模型预测，全部完成后热加载")
             logger.info("")
-            
+
+            # 标记所有时间框架为训练中
+            for tf in settings.TIMEFRAMES:
+                self.training_in_progress[tf] = True
+            self.background_training = True
+
+            # 清空临时模型存储（用于定时训练）
+            self.pending_models = {}
+
             results = {}
-            
+            training_success = True
+
             for timeframe in settings.TIMEFRAMES:
                 logger.info("=" * 60)
                 logger.info(f"📊 训练 {timeframe} 集成模型...")
                 logger.info("=" * 60)
-                
-                result = await self._train_ensemble_single_timeframe(timeframe)
-                results[timeframe] = result
-                
-                logger.info(f"✅ {timeframe} 集成模型训练完成 - 准确率: {result['accuracy']:.4f}")
+
+                try:
+                    result = await self._train_ensemble_single_timeframe(
+                        timeframe,
+                        end_time=end_time,
+                        save_to_pending=not is_first_training  # 定时训练时保存到临时存储
+                    )
+                    results[timeframe] = result
+                    logger.info(f"✅ {timeframe} 集成模型训练完成 - 准确率: {result['accuracy']:.4f}")
+                except Exception as e:
+                    logger.error(f"❌ {timeframe} 训练失败: {e}")
+                    training_success = False
+                    results[timeframe] = {'accuracy': 0.0, 'error': str(e)}
                 logger.info("")
-            
+
             # 计算平均准确率
-            avg_accuracy = np.mean([r['accuracy'] for r in results.values()])
-            
+            valid_results = [r for r in results.values() if 'error' not in r]
+            avg_accuracy = np.mean([r['accuracy'] for r in valid_results]) if valid_results else 0.0
+
             logger.info("=" * 60)
             logger.info("🎉 Stacking集成模型训练完成")
-            logger.info(f"成功训练: {len(results)}/{len(settings.TIMEFRAMES)} 个时间框架")
+            logger.info(f"成功训练: {len(valid_results)}/{len(settings.TIMEFRAMES)} 个时间框架")
             logger.info(f"平均准确率: {avg_accuracy:.4f}")
             logger.info("=" * 60)
-            logger.info("")
-            
+
+            # 🔑 根据训练模式处理模型更新
+            if is_first_training:
+                # 首次训练：模型已在 _train_ensemble_single_timeframe 中直接生效
+                if training_success:
+                    self.is_first_training = False
+                    self.all_models_ready = True
+                    for tf in settings.TIMEFRAMES:
+                        self.models_ready[tf] = True
+                    logger.info("✅ 首次训练完成，所有模型已就绪，预测功能已启用")
+            else:
+                # 定时训练：全部成功后才热加载
+                if training_success and len(self.pending_models) == len(settings.TIMEFRAMES):
+                    await self._hot_reload_all_models()
+                else:
+                    logger.warning("⚠️ 部分模型训练失败，保持使用旧模型，不进行热加载")
+                    self.pending_models = {}  # 清空临时模型
+
+            # 清除训练状态
+            for tf in settings.TIMEFRAMES:
+                self.training_in_progress[tf] = False
+            self.background_training = False
+
             # 🔑 保存模型指标到Redis缓存（供health_monitor读取）
             metrics_cache = {
                 'accuracy': float(avg_accuracy),
-                'timeframes': {tf: float(r['accuracy']) for tf, r in results.items()},
+                'timeframes': {tf: float(r.get('accuracy', 0.0)) for tf, r in results.items()},
                 'training_date': datetime.now().isoformat(),
                 'method': 'Stacking Ensemble',
                 'models': ['LightGBM', 'XGBoost', 'CatBoost']
             }
             await cache_manager.set_model_metrics(settings.SYMBOL, metrics_cache)
-            
+
             return {
                 'results': results,
                 'average_accuracy': avg_accuracy,
                 'training_date': datetime.now().isoformat()
             }
-            
+
         except Exception as e:
             logger.error(f"❌ 集成模型训练失败: {e}")
             logger.error(traceback.format_exc())
+            # 清除训练状态
+            for tf in settings.TIMEFRAMES:
+                self.training_in_progress[tf] = False
+            self.background_training = False
+            self.pending_models = {}
             raise
+
+    async def _hot_reload_all_models(self):
+        """
+        热加载所有模型（定时训练完成后调用）
+
+        流程：
+        1. 备份当前模型文件
+        2. 保存新模型到磁盘
+        3. 原子性替换内存中的模型
+        4. 更新模型版本和状态
+        """
+        try:
+            logger.info("🔄 开始热加载所有模型...")
+
+            # 1️⃣ 备份旧模型
+            backup_dir = self._backup_current_models()
+            if backup_dir:
+                logger.info(f"📦 旧模型已备份到: {backup_dir}")
+
+            # 2️⃣ 保存新模型到磁盘并加载到内存
+            for timeframe, models in self.pending_models.items():
+                try:
+                    # 更新内存中的模型
+                    old_version = self.model_versions.get(timeframe, 0)
+                    new_version = old_version + 1
+
+                    # 原子性替换
+                    self.ensemble_models[timeframe] = models
+                    self.model_versions[timeframe] = new_version
+                    self.models_ready[timeframe] = True
+
+                    # 保存到磁盘
+                    self._save_ensemble_models(timeframe)
+
+                    logger.info(f"✅ {timeframe} 模型热加载完成 (v{old_version} → v{new_version})")
+
+                except Exception as e:
+                    logger.error(f"❌ {timeframe} 热加载失败: {e}")
+                    # 如果有备份，可以考虑回滚（这里简化处理，只记录错误）
+
+            # 3️⃣ 清空临时存储
+            self.pending_models = {}
+
+            logger.info("✅ 所有模型热加载完成，系统运行在最新模型版本")
+
+        except Exception as e:
+            logger.error(f"❌ 热加载失败: {e}")
+            logger.error(traceback.format_exc())
+
+    def _backup_current_models(self) -> Optional[str]:
+        """
+        备份当前模型文件
+
+        Returns:
+            备份目录路径，如果没有模型则返回None
+        """
+        try:
+            # 检查是否有模型文件需要备份
+            safe_symbol = settings.SYMBOL.replace('/', '_')
+            model_files = list(Path(self.model_dir).glob(f"{safe_symbol}_*"))
+
+            if not model_files:
+                logger.info("📭 没有旧模型需要备份")
+                return None
+
+            # 创建备份目录
+            backup_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_dir = Path(self.model_dir) / "backups" / backup_timestamp
+            backup_dir.mkdir(parents=True, exist_ok=True)
+
+            # 复制模型文件到备份目录
+            for model_file in model_files:
+                if model_file.is_file():
+                    shutil.copy2(model_file, backup_dir / model_file.name)
+
+            logger.info(f"📦 已备份 {len(model_files)} 个模型文件")
+
+            # 清理旧备份（保留最近5个）
+            self._cleanup_old_backups(max_backups=5)
+
+            return str(backup_dir)
+
+        except Exception as e:
+            logger.error(f"❌ 备份模型失败: {e}")
+            return None
+
+    def _cleanup_old_backups(self, max_backups: int = 5):
+        """清理旧备份，保留最近N个"""
+        try:
+            backup_base = Path(self.model_dir) / "backups"
+            if not backup_base.exists():
+                return
+
+            # 获取所有备份目录，按时间排序
+            backup_dirs = sorted(
+                [d for d in backup_base.iterdir() if d.is_dir()],
+                key=lambda x: x.name,
+                reverse=True
+            )
+
+            # 删除超出数量的旧备份
+            for old_backup in backup_dirs[max_backups:]:
+                shutil.rmtree(old_backup)
+                logger.info(f"🗑️ 已删除旧备份: {old_backup.name}")
+
+        except Exception as e:
+            logger.warning(f"⚠️ 清理旧备份失败: {e}")
     
-    async def _train_ensemble_single_timeframe(self, timeframe: str) -> Dict[str, Any]:
+    async def _train_ensemble_single_timeframe(
+        self,
+        timeframe: str,
+        end_time: Optional[int] = None,
+        save_to_pending: bool = False
+    ) -> Dict[str, Any]:
         """
         训练单个时间框架的Stacking集成模型
-        
+
         改进：三个模型使用不同的训练数据，增加多样性
-        
+
+        Args:
+            timeframe: 时间框架
+            end_time: 训练数据截止时间（毫秒时间戳，可选）
+                      用于 Walk-Forward 验证模式
+            save_to_pending: 是否保存到临时存储（定时训练时为True）
+
         流程:
         1. 准备三份不同的训练数据（不同天数）
         2. 训练基础模型（LightGBM, XGBoost, CatBoost）- 各用不同数据
@@ -708,10 +900,20 @@ class EnsembleMLService(MLService):
         4. 训练元学习器（Stacking）
         5. 评估集成效果
         """
-        # 🔥 生产级别：后台训练，不影响预测
-        self.training_in_progress[timeframe] = True
-        self.background_training = True
-        logger.info(f"🔄 {timeframe} 后台训练已开始（预测功能继续运行，训练完成后热更新模型）")
+        # 🔥 训练状态已在 train_all_timeframes 中统一设置
+        if save_to_pending:
+            logger.info(f"🔄 {timeframe} 定时训练中（训练到临时存储，完成后统一热加载）")
+        else:
+            logger.info(f"🔄 {timeframe} 首次训练中（训练完成后直接生效）")
+
+        # 🧪 Walk-Forward 验证模式检测
+        actual_end_time = end_time
+        if WALK_FORWARD_VALIDATION_ENABLED and actual_end_time is None:
+            # Walk-Forward 模式：训练数据截止到 N 天前
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=WALK_FORWARD_GAP_DAYS)
+            actual_end_time = int(cutoff_date.timestamp() * 1000)
+            logger.info(f"🧪 Walk-Forward 验证模式: 训练数据截止到 {cutoff_date.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            logger.info(f"   间隔天数: {WALK_FORWARD_GAP_DAYS}天，回测将使用此后的数据验证模型泛化能力")
         
         try:
             # 1️⃣ 为三个模型准备统一的训练数据（确保公平对比和最大化数据利用）
@@ -722,7 +924,11 @@ class EnsembleMLService(MLService):
             logger.info(f"📥 为三个模型准备统一训练数据（{unified_days}天，{unified_multiplier}倍，最大化数据利用）...")
             
             # 统一使用配置的倍数数据（所有模型使用相同数据，通过不同算法架构和超参数获得多样性）
-            data_unified = await self._prepare_diverse_training_data(timeframe, days_multiplier=unified_multiplier)
+            data_unified = await self._prepare_diverse_training_data(
+                timeframe,
+                days_multiplier=unified_multiplier,
+                end_time=actual_end_time
+            )
             logger.info(f"✅ 统一训练数据: {len(data_unified)}条（{unified_days}天，所有模型共享）")
             
             # 三个模型使用相同数据
@@ -921,12 +1127,10 @@ class EnsembleMLService(MLService):
                 X_xgb_train, y_xgb_train, X_xgb_val, y_xgb_val, X_xgb_test, y_xgb_test,
                 X_cat_train, y_cat_train, X_cat_val, y_cat_val, X_cat_test, y_cat_test,
                 X_seq_train, y_seq_train, X_seq_val, y_seq_val, X_seq_test, y_seq_test,
-                timeframe
+                timeframe,
+                save_to_pending=save_to_pending
             )
-            
-            # 8️⃣ 保存集成模型
-            self._save_ensemble_models(timeframe)
-            
+
             logger.info(f"⏱️ {timeframe} 训练耗时: {ensemble_result['training_time']:.2f}秒")
             
             return ensemble_result
@@ -1124,11 +1328,12 @@ class EnsembleMLService(MLService):
         X_xgb_train, y_xgb_train, X_xgb_val, y_xgb_val, X_xgb_test, y_xgb_test,
         X_cat_train, y_cat_train, X_cat_val, y_cat_val, X_cat_test, y_cat_test,
         X_seq_train, y_seq_train, X_seq_val, y_seq_val, X_seq_test, y_seq_test,
-        timeframe: str
+        timeframe: str,
+        save_to_pending: bool = False
     ) -> Dict[str, Any]:
         """
         使用差异化数据训练Stacking集成模型（支持序列输入）
-        
+
         Args:
             X_lgb_train, y_lgb_train: LightGBM训练数据
             X_lgb_val, y_lgb_val: LightGBM验证数据
@@ -1139,7 +1344,8 @@ class EnsembleMLService(MLService):
             X_seq_train, y_seq_train: Informer-2序列训练数据
             X_seq_val, y_seq_val: Informer-2序列验证数据
             timeframe: 时间框架
-        
+            save_to_pending: 是否保存到临时存储（定时训练时为True）
+
         Returns:
             训练结果字典
         """
@@ -1982,40 +2188,35 @@ class EnsembleMLService(MLService):
             logger.info(f"     元特征数量:     {meta_features_val.shape[1]}个（基础{n_base}+新增{n_enhanced}）")
             logger.info(f"     训练耗时:       {training_time:.2f}秒")
             
-            # 🔄 生产级别：热更新模型（原子性替换）
-            logger.info(f"🔄 {timeframe} 训练完成，准备热更新模型...")
-            
-            # 原子性替换模型（确保预测不会使用半更新的模型）
-            old_version = self.model_versions.get(timeframe, 0)
-            new_version = old_version + 1
-            
-            # ✅ 原子性替换：一次性更新模型字典
-            self.ensemble_models[timeframe] = models
-            
-            # 更新版本和状态（原子操作）
-            self.model_versions[timeframe] = new_version
-            self.models_ready[timeframe] = True
-            self.training_in_progress[timeframe] = False
-            
-            # 检查是否还有其他时间框架在训练
-            self.background_training = any(self.training_in_progress.values())
-            
-            logger.info(f"✅ {timeframe} 模型已热更新（v{old_version} → v{new_version}），预测功能无缝衔接")
-            
-            if not self.background_training:
-                logger.info(f"✅ 所有时间框架训练完成，系统运行在最新模型版本")
-            
+            # 🔄 根据训练模式处理模型更新
+            if save_to_pending:
+                # 定时训练：保存到临时存储，等待统一热加载
+                self.pending_models[timeframe] = models
+                logger.info(f"📦 {timeframe} 模型已保存到临时存储，等待所有时间框架训练完成后统一热加载")
+            else:
+                # 首次训练：直接生效
+                logger.info(f"🔄 {timeframe} 首次训练完成，模型直接生效...")
+
+                old_version = self.model_versions.get(timeframe, 0)
+                new_version = old_version + 1
+
+                # ✅ 原子性替换：一次性更新模型字典
+                self.ensemble_models[timeframe] = models
+
+                # 更新版本（状态由 train_all_timeframes 统一设置）
+                self.model_versions[timeframe] = new_version
+
+                # 保存到磁盘
+                self._save_ensemble_models(timeframe)
+
+                logger.info(f"✅ {timeframe} 模型已生效（v{new_version}）")
+
             return result
             
         except Exception as e:
-            logger.error(f"差异化Stacking训练失败: {e}")
+            logger.error(f"❌ {timeframe} Stacking训练失败: {e}")
             logger.error(traceback.format_exc())
-            # 🔓 训练失败时清除状态（保持旧模型继续运行）
-            self.training_in_progress[timeframe] = False
-            self.background_training = any(self.training_in_progress.values())
-            
-            logger.warning(f"⚠️ {timeframe} 训练失败，继续使用旧模型（预测功能不受影响）")
-            
+            # 训练失败时不更新状态，由 train_all_timeframes 统一处理
             raise
     
     def _train_lightgbm(self, X_train: pd.DataFrame, y_train: pd.Series, timeframe: str, custom_params: Optional[Dict[str, Any]] = None):
@@ -2689,43 +2890,43 @@ class EnsembleMLService(MLService):
             return None
     
     async def predict(
-        self, 
-        data: pd.DataFrame, 
+        self,
+        data: pd.DataFrame,
         timeframe: str
     ) -> Dict[str, Any]:
         """
         集成预测（覆盖父类方法）
-        
+
+        预测策略：
+        - 首次训练：等待所有时间框架训练完成后才允许预测
+        - 定时训练：使用旧模型继续预测，不受训练影响
+
         Args:
             data: K线数据DataFrame
             timeframe: 时间框架
-        
+
         Returns:
-            预测结果，如果模型训练中则返回None
+            预测结果，如果模型未就绪则返回None
         """
         try:
-            #  检生产级别：后台训练不影响预测
-            # 训练和预测并行运行，训练完成后热更新模型
+            # 🔑 首次训练检查：必须等待所有模型就绪
+            if self.is_first_training or not self.all_models_ready:
+                if self.background_training:
+                    training_tfs = [tf for tf, status in self.training_in_progress.items() if status]
+                    logger.debug(f"⏳ 首次训练中（{', '.join(training_tfs)}），等待所有模型就绪后开始预测")
+                    return None
+                elif not self.all_models_ready:
+                    logger.debug(f"⏸️ 模型未就绪，等待首次训练完成")
+                    return None
+
+            # 🔄 定时训练：后台训练不影响预测，使用当前模型继续预测
             if self.background_training:
                 training_tfs = [tf for tf, status in self.training_in_progress.items() if status]
-                logger.debug(f"🔄 后台训练中（{', '.join(training_tfs)}），预测继续使用当前模型")
-            
-            # 仅在首次训练时（模型不存在）才阻止预测
-            if timeframe not in self.ensemble_models and not self.models_ready.get(timeframe, False):
-                if self.training_in_progress.get(timeframe, False):
-                    logger.debug(f"⏳ {timeframe} 首次训练中，等待模型就绪")
-                    return None
-                else:
-                    logger.debug(f"⏸️ {timeframe} 模型未就绪，等待训练完成")
-                    return None
-            
+                logger.debug(f"🔄 定时训练中（{', '.join(training_tfs)}），预测继续使用当前模型")
+
             # 检查集成模型是否存在
             if timeframe not in self.ensemble_models:
-                # 如果模型未就绪且不在训练中，尝试加载
-                if not self.models_ready.get(timeframe, False):
-                    logger.debug(f"⏸️ {timeframe} 模型未就绪，等待训练完成")
-                    return None
-                logger.warning(f"⚠️ {timeframe} 集成模型未训练，降级到单模型")
+                logger.warning(f"⚠️ {timeframe} 集成模型未找到，降级到单模型")
                 return await super().predict(data, timeframe)
             
             # 特征工程
@@ -3507,19 +3708,27 @@ class EnsembleMLService(MLService):
             logger.info("启动Stacking集成机器学习服务...")
             # ✅ 健康检查依赖：标记服务运行状态
             self.is_running = True
-            
+
             # 尝试加载已有集成模型
             all_loaded = True
             for timeframe in settings.TIMEFRAMES:
                 if not self._load_ensemble_models(timeframe):
                     all_loaded = False
                     break
-            
+
             if all_loaded:
-                logger.info("✅ 所有集成模型加载成功")
+                # 🔑 模型加载成功：标记为非首次训练，允许预测
+                self.is_first_training = False
+                self.all_models_ready = True
+                for tf in settings.TIMEFRAMES:
+                    self.models_ready[tf] = True
+                logger.info("✅ 所有集成模型加载成功，预测功能已启用")
             else:
-                logger.warning("⚠️ 未找到集成模型，需要训练")
-            
+                # 🔑 模型未找到：标记为首次训练，等待训练完成
+                self.is_first_training = True
+                self.all_models_ready = False
+                logger.warning("⚠️ 未找到集成模型，需要训练（预测功能将在训练完成后启用）")
+
             logger.info("Stacking集成ML服务启动完成（训练由scheduler管理）")
             
         except Exception as e:
