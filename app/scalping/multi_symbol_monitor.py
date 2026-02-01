@@ -193,12 +193,13 @@ class MultiSymbolMonitor:
 
         logger.info("✅ Scalping WebSocket连接成功")
 
+        # 先设置运行状态，确保断开时能触发重连
+        self.is_running = True
+
         # 订阅各币种数据
         for sym_config in symbols:
             await self._subscribe_symbol(sym_config.symbol)
-            await asyncio.sleep(0.1)  # 避免订阅太快
-
-        self.is_running = True
+            await asyncio.sleep(0.2)  # 增加间隔，避免订阅太快触发限制
 
         # 启动价格历史记录任务
         asyncio.create_task(self._record_price_history())
@@ -249,16 +250,52 @@ class MultiSymbolMonitor:
             return
 
         logger.info("🔄 尝试重连Scalping WebSocket...")
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
 
         try:
+            from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
+            from app.core.config import settings
+
+            # 配置代理
+            proxies = None
+            if settings.USE_PROXY_WS:
+                proxy_url = f"socks5h://{settings.PROXY_HOST}:{settings.PROXY_PORT}"
+                proxies = {'https': proxy_url}
+
+            # 重新创建WebSocket客户端
+            def on_message(_, msg):
+                self._handle_ws_message(msg)
+
+            def on_close(_):
+                logger.warning("⚠️ Scalping WebSocket连接关闭")
+                if self.is_running:
+                    asyncio.run_coroutine_threadsafe(self._reconnect(), self._loop)
+
+            def on_error(_, error):
+                logger.error(f"❌ Scalping WebSocket错误: {error}")
+
+            self._raw_ws_client = UMFuturesWebsocketClient(
+                on_message=on_message,
+                on_close=on_close,
+                on_error=on_error,
+                proxies=proxies
+            )
+
+            logger.info("✅ Scalping WebSocket重连成功")
+
             # 重新订阅
             for symbol in self.symbol_data.keys():
                 await self._subscribe_symbol(symbol)
-                await asyncio.sleep(0.1)
-            logger.info("✅ Scalping WebSocket重连成功")
+                await asyncio.sleep(0.2)
+
+            logger.info(f"✅ 重新订阅 {len(self.symbol_data)} 个币种完成")
+
         except Exception as e:
             logger.error(f"❌ 重连失败: {e}")
+            # 5秒后重试
+            await asyncio.sleep(5)
+            if self.is_running:
+                asyncio.create_task(self._reconnect())
 
     async def _subscribe_symbol(self, symbol: str):
         """订阅单个币种的数据"""
@@ -272,12 +309,14 @@ class MultiSymbolMonitor:
                 speed=100,
                 id=hash(f"{symbol}_depth") % 10000
             )
+            await asyncio.sleep(0.05)  # 每个流之间增加小延迟
 
             # 订阅成交流
             self._raw_ws_client.agg_trade(
                 symbol=exchange_symbol,
                 id=hash(f"{symbol}_trade") % 10000
             )
+            await asyncio.sleep(0.05)
 
             # 订阅1分钟K线（用于ATR和成交量计算）
             self._raw_ws_client.kline(
