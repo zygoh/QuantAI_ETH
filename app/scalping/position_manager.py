@@ -323,16 +323,16 @@ class PositionManager:
         if pnl_pct < required_profit:
             return None
 
-        # 检查与上次加仓的价格间隔
-        if pos.last_addition_price > 0:
-            if pos.direction == "LONG":
-                spacing = (current_price - pos.last_addition_price) / pos.last_addition_price
-            else:
-                spacing = (pos.last_addition_price - current_price) / pos.last_addition_price
+        # 检查与上次入场价的间隔（首次加仓用首仓入场价，后续用上次加仓价）
+        reference_price = pos.last_addition_price if pos.last_addition_price > 0 else pos.entry_price
+        if pos.direction == "LONG":
+            spacing = (current_price - reference_price) / reference_price
+        else:
+            spacing = (reference_price - current_price) / reference_price
 
-            if spacing < scalping_config.pyramid_spacing:
-                logger.debug(f"加仓间隔不足: {spacing:.2%} < {scalping_config.pyramid_spacing:.2%}")
-                return None
+        if spacing < scalping_config.pyramid_spacing:
+            logger.debug(f"加仓间隔不足: {spacing:.2%} < {scalping_config.pyramid_spacing:.2%}")
+            return None
 
         # 计算加仓量（底仓 × 递减因子）
         add_quantity = pos.base_quantity * scalping_config.pyramid_scale_factor
@@ -348,10 +348,15 @@ class PositionManager:
         old_avg = pos.avg_entry_price
         pos.add_position(current_price, add_quantity, add_value)
 
-        # 计算新止损（综合成本价上方）
+        # 计算新止损
+        # 报告逻辑：止损移至综合成本价，确保被扫时不亏本金
+        # LONG: 价格下跌触发止损，所以止损价 < 当前价，设在成本价附近（略高于成本价保护手续费）
+        # SHORT: 价格上涨触发止损，所以止损价 > 当前价，设在成本价附近（略低于成本价保护手续费）
         if pos.direction == "LONG":
+            # LONG止损在成本价上方一点点，被扫时有微利覆盖手续费
             new_stop_loss = pos.avg_entry_price * (1 + scalping_config.pyramid_stop_buffer)
         else:
+            # SHORT止损在成本价下方一点点，被扫时有微利覆盖手续费
             new_stop_loss = pos.avg_entry_price * (1 - scalping_config.pyramid_stop_buffer)
 
         pos.stop_loss = new_stop_loss
@@ -409,15 +414,15 @@ class PositionManager:
         if pnl_pct < scalping_config.pyramid_profit_trigger:
             return False
 
-        # 检查间隔
-        if pos.last_addition_price > 0:
-            if pos.direction == "LONG":
-                spacing = (current_price - pos.last_addition_price) / pos.last_addition_price
-            else:
-                spacing = (pos.last_addition_price - current_price) / pos.last_addition_price
+        # 检查间隔（首次加仓用首仓入场价，后续用上次加仓价）
+        reference_price = pos.last_addition_price if pos.last_addition_price > 0 else pos.entry_price
+        if pos.direction == "LONG":
+            spacing = (current_price - reference_price) / reference_price
+        else:
+            spacing = (reference_price - current_price) / reference_price
 
-            if spacing < scalping_config.pyramid_spacing:
-                return False
+        if spacing < scalping_config.pyramid_spacing:
+            return False
 
         return True
 
