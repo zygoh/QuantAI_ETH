@@ -105,6 +105,17 @@ class TradeData:
 
 
 @dataclass
+class KlineData:
+    """K线数据"""
+    timestamp: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+@dataclass
 class SymbolData:
     """单个币种的实时数据"""
     symbol: str
@@ -114,6 +125,8 @@ class SymbolData:
     volume_1m: float = 0.0        # 1分钟成交量
     trades: deque = field(default_factory=lambda: deque(maxlen=1000))  # 最近成交
     price_history: deque = field(default_factory=lambda: deque(maxlen=60))  # 价格历史（秒级）
+    kline_history: deque = field(default_factory=lambda: deque(maxlen=100))  # K线历史
+    last_kline: Optional[KlineData] = None  # 最新K线
     last_update: Optional[datetime] = None
 
 
@@ -266,7 +279,14 @@ class MultiSymbolMonitor:
                 id=hash(f"{symbol}_trade") % 10000
             )
 
-            logger.info(f"  ✓ 订阅 {symbol} 数据流 (深度+成交)")
+            # 订阅1分钟K线（用于ATR和成交量计算）
+            self._raw_ws_client.kline(
+                symbol=exchange_symbol,
+                interval="1m",
+                id=hash(f"{symbol}_kline") % 10000
+            )
+
+            logger.info(f"  ✓ 订阅 {symbol} 数据流 (深度+成交+K线)")
 
         except Exception as e:
             logger.error(f"订阅 {symbol} 失败: {e}")
@@ -343,14 +363,34 @@ class MultiSymbolMonitor:
                 kline_data = data.get('k', {})
 
             if symbol in self.symbol_data:
-                close_price = float(kline_data.get('c', 0))
-                open_price = float(kline_data.get('o', 0))
-                volume = float(kline_data.get('v', 0))
+                # 解析K线数据
+                kline = KlineData(
+                    timestamp=int(kline_data.get('t', 0)),
+                    open=float(kline_data.get('o', 0)),
+                    high=float(kline_data.get('h', 0)),
+                    low=float(kline_data.get('l', 0)),
+                    close=float(kline_data.get('c', 0)),
+                    volume=float(kline_data.get('v', 0))
+                )
 
-                if open_price > 0:
-                    self.symbol_data[symbol].price_change_1m = (close_price - open_price) / open_price
-                self.symbol_data[symbol].volume_1m = volume
-                self.symbol_data[symbol].last_price = close_price
+                # 检查是否是已完成的K线（x=true表示K线已完成）
+                is_closed = kline_data.get('x', False)
+
+                # 更新数据
+                self.symbol_data[symbol].last_kline = kline
+                self.symbol_data[symbol].last_price = kline.close
+                self.symbol_data[symbol].volume_1m = kline.volume
+
+                if kline.open > 0:
+                    self.symbol_data[symbol].price_change_1m = (kline.close - kline.open) / kline.open
+
+                # 如果K线已完成，添加到历史
+                if is_closed:
+                    self.symbol_data[symbol].kline_history.append(kline)
+                    logger.debug(f"📊 K线完成 {symbol}: O={kline.open:.6f} H={kline.high:.6f} L={kline.low:.6f} C={kline.close:.6f} V={kline.volume:.2f}")
+
+                # 触发回调（让momentum_analyzer更新ATR）
+                self._notify_callbacks(symbol)
 
         except Exception as e:
             logger.error(f"处理K线数据失败 {symbol}: {e}")

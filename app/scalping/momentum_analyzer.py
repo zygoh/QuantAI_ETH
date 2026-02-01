@@ -94,6 +94,40 @@ class MomentumAnalyzer:
         self.min_signal_score = scalping_config.min_signal_score
         self.signal_cooldown = scalping_config.signal_cooldown_seconds
 
+    def _update_from_symbol_data(self, symbol: str, data: SymbolData):
+        """从SymbolData更新K线和ATR缓存"""
+        # 初始化缓存
+        if symbol not in self.kline_history:
+            self.kline_history[symbol] = deque(maxlen=100)
+            self.atr_cache[symbol] = deque(maxlen=60)
+            self.volume_history[symbol] = deque(maxlen=30)
+
+        # 从SymbolData获取K线历史
+        if hasattr(data, 'kline_history') and data.kline_history:
+            kline_list = list(data.kline_history)
+
+            # 同步K线历史到本地缓存
+            local_timestamps = {k.timestamp for k in self.kline_history[symbol]} if self.kline_history[symbol] else set()
+
+            for kline in kline_list:
+                if kline.timestamp not in local_timestamps:
+                    # 转换为本地KlineData格式
+                    local_kline = KlineData(
+                        timestamp=kline.timestamp,
+                        open=kline.open,
+                        high=kline.high,
+                        low=kline.low,
+                        close=kline.close,
+                        volume=kline.volume
+                    )
+                    self.kline_history[symbol].append(local_kline)
+                    self.volume_history[symbol].append(kline.volume)
+
+                    # 计算并缓存ATR
+                    atr = self._calculate_current_atr(symbol)
+                    if atr > 0:
+                        self.atr_cache[symbol].append(atr)
+
     def update_kline(self, symbol: str, kline: KlineData):
         """更新K线数据"""
         if symbol not in self.kline_history:
@@ -129,6 +163,9 @@ class MomentumAnalyzer:
         # 检查信号冷却
         if self._is_in_cooldown(symbol):
             return None
+
+        # 从SymbolData更新K线和ATR缓存
+        self._update_from_symbol_data(symbol, data)
 
         # 获取价格历史
         price_history = list(data.price_history)
@@ -282,19 +319,20 @@ class MomentumAnalyzer:
         Returns:
             当前成交量 / 5分钟均量
         """
-        if symbol not in self.volume_history:
-            return 1.0
+        # 优先使用K线的成交量数据
+        if symbol in self.volume_history and len(self.volume_history[symbol]) >= 5:
+            volumes = list(self.volume_history[symbol])
+            avg_volume = sum(volumes[-5:]) / 5
 
-        volumes = list(self.volume_history[symbol])
-        if len(volumes) < 5:
-            return 1.0
+            # 当前成交量（使用最新K线或SymbolData的volume_1m）
+            current_volume = data.volume_1m if data.volume_1m > 0 else (volumes[-1] if volumes else 0)
 
-        # 计算5分钟均量
-        avg_volume = sum(volumes[-5:]) / 5
+            if avg_volume > 0 and current_volume > 0:
+                return current_volume / avg_volume
 
-        # 获取当前成交量（从最近成交计算）
+        # 回退：从trades计算
         trades = list(data.trades)
-        if not trades:
+        if len(trades) < 10:
             return 1.0
 
         # 最近1分钟的成交量
@@ -304,6 +342,16 @@ class MomentumAnalyzer:
             if current_time - t.timestamp <= 60000
         )
 
+        # 前5分钟的成交量
+        older_volume = sum(
+            t.quantity for t in trades
+            if 60000 < current_time - t.timestamp <= 360000
+        )
+
+        if older_volume <= 0:
+            return 1.0
+
+        avg_volume = older_volume / 5
         if avg_volume <= 0:
             return 1.0
 
