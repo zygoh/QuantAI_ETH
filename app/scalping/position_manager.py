@@ -266,7 +266,8 @@ class PositionManager:
             logger.error(f"已达最大持仓数 {max_positions}")
             return False
 
-        position_value = quantity * entry_price / leverage
+        # position_value 是名义价值（仓位总价值），不是保证金
+        position_value = quantity * entry_price
 
         position = PositionInfo(
             symbol=symbol,
