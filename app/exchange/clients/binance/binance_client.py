@@ -3,8 +3,6 @@ Binance API客户端
 """
 # StdLib
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 import os
@@ -12,42 +10,63 @@ import ssl
 import time
 import traceback
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 from typing import Optional, List, Dict, Any, Callable
 
 # Third-Party
-import requests
-import websocket
 from binance.um_futures import UMFutures
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
 
 # Local App
-from app.core.constants import (
-    BINANCE_API_LIMIT_LARGE,
-    BINANCE_API_LIMIT_MEDIUM,
-    BINANCE_API_MAX_LIMIT,
-    BINANCE_MAX_INITIAL_RETRIES,
-    BINANCE_MAX_WAIT_SECONDS,
-    BINANCE_MESSAGE_TIMEOUT_SECONDS,
-    BINANCE_PERIODIC_RETRY_INTERVAL_SECONDS,
-    BINANCE_RATE_LIMIT_DELAY_SECONDS,
-    BINANCE_RECV_WINDOW_MS,
-    BINANCE_WARNING_TIMEOUT_SECONDS,
-    WS_PING_INTERVAL,
-    WS_PONG_TIMEOUT,
-    WS_RECONNECT_BACKOFF_FACTOR,
-    WS_RECONNECT_INITIAL_DELAY,
-    WS_RECONNECT_MAX_DELAY
-)
 from app.core.config import settings
-from app.exchange.base_exchange_client import (
-    BaseExchangeClient,
-    UnifiedKlineData,
-    UnifiedOrderData,
-    UnifiedTickerData
-)
 from app.exchange.mappers import SymbolMapper
+
+# ==================== 常量定义 ====================
+# API限制
+BINANCE_API_LIMIT_LARGE = 1000
+BINANCE_API_LIMIT_MEDIUM = 500
+BINANCE_RECV_WINDOW_MS = 5000
+BINANCE_RATE_LIMIT_DELAY_SECONDS = 0.2
+
+# WebSocket重连配置
+WS_RECONNECT_INITIAL_DELAY = 1.0
+WS_RECONNECT_MAX_DELAY = 60.0
+WS_RECONNECT_BACKOFF_FACTOR = 2.0
+BINANCE_MAX_INITIAL_RETRIES = 3
+BINANCE_PERIODIC_RETRY_INTERVAL_SECONDS = 120
+BINANCE_MAX_WAIT_SECONDS = 30
+
+# WebSocket心跳配置
+WS_PING_INTERVAL = 30
+WS_PONG_TIMEOUT = 10
+BINANCE_MESSAGE_TIMEOUT_SECONDS = 1200
+BINANCE_WARNING_TIMEOUT_SECONDS = 600
+
+
+# ==================== 统一数据结构 ====================
+@dataclass
+class UnifiedKlineData:
+    """统一K线数据格式"""
+    timestamp: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    close_time: int = 0
+    quote_volume: float = 0.0
+    trades: int = 0
+    taker_buy_base_volume: float = 0.0
+    taker_buy_quote_volume: float = 0.0
+
+
+@dataclass
+class UnifiedTickerData:
+    """统一行情数据格式"""
+    symbol: str
+    price: float
+    timestamp: int
 
 logger = logging.getLogger(__name__)
 
@@ -396,7 +415,7 @@ class WebSocketHeartbeat:
         return time_since_pong <= self.pong_timeout
 
 
-class BinanceClient(BaseExchangeClient):
+class BinanceClient:
     """Binance API客户端"""
     
     @staticmethod
@@ -1142,7 +1161,7 @@ class BinanceWebSocketClient:
             logger.debug(f"   当前状态: ws_client={self.ws_client is not None}, is_connected={self.is_connected}")
             success_count = 0
             failed_subs = []
-            
+
             for sub_info in self.subscriptions:
                 try:
                     if sub_info['type'] == 'kline':
@@ -1154,6 +1173,24 @@ class BinanceWebSocketClient:
                     elif sub_info['type'] == 'ticker':
                         self._do_subscribe_ticker(sub_info['symbol'])
                         success_count += 1
+                    elif sub_info['type'] == 'depth':
+                        exchange_symbol = SymbolMapper.to_exchange_format(sub_info['symbol'], "BINANCE")
+                        self.ws_client.partial_book_depth(
+                            symbol=exchange_symbol,
+                            level=sub_info['level'],
+                            speed=100,
+                            id=hash(f"{sub_info['symbol']}_depth") % 10000
+                        )
+                        logger.info(f"✓ 恢复深度订阅: {sub_info['symbol']}")
+                        success_count += 1
+                    elif sub_info['type'] == 'agg_trade':
+                        exchange_symbol = SymbolMapper.to_exchange_format(sub_info['symbol'], "BINANCE")
+                        self.ws_client.agg_trade(
+                            symbol=exchange_symbol,
+                            id=hash(f"{sub_info['symbol']}_trade") % 10000
+                        )
+                        logger.info(f"✓ 恢复成交订阅: {sub_info['symbol']}")
+                        success_count += 1
                     else:
                         logger.warning(f"  ⚠️ 未知订阅类型: {sub_info.get('type')}")
                 except Exception as sub_error:
@@ -1162,14 +1199,14 @@ class BinanceWebSocketClient:
                     logger.error(f"     错误详情: {sub_error}")
                     logger.error(traceback.format_exc())
                     failed_subs.append(sub_info)
-            
+
             if success_count == len(self.subscriptions):
                 logger.info(f"✅ 订阅恢复完成: {success_count}/{len(self.subscriptions)} 全部成功")
             else:
                 logger.warning(f"⚠️ 订阅恢复完成: {success_count}/{len(self.subscriptions)} 成功")
                 if failed_subs:
                     logger.error(f"  失败列表: {failed_subs}")
-                    
+
         except Exception as e:
             logger.error(f"恢复订阅失败: {e}")
             logger.error(traceback.format_exc())
@@ -1327,10 +1364,10 @@ class BinanceWebSocketClient:
         try:
             # 🔧 修复: 使用映射后的符号构造 stream_name
             exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
-            
+
             stream_name = f"{exchange_symbol.lower()}@ticker"
             self.callbacks[stream_name] = callback
-            
+
             # 保存订阅信息以便重连后恢复
             sub_info = {
                 'type': 'ticker',
@@ -1338,11 +1375,71 @@ class BinanceWebSocketClient:
             }
             if sub_info not in self.subscriptions:
                 self.subscriptions.append(sub_info)
-            
+
             self._do_subscribe_ticker(symbol)
-                
+
         except Exception as e:
             logger.error(f"订阅价格数据失败: {e}")
+
+    def subscribe_depth(self, symbol: str, level: int, callback: Callable):
+        """订阅订单簿深度数据"""
+        try:
+            exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
+
+            # 深度流格式: symbol@depth5@100ms 或 symbol@depth10@100ms 或 symbol@depth20@100ms
+            stream_name = f"{exchange_symbol.lower()}@depth{level}@100ms"
+            self.callbacks[stream_name] = callback
+
+            # 保存订阅信息以便重连后恢复
+            sub_info = {
+                'type': 'depth',
+                'symbol': symbol,
+                'level': level
+            }
+            if sub_info not in self.subscriptions:
+                self.subscriptions.append(sub_info)
+
+            if self.ws_client and self.is_connected:
+                self.ws_client.partial_book_depth(
+                    symbol=exchange_symbol,
+                    level=level,
+                    speed=100,
+                    id=hash(f"{symbol}_depth") % 10000
+                )
+                logger.info(f"✓ 订阅深度: {symbol} ({exchange_symbol}) level={level}")
+            else:
+                logger.warning(f"⚠️ WebSocket未连接，延迟订阅深度: {symbol}")
+
+        except Exception as e:
+            logger.error(f"订阅深度数据失败 {symbol}: {e}")
+
+    def subscribe_agg_trade(self, symbol: str, callback: Callable):
+        """订阅聚合成交流数据"""
+        try:
+            exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
+
+            stream_name = f"{exchange_symbol.lower()}@aggTrade"
+            self.callbacks[stream_name] = callback
+
+            # 保存订阅信息以便重连后恢复
+            sub_info = {
+                'type': 'agg_trade',
+                'symbol': symbol
+            }
+            if sub_info not in self.subscriptions:
+                self.subscriptions.append(sub_info)
+
+            if self.ws_client and self.is_connected:
+                self.ws_client.agg_trade(
+                    symbol=exchange_symbol,
+                    id=hash(f"{symbol}_trade") % 10000
+                )
+                logger.info(f"✓ 订阅成交: {symbol} ({exchange_symbol})")
+            else:
+                logger.warning(f"⚠️ WebSocket未连接，延迟订阅成交: {symbol}")
+
+        except Exception as e:
+            logger.error(f"订阅成交数据失败 {symbol}: {e}")
     
     def stop_websocket(self):
         """停止WebSocket连接"""

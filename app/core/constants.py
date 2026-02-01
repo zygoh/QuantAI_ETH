@@ -1,452 +1,161 @@
 """
-系统常量定义
+全局常量定义
+
+集中管理系统中使用的所有常量，便于维护和修改。
 """
-# StdLib
-from decimal import Decimal
+from enum import Enum
 
-# 🎯 虚拟交易手续费配置（模拟实际交易所费率）- 使用Decimal确保精度
-VIRTUAL_OPEN_FEE_RATE = Decimal('0.0002')   # 开仓手续费：0.02% (Maker)
-VIRTUAL_CLOSE_FEE_RATE = Decimal('0.0005')  # 平仓手续费：0.05% (Taker)
 
-# 💰 模拟交易初始资金与缓存键
-VIRTUAL_ACCOUNT_INITIAL_BALANCE = 20.0  # 虚拟账户初始余额（USDT）
-VIRTUAL_BALANCE_KEY = "virtual_account:balance"
+# ==================== API限制 ====================
 
-# 🧪 回测默认参数
-BACKTEST_DEFAULT_SYMBOL = "BTC/USDT"
-BACKTEST_DEFAULT_DAYS = 60
-BACKTEST_INITIAL_BALANCE = 20.0
-BACKTEST_DEFAULT_LEVERAGE = 20.0
-BACKTEST_DEFAULT_PRIMARY_TIMEFRAME = "5m"
-BACKTEST_DEFAULT_TIMEFRAMES = ["3m", "5m", "15m"]
-BACKTEST_POSITION_RATIO = 0.35  # 回测仓位管理配置默认使用 35% 仓位（降低风险）
-
-# =========================
-# 交易信号与交易执行
-# =========================
-# 🎯 交易配置（统一管理，回测和实盘都使用）
-DEFAULT_SYMBOL = "BTC/USDT"  # 默认交易对
-DEFAULT_LEVERAGE = 20  # 默认杠杆倍数（回测和模拟交易都使用）
-DEFAULT_CONFIDENCE_THRESHOLD = 0.65  # 默认置信度阈值（提高到0.65以过滤低质量信号）
-DEFAULT_TIMEFRAMES = ["3m", "5m", "15m"]  # 默认多时间框架配置（回测和模拟交易都使用）
-
-# 🎯 信号质量过滤阈值（统一管理，确保回测和实盘一致）
-SIGNAL_PRIMARY_TIMEFRAME_MIN_CONFIDENCE = 0.55  # 主时间框架（5m）最低置信度要求
-SIGNAL_TREND_CONSISTENCY_MIN_CONFIDENCE = 0.55  # 趋势一致性检查的最低置信度
-SIGNAL_HIGH_CONFIDENCE_THRESHOLD = 0.65  # 高置信度信号阈值（触发量能确认）
-SIGNAL_HOLD_HIGH_CONFIDENCE_THRESHOLD = 0.70  # HOLD高置信度阈值（触发权重衰减）
-SIGNAL_VOLUME_RATIO_THRESHOLD = 0.7  # 量能比例阈值（当前量能/平均量能）
-SIGNAL_MAX_DAILY_VOLATILITY = 0.08  # 最大日波动率（8%）
-SIGNAL_MIN_DAILY_VOLATILITY = 0.005  # 最小日波动率（0.5%）
-
-SIGNAL_MIN_INTERVAL_SECONDS = 180
-SIGNAL_WARMUP_COUNT = 5
-SIGNAL_BUFFER_DAYS = 30
-SIGNAL_PREDICTION_CACHE_TTL = {"3m": 300, "5m": 600, "15m": 1200}
-SIGNAL_FEATURE_CACHE_TTL = 300
-# 🔥 多时间框架权重配置（更均衡的权重分配）
-SIGNAL_TIMEFRAME_WEIGHTS = {"3m": 0.20, "5m": 0.60, "15m": 0.20}
-SIGNAL_PREDICTION_DAYS = {"3m": 10, "5m": 10, "15m": 10}
-SIGNAL_MIN_REQUIRED_KLINES = 250
-
-# 🎯 固定止盈止损百分比（严格模式：回测/实盘/风控 fallback 使用同一套配置）
-# 当前配置：3:1 盈亏比（0.012/0.036）
-STOP_LOSS_PCT = 0.012
-TAKE_PROFIT_PCT = 0.036
-
-# ✅ 兼容旧命名：严格模式下与主配置保持一致（禁止分叉）
-STOP_LOSS_PCT_FALLBACK = STOP_LOSS_PCT
-TAKE_PROFIT_PCT_FALLBACK = TAKE_PROFIT_PCT
-
-# 🎯 动态止盈止损 ATR 倍数配置（用于回测和实盘）
-# 盈亏比策略：2:1（止盈距离是止损的2倍），提高单笔盈利覆盖亏损能力
-STOP_LOSS_ATR_MULTIPLIER = 1.5  # 止损距离：entry_price ± ATR × 1.5
-TAKE_PROFIT_ATR_MULTIPLIER = 3.0  # 止盈距离：entry_price ± ATR × 3.0（2:1盈亏比）
-
-ADX_TRENDING_THRESHOLD = 30
-ADX_RANGING_THRESHOLD = 25
-
-POSITION_MAX_VALUE_USDT = 500000
-POSITION_MIN_VALUE_USDT = 20
-POSITION_MAX_SIZE = 1000
-POSITION_MAX_DAILY_TRADES = 50
-
-# =========================
-# 风险与频率控制
-# =========================
-DRAWDOWN_WARNING_RATIO = 0.33
-DRAWDOWN_CRITICAL_RATIO = 0.67
-DRAWDOWN_CHECK_INTERVAL_SECONDS = 60
-DRAWDOWN_LOOKBACK_DAYS = 30
-DRAWDOWN_EVENT_THRESHOLD = 0.01
-DRAWDOWN_CACHE_TTL_SECONDS = 300
-DRAWDOWN_ALERT_CACHE_TTL_SECONDS = 3600
-
-FREQUENCY_BASE_LIMIT = 0.3
-FREQUENCY_MAX_DAILY_TRADES = 20
-FREQUENCY_MIN_TRADE_INTERVAL_MINUTES = 15
-FREQUENCY_FEE_RATE = 0.0007
-FREQUENCY_TARGET_FEE_IMPACT = 0.05
-FREQUENCY_VOLATILITY_THRESHOLD = 0.02
-FREQUENCY_TREND_STRENGTH_THRESHOLD = 0.6
-FREQUENCY_MIN_CONFIDENCE = 0.4
-FREQUENCY_ATR_WINDOW = 14
-FREQUENCY_TREND_FACTOR_BASE = 0.5
-FREQUENCY_PERFORMANCE_FACTOR_BASE = 0.5
-FREQUENCY_MIN_LIMIT = 0.05
-FREQUENCY_MAX_LIMIT = 0.8
-FREQUENCY_OVERFLOW_MULTIPLIER = 1.2
-FREQUENCY_FEE_OVERFLOW_MULTIPLIER = 1.5
-
-DIRECTION_CONSISTENCY_THRESHOLD = 0.7
-DIRECTION_CONFIDENCE_THRESHOLD = 0.6
-DIRECTION_STRENGTH_THRESHOLD = 0.5
-
-RISK_FREE_RATE = 0.02
-KELLY_MAX_POSITION_RATIO = 0.25
-RISK_ATR_KLINES_COUNT = 100
-RISK_METRICS_QUERY_LIMIT = 1000
-RISK_ATR_WINDOW = 14
-RISK_ATR_TAKE_PROFIT_MULTIPLIER = 3.6
-RISK_ATR_TRAILING_STOP_MULTIPLIER = 1.0
-RISK_FIXED_TRAILING_STOP_PCT = 0.01
-RISK_VAR_LIMIT_PCT = 0.05
-RISK_MONTE_CARLO_SIMULATIONS = 10000
-
-# =========================
-# 风险管理固定阈值（非环境变量）
-# =========================
-VAR_CONFIDENCE = 0.95  # VaR/ES默认置信度
-MAX_DRAWDOWN_LIMIT = 0.10  # 最大回撤比例（10%，更严格的风控）
-KELLY_MULTIPLIER = 0.25  # Kelly系数乘数
-
-# =========================
-# 系统执行器与并发
-# =========================
-# 🔑 全局线程池配置（根据硬件优化）
-# 硬件：8核CPU + 16GB GPU
-EXECUTOR_MAX_WORKERS = 8  # 最大并发任务数（充分利用8核CPU + GPU并行能力）
-# 并发能力：
-#   - 1个训练任务（GPU密集，8-12GB显存）
-#   - 3-4个回测任务（GPU并行，2-3GB显存/任务）
-#   - 3-4个预测任务（GPU轻量，<1GB显存/任务）
-# GPU并发策略：
-#   - LightGBM/XGBoost/CatBoost 支持多任务并发（OpenCL/CUDA独立流）
-#   - PyTorch (Informer-2) 使用显存池管理，支持有限并发
-
-# =========================
-# 机器学习与特征
-# =========================
-# 训练数据天数配置（增加到365天以覆盖更完整的市场周期）
-TRAINING_BASE_DAYS_CONFIG = {"3m": 270, "5m": 270, "15m": 270}  # 基础天数
-TRAINING_DAYS_MULTIPLIER = 1.35  # Ensemble模型统一倍数（270 × 1.35 ≈ 365天）
-
-# 标签生成窗口配置（预测未来多少根K线）
-# 增加窗口期以减少HOLD占比，让更多样本有机会触及止盈/止损线
-LABEL_WINDOW_CONFIG = {"3m": 12, "5m": 15, "15m": 20}
-# 标签生成障碍系数配置 (止盈倍数, 止损倍数)
-# 适当降低障碍系数，增加LONG/SHORT标签比例
-LABEL_PT_SL_CONFIG = {"3m": (1.5, 1.2), "5m": (1.5, 1.2), "15m": (1.6, 1.3)}
-LABEL_VOLATILITY_WINDOW = 20
-LABEL_VOLATILITY_DEFAULT = 0.002
-LABEL_VOLATILITY_MIN = 0.001
-
-# LightGBM 基础参数配置（优化版：增强泛化能力）
-LGB_N_ESTIMATORS = 250            # 从300降低到250（减少过拟合）
-LGB_NUM_LEAVES = 31               # 保持
-LGB_LEARNING_RATE = 0.04          # 从0.05降低到0.04（更稳定）
-LGB_FEATURE_FRACTION = 0.75       # 从0.8降低到0.75（更强正则化）
-LGB_BAGGING_FRACTION = 0.75       # 从0.8降低到0.75
-LGB_BAGGING_FREQ = 3              # 从5降低到3（更频繁的Bagging）
-LGB_MAX_DEPTH = 6                 # 保持
-LGB_MIN_CHILD_SAMPLES = 50        # 从40增加到50（更稳定）
-LGB_REG_ALPHA = 0.6               # 从0.5增加到0.6（更强L1正则化）
-LGB_REG_LAMBDA = 0.6              # 从0.5增加到0.6（更强L2正则化）
-LGB_MIN_SPLIT_GAIN = 0.03         # 从0.02增加到0.03（减少无效分裂）
-
-FEATURE_IMPORTANCE_THRESHOLD_HIGH = 0.1
-FEATURE_IMPORTANCE_THRESHOLD_LOW = 0.01
-
-# 🔧 特征工程配置
-# 特征选择数量：根据时间框架差异化配置
-FEATURE_SELECTION_TOP_N = 40  # 默认值（从50降低到40，减少过拟合）
-
-# 📊 滚动窗口标准化配置（避免数据泄露）
-# 使用约1天的数据计算统计量，防止未来信息泄露
-ROLLING_SCALER_WINDOW_SIZE = 300  # 从500降低到300（约1天的5m K线数量）
-
-EFFECTIVE_SAMPLE_BETA_BASE = 0.999
-EFFECTIVE_SAMPLE_BETA_NON_3M = 0.995
-
-# Optuna 超参数优化配置
-OPTUNA_N_TRIALS = 80              # 从100降低到80（足够找到好参数）
-OPTUNA_TIMEOUT_SECONDS = 1500     # 从1800降低到1500（25分钟）
-INFORMER_N_TRIALS = 15            # 从20降低到15（深度学习搜索更耗时）
-INFORMER_TIMEOUT_SECONDS = 2400   # 从3600降低到2400（40分钟）
-
-# 🤖 Informer-2 深度学习配置（优化版：减少过拟合，加快收敛）
-INFORMER_D_MODEL = 96              # 从128降低到96（减少参数量）
-INFORMER_N_HEADS = 6               # 从8降低到6（更稳定的注意力）
-INFORMER_N_LAYERS = 2              # 从3降低到2（减少过拟合风险）
-INFORMER_EPOCHS = 35               # 从50降低到35（足够收敛）
-INFORMER_BATCH_SIZE = 128          # 从256降低到128（更稳定的梯度）
-INFORMER_LEARNING_RATE = 0.0008    # 从0.0005增加到0.0008（加快收敛）
-# 序列长度配置：减少序列长度以降低内存占用和过拟合风险
-INFORMER_SEQ_LEN_CONFIG = {"3m": 48, "5m": 48, "15m": 32}
-INFORMER_WARMUP_EPOCHS = 5
-INFORMER_MAX_NAN_INF_TOLERANCE = 30
-INFORMER_MAX_CONSECUTIVE_NAN_INF = 8
-INFORMER_GRAD_CLIP_NORM = 2.0
-
-ENSEMBLE_FALLBACK_WEIGHTS = {"lgb": 0.4, "xgb": 0.3, "cat": 0.3}
-
-STABILITY_N_BAGGING_MODELS = 5
-STABILITY_BOOTSTRAP_RATIO = 0.8
-STABILITY_FEATURE_SAMPLING_RATIO = 0.8
-STABILITY_DIVERSITY_THRESHOLD = 0.3
-STABILITY_STABILITY_THRESHOLD = 0.8
-
-# =========================
-# 机器学习损失函数配置
-# =========================
-USE_GMADL_LOSS = False  # 生产默认使用稳定的交叉熵损失
-GMADL_ALPHA = 1.0  # GMADL损失alpha
-GMADL_BETA = 0.5  # GMADL损失beta
-
-GMADL_PROB_MIN = 1e-7
-GMADL_PROB_MAX = 1.0 - 1e-7
-GMADL_ERROR_MIN = 1e-7
-
-# 致命错误惩罚配置（用于降低LONG↔SHORT错误率）
-USE_FATAL_ERROR_PENALTY = True  # 是否启用致命错误惩罚
-FATAL_ERROR_WEIGHT = 5.0  # 致命错误权重（LONG↔SHORT错误的惩罚倍数）
-# HOLD权重倍数：平衡HOLD预测，避免过度预测HOLD
-# 降低到6.0以避免模型过度偏向HOLD信号
-HOLD_WEIGHT_MULTIPLIER = 6.0  # HOLD类别权重倍数（从15.0降低到6.0）
-
-MOMENTUM_ROC_PERIODS = [5, 10, 20]
-MOMENTUM_MOMENTUM_PERIODS = [5, 10, 20]
-MOMENTUM_RSI_WINDOW = 14
-MOMENTUM_RSI_ACCEL_SHIFT = 1
-FEATURE_EPS = 1e-10
-FEATURE_STD_EPS = 1e-8
-
-PRICE_CHANGE_PERIODS = [2, 3, 5, 10, 20]
-PRICE_ACCELERATION_SHIFTS = [1, 3, 5]
-PRICE_MOMENTUM_WINDOW = 5
-
-VOLUME_SMA_WINDOW = 20
-VOLUME_OBV_SMA_WINDOW = 20
-VWAP_WINDOW = 20
-VOLUME_BREAKOUT_FAST_WINDOW = 5
-VOLUME_BREAKOUT_SLOW_WINDOW = 20
-PRICE_CHANGE_SHORT_WINDOW = 1
-PRICE_CHANGE_LONG_WINDOW = 5
-VOLUME_CHANGE_WINDOW = 5
-VOLUME_WEIGHTED_WINDOW = 20
-
-ORDER_FLOW_EPS = 1e-10
-ORDER_FLOW_LARGE_WINDOW = 20
-ORDER_FLOW_LARGE_STD_MULTIPLIER = 2
-ORDER_FLOW_CUM_WINDOWS = [5, 10, 20]
-
-MICROSTRUCTURE_POSITION_WINDOWS = [5, 20, 50]
-MICROSTRUCTURE_OVERBOUGHT_THRESHOLD = 0.8
-MICROSTRUCTURE_OVERSOLD_THRESHOLD = 0.2
-MICROSTRUCTURE_PRICE_RANGE_EPS = 1e-10
-MICROSTRUCTURE_BODY_STRONG_RATIO = 0.6
-MICROSTRUCTURE_DOJI_RATIO = 0.1
-MICROSTRUCTURE_EFFICIENCY_PERIODS = [5, 10, 20]
-MICROSTRUCTURE_FRACTAL_PERIODS = [10, 20]
-MICROSTRUCTURE_HURST_PERIODS = [20, 50]
-MICROSTRUCTURE_ATR_EPS = 1e-10
-
-MTF_INTERVAL_3M_MAX = 3.5
-MTF_INTERVAL_5M_MAX = 7.5
-MTF_INTERVAL_15M_MAX = 22.5
-MTF_RESAMPLE_MAP = {"3m": "3min", "5m": "5min", "15m": "15min"}
-MTF_SMA_FAST_WINDOW = 20
-MTF_SMA_SLOW_WINDOW = 50
-MTF_RSI_WINDOW = 14
-MTF_VOLATILITY_WINDOW = 20
-MTF_SHIFT_LAG = 1
-
-PATTERN_SHADOW_MULTIPLIER = 2
-PATTERN_SHADOW_SMALL_RATIO = 0.5
-PATTERN_DOJI_RATIO = 0.1
-PATTERN_GAP_EPS = 1e-10
-PATTERN_SHIFT_1 = 1
-PATTERN_SHIFT_2 = 2
-
-SENTIMENT_SHORT_VOL_WINDOW = 20
-SENTIMENT_LONG_VOL_WINDOW = 100
-SENTIMENT_EPS = 1e-10
-SENTIMENT_RSI_OVERBOUGHT = 70
-SENTIMENT_RSI_OVERSOLD = 30
-SENTIMENT_RSI_MOMENTUM_SHIFT = 5
-SENTIMENT_RSI_VOL_WINDOW = 10
-SENTIMENT_VOLUME_MA_WINDOW = 20
-SENTIMENT_VOLUME_SURGE_MULTIPLIER = 2
-SENTIMENT_VOLUME_DRY_MULTIPLIER = 0.5
-SENTIMENT_PRICE_TREND_WINDOW = 5
-SENTIMENT_VOLUME_TREND_WINDOW = 5
-SENTIMENT_VOL_REGIME_SHORT = 20
-SENTIMENT_VOL_REGIME_LONG = 100
-SENTIMENT_SMA_TREND_SHIFT = 1
-SENTIMENT_MACD_NORM_PCT = 0.01
-SENTIMENT_SCORE_WINDOW = 10
-SENTIMENT_PRESSURE_MA_WINDOW = 5
-SENTIMENT_VOLUME_WEIGHTED_WINDOW = 10
-SENTIMENT_VOLUME_STD_WINDOW = 20
-SENTIMENT_MARKET_BREADTH_WINDOWS = [5, 20, 50]
-SENTIMENT_EXTREME_WINDOW = 50
-SENTIMENT_EXTREME_STD_MULTIPLIER = 2
-SENTIMENT_EXTREME_DECAY_WINDOW = 5
-
-SWING_WINDOWS = [5, 10]
-SWING_RANGE_WINDOWS = [20, 50]
-SWING_RANGE_EPS = 1e-10
-SWING_FREQUENCY_WINDOW = 50
-SWING_CENTER_MULTIPLIER = 2
-
-TREND_ADX_WEAK = 20
-TREND_ADX_STRONG = 40
-TREND_SLOPE_WINDOWS = [5, 10, 20]
-TREND_SMA_WINDOWS = [5, 10, 20]
-TREND_EMA_FAST = 12
-TREND_EMA_SLOW = 26
-TREND_EPS = 1e-10
-SUPPORT_RESISTANCE_WINDOWS = [10, 20, 50]
-BREAKOUT_WINDOWS = [20, 50]
-TREND_BREAKOUT_SHIFT = 1
-
-# =========================
-# 数据服务与接口
-# =========================
-WS_RECONNECT_DELAY_SECONDS = 5
-WS_DEFAULT_INTERVAL_MS = 60 * 1000
-HISTORICAL_DATA_BATCH_SIZE = 1000
-HISTORICAL_DATA_RATE_LIMIT_DELAY = 0.1
-HEALTH_CHECK_INTERVAL_SECONDS = 300
-HEALTH_DATA_FRESHNESS_SECONDS = 60
-HEALTH_BUFFER_MIN_SIZE = 200
-HEALTH_CHECK_QUERY_LIMIT = 100
-ALERT_CACHE_TTL_SECONDS = 3600
-DEBUG_LOG_PROBABILITY = 0.01
-
-# =========================
-# WebSocket重连与心跳
-# =========================
-WS_RECONNECT_INITIAL_DELAY = 1.0  # 初始重连延迟（秒）
-WS_RECONNECT_MAX_DELAY = 60.0  # 最大重连延迟（秒）
-WS_RECONNECT_BACKOFF_FACTOR = 2.0  # 退避因子
-WS_PING_INTERVAL = 30  # 心跳ping间隔（秒）
-WS_PONG_TIMEOUT = 10  # pong超时时间（秒）
-
-# =========================
-# GradScaler配置（自动混合精度）
-# =========================
-# 🔧 优化：降低增长因子和增长间隔，减少Scale值过大问题
-GRAD_SCALER_GROWTH_FACTOR = 1.1  # 从1.2降低到1.1，更保守的增长策略
-GRAD_SCALER_GROWTH_INTERVAL = 3000  # 从2000增加到3000，增长更慢
-GRAD_SCALER_MAX_SCALE = 50000.0  # 从100000.0降低到50000.0，更早触发重置
-GRAD_SCALER_AUTO_RESET = True  # 是否启用自动重置
-GRAD_SCALER_RESET_THRESHOLD_EPOCHS = 3  # 触发重置的epoch阈值
-GRAD_SCALER_MAX_CONSECUTIVE_OVERFLOW = 5  # 最大连续溢出次数
-
-# =========================
-# 交易所客户端
-# =========================
-BINANCE_MAX_INITIAL_RETRIES = 3
-BINANCE_PERIODIC_RETRY_INTERVAL_SECONDS = 120.0
-BINANCE_RECV_WINDOW_MS = 60000
-BINANCE_MAX_WAIT_SECONDS = 10
-BINANCE_MESSAGE_TIMEOUT_SECONDS = 1200
-BINANCE_WARNING_TIMEOUT_SECONDS = 600
-BINANCE_API_MAX_LIMIT = 1500
+# Binance API限制
 BINANCE_API_LIMIT_LARGE = 1000
 BINANCE_API_LIMIT_MEDIUM = 500
+BINANCE_RECV_WINDOW_MS = 5000
 BINANCE_RATE_LIMIT_DELAY_SECONDS = 0.2
 
-OKX_API_LIMIT_LARGE = 300
-OKX_API_LIMIT_MEDIUM = 100
-OKX_PING_TIMEOUT_SECONDS = 10
-OKX_DEFAULT_INTERVAL_MS = 60 * 1000
-OKX_MAX_RETRIES = 3
+# 请求超时
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 60
+DEFAULT_WS_TIMEOUT_SECONDS = 30
 
-# =========================
-# 数据库
-# =========================
-DB_POOL_RECYCLE_SECONDS = 3600
 
-# =========================
-# API默认参数
-# =========================
-API_SIGNAL_RECENT_HOURS = 1
-API_SIGNAL_RECENT_LIMIT = 1
-API_SIGNAL_HISTORY_LIMIT = 1000
-API_SIGNAL_LATEST_DATA_LIMIT = 200
-API_SIGNALS_HISTORY_HOURS = 24
-API_SIGNALS_HISTORY_LIMIT = 100
-API_SIGNALS_PERFORMANCE_DAYS = 7
-API_SIGNALS_SUMMARY_DAYS = 30
-SIGNAL_API_DELAY_SECONDS = 0.1
-SIGNAL_HOLD_WEIGHT_DECAY = 0.5
+# ==================== WebSocket配置 ====================
 
-# =========================
-# 调度器
-# =========================
-SCHEDULER_MODEL_TRAINING_DAY = 5
-SCHEDULER_DATA_UPDATE_INTERVAL_HOURS = 1
-SCHEDULER_DATA_INTEGRITY_CHECK_INTERVAL_HOURS = 6
+# WebSocket重连配置
+WS_RECONNECT_INITIAL_DELAY = 1.0
+WS_RECONNECT_MAX_DELAY = 60.0
+WS_RECONNECT_BACKOFF_FACTOR = 2.0
+WS_MAX_INITIAL_RETRIES = 3
+WS_PERIODIC_RETRY_INTERVAL_SECONDS = 120
+WS_MAX_WAIT_SECONDS = 30
 
-# =========================
-# 交易安全参数
-# =========================
-TRADING_SAFE_STOP_LOSS_LONG_PCT = 0.985
-TRADING_SAFE_TAKE_PROFIT_LONG_PCT = 1.03
-TRADING_SAFE_STOP_LOSS_SHORT_PCT = 1.015
-TRADING_SAFE_TAKE_PROFIT_SHORT_PCT = 0.97
+# WebSocket心跳配置
+WS_PING_INTERVAL = 30
+WS_PONG_TIMEOUT = 10
+WS_MESSAGE_TIMEOUT_SECONDS = 1200
+WS_WARNING_TIMEOUT_SECONDS = 600
 
-# =========================
-# 集成学习
-# =========================
-ENSEMBLE_TRAIN_SPLIT_RATIO = 0.6
-ENSEMBLE_VAL_SPLIT_RATIO = 0.8
-ENSEMBLE_META_HOLD_PENALTY_WEIGHTS = {0.60: 0.45, 0.50: 0.55, 0.40: 0.65, 0.0: 0.75}
-ENSEMBLE_META_TIME_DECAY_FACTOR = 0.1
-ENSEMBLE_MAX_SPLITS = 5
-ENSEMBLE_META_LEARNER_PARAMS = {
-    # 元学习器配置优化：简化模型结构，增强泛化能力
-    "n_estimators": 150,  # 从200降低到150（防过拟合）
-    "max_depth": 4,       # 从5降低到4（元学习器应简单）
-    "learning_rate": 0.05,  # 从0.03增加到0.05（加快收敛）
-    "num_leaves": 31,     # 从24增加到31（更好的表达能力）
-    "min_child_samples": 40,  # 从30增加到40（防过拟合）
-    "subsample": 0.85,    # 从0.7增加到0.85（更多样本参与）
-    "colsample_bytree": 0.85,  # 从0.7增加到0.85（更多特征参与）
-    "reg_alpha": 0.5,     # 从0.3增加到0.5（更强正则化）
-    "reg_lambda": 0.5,    # 从0.3增加到0.5（更强正则化）
-    "feature_fraction": 0.85,  # 新增（特征采样）
-    "bagging_freq": 3,    # 从5降低到3（更频繁的Bagging）
-    "random_state": 42,
-    "verbose": -1
-}
 
-# =========================
-# 优化器
-# =========================
-OPTIMIZER_LR_REDUCE_FACTOR = 0.5
-OPTIMIZER_LR_REDUCE_THRESHOLD = 1e-4
+# ==================== 交易默认值 ====================
 
-# =========================
-# Walk-Forward 验证配置
-# =========================
-# 🧪 Walk-Forward 验证模式（用于检测模型过拟合）
-# - True: 训练数据截止到回测开始日期之前（验证模式）
-# - False: 使用最新数据训练（生产模式，默认）
-WALK_FORWARD_VALIDATION_ENABLED = True
+# 默认杠杆
+DEFAULT_LEVERAGE = 20
+MAX_LEVERAGE = 75
+MIN_LEVERAGE = 1
 
-# Walk-Forward 验证的数据间隔天数
-# 训练数据截止日期 = 当前时间 - WALK_FORWARD_GAP_DAYS
-WALK_FORWARD_GAP_DAYS = 60
+# 默认仓位比例
+DEFAULT_POSITION_RATIO = 0.5
+MAX_POSITION_RATIO = 1.0
+MIN_POSITION_RATIO = 0.1
+
+# 默认止损止盈
+DEFAULT_STOP_LOSS_PCT = 0.008  # 0.8%
+DEFAULT_TAKE_PROFIT_PCT = 0.015  # 1.5%
+MIN_STOP_LOSS_PCT = 0.005  # 0.5%
+MAX_STOP_LOSS_PCT = 0.01  # 1%
+
+
+# ==================== 风控限制 ====================
+
+# 每日限制
+DEFAULT_MAX_DAILY_TRADES = 50
+DEFAULT_MAX_DAILY_LOSS_PCT = 0.15  # 15%
+
+# 连续亏损限制
+DEFAULT_MAX_CONSECUTIVE_LOSSES = 3
+DEFAULT_COOLDOWN_MINUTES = 30
+
+# 持仓限制
+DEFAULT_MAX_POSITION_HOLD_MINUTES = 30
+
+
+# ==================== 信号配置 ====================
+
+# 动量阈值
+DEFAULT_MOMENTUM_THRESHOLD = 0.005  # 0.5%
+DEFAULT_VOLUME_MULTIPLIER = 2.0
+DEFAULT_ATR_PERIOD = 14
+DEFAULT_ATR_FILTER_MULTIPLIER = 1.5
+
+# 信号冷却
+DEFAULT_SIGNAL_COOLDOWN_SECONDS = 60
+DEFAULT_MIN_SIGNAL_SCORE = 0.5
+
+
+# ==================== 数据配置 ====================
+
+# K线数据
+DEFAULT_KLINE_LIMIT = 500
+MAX_KLINE_LIMIT = 1000
+
+# 订单簿深度
+DEFAULT_ORDERBOOK_DEPTH = 20
+
+# 价格历史
+DEFAULT_PRICE_HISTORY_SIZE = 60
+DEFAULT_TRADE_HISTORY_SIZE = 1000
+
+
+# ==================== 手续费 ====================
+
+# Binance手续费率
+BINANCE_MAKER_FEE_RATE = 0.0002  # 0.02%
+BINANCE_TAKER_FEE_RATE = 0.0005  # 0.05%
+
+
+# ==================== 枚举类型 ====================
+
+class TradingDirection(str, Enum):
+    """交易方向"""
+    LONG = "LONG"
+    SHORT = "SHORT"
+
+
+class OrderType(str, Enum):
+    """订单类型"""
+    MARKET = "MARKET"
+    LIMIT = "LIMIT"
+    STOP_MARKET = "STOP_MARKET"
+    TAKE_PROFIT_MARKET = "TAKE_PROFIT_MARKET"
+
+
+class OrderSide(str, Enum):
+    """订单方向"""
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+class PositionSide(str, Enum):
+    """持仓方向"""
+    LONG = "LONG"
+    SHORT = "SHORT"
+    BOTH = "BOTH"
+
+
+class ExitReason(str, Enum):
+    """平仓原因"""
+    TAKE_PROFIT = "take_profit"
+    STOP_LOSS = "stop_loss"
+    TRAILING_STOP = "trailing_stop"
+    BREAKEVEN = "breakeven"
+    TIMEOUT = "timeout"
+    MANUAL = "manual"
+
+
+class WebSocketErrorType(str, Enum):
+    """WebSocket错误类型"""
+    SSL_ERROR = "ssl_error"
+    NETWORK_ERROR = "network_error"
+    TIMEOUT_ERROR = "timeout_error"
+    PROTOCOL_ERROR = "protocol_error"
+    UNKNOWN_ERROR = "unknown_error"
+
+
+# ==================== 交易所标识 ====================
+
+class Exchange(str, Enum):
+    """支持的交易所"""
+    BINANCE = "BINANCE"
+    # 预留扩展
+    # OKX = "OKX"
+    # BYBIT = "BYBIT"

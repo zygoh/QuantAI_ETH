@@ -1,88 +1,136 @@
-QuantAI 量化交易系统（Strict Mode）
+# 30天百倍剥头皮交易系统
 
 ## 项目简介
 
-本项目是一个基于 **FastAPI** 的量化交易/信号系统，核心能力：
+本项目是一个基于 **FastAPI** 的高频剥头皮交易系统，核心目标：
 
-- **多时间框架信号生成**：默认 `["3m", "5m", "15m"]`，以 5m 为主框架合成信号。
-- **虚拟交易（默认）**：默认模式为 `SIGNAL_ONLY`，走完整的“信号→下单→成交→仓位更新”流程，但不依赖交易所下单权限。
-- **模型体系**：以 Stacking 集成（`lgb/xgb/cat/meta`）为主，支持 GPU 加速（LightGBM/XGBoost/CatBoost/PyTorch）。
-- **数据与存储**：WebSocket 实时行情 + PostgreSQL/TimescaleDB（K线/信号/订单/仓位）+ Redis（缓存/状态）。
-- **严格模式（Strict Mode）**：训练、回测、实时预测共享同一条特征工程与预测路径，避免回测“特供逻辑”带来的偏差。
+- **目标**：5U → 500U（30天100倍）
+- **策略**：高频剥头皮 + 复利滚仓
+- **核心能力**：
+  - 订单流分析（买卖压力、大单追踪、成交量异动、动量分析）
+  - 自动扫描高波动币种
+  - 多仓位管理
+  - 追踪止盈 + 移动保本
+  - 阶段性杠杆调整（根据资金量）
 
-## 严格模式原则（必须读）
+## 系统架构
 
-- **训练 / 回测 / 实盘预测**：必须走同一套特征工程与预测逻辑（禁止分支逻辑）。
-- **防未来函数**：特征只允许使用 \(t-1\) 及更早数据（详见项目规则与测试）。
-- 关键对比文档：
-  - `docs/backtest_vs_realtime_config.md`
-  - `docs/config_unification_and_cumulative_backtest.md`
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        main.py                               │
+│                    (FastAPI 应用入口)                         │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    ScalpingEngine                            │
+│                    (剥头皮交易引擎)                            │
+│  - 整合所有模块                                               │
+│  - 自动交易执行                                               │
+│  - 币种刷新管理                                               │
+└─────────────────────────────────────────────────────────────┘
+         │              │              │              │
+         ▼              ▼              ▼              ▼
+┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+│   Signal    │ │  Position   │ │    Risk     │ │   Symbol    │
+│  Generator  │ │   Manager   │ │ Controller  │ │   Scanner   │
+│ (信号生成器) │ │ (仓位管理器) │ │ (风控系统)  │ │ (币种扫描器) │
+└─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘
+         │              │              │
+         ▼              │              │
+┌─────────────┐         │              │
+│  OrderFlow  │         │              │
+│  Analyzer   │         │              │
+│(订单流分析器)│         │              │
+└─────────────┘         │              │
+         │              │              │
+         ▼              ▼              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  MultiSymbolMonitor                          │
+│                  (多币种实时监控)                              │
+│  - WebSocket 订单簿                                          │
+│  - WebSocket 成交流                                          │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    BinanceClient                             │
+│                   (币安交易所客户端)                           │
+└─────────────────────────────────────────────────────────────┘
+```
 
-## 重要行为（⚠️ 启动即清理）
+## 核心模块
 
-启动 `main.py` 时会进行 **系统启动清理**（用于保证“干净启动”）：
+| 模块 | 文件 | 功能 |
+|------|------|------|
+| 交易引擎 | `app/scalping/scalping_engine.py` | 整合所有模块，自动交易执行 |
+| 信号生成器 | `app/scalping/signal_generator.py` | 整合订单流分析，生成交易信号 |
+| 订单流分析 | `app/scalping/orderflow_analyzer.py` | 买卖压力、大单追踪、动量分析 |
+| 仓位管理 | `app/scalping/position_manager.py` | 复利滚仓，连胜加仓/连亏减仓 |
+| 风控系统 | `app/scalping/risk_controller.py` | 止盈止损、追踪止盈、持仓超时 |
+| 币种扫描 | `app/scalping/symbol_scanner.py` | 自动扫描高波动币种 |
+| 多币种监控 | `app/scalping/multi_symbol_monitor.py` | WebSocket 实时数据订阅 |
+| 回测系统 | `app/scalping/backtest.py` | 历史数据回测 |
+| 配置 | `app/scalping/config.py` | 系统配置参数 |
 
-- **清空数据库交易相关表**（如 `klines / virtual_positions / orders / trading_signals` 等，含序列重置）
-- **清理 Redis 缓存**（多个 `pattern`）
-- **重置虚拟账户余额**
-- **重置回测累积余额（内存）**
+## 交易阶段
 
-因此：
+系统根据资金量自动调整策略：
 
-- **不要把 `PG_* / REDIS_*` 指向你想保留数据的生产库**。
-- 回测结果写库后也会在下一次回测/启动时被清理（回测表会被 TRUNCATE）。
+| 阶段 | 资金范围 | 杠杆 | 最大持仓数 | 策略特点 |
+|------|----------|------|-----------|----------|
+| Phase 1 | 5U - 50U | 20x | 1 | 高波动meme币，激进，集中火力 |
+| Phase 2 | 50U - 200U | 30x | 3 | 中等波动，平衡 |
+| Phase 3 | 200U+ | 50x | 全部 | 主流币，稳健，不错过机会 |
+
+## 风控机制
+
+### 止盈止损
+- **初始止损**：1.5%（价格波动，不含杠杆）
+- **追踪止盈**：盈利2.0%后激活，从最高点回撤0.8%触发
+- **移动保本**：盈利1.2%后止损移至入场价+0.4%
+
+### 信号质量控制
+- **最小信号得分**：0.72（只做高确定性交易）
+- **信号冷却时间**：30秒（避免频繁切换方向）
+- **趋势确认**：启用（防止逆势交易）
+
+### 风控限制
+- 单日最大亏损：15%
+- 单日最大交易次数：100
+- 连续亏损暂停阈值：3次
+- 连亏后冷却时间：10分钟
+- 最大持仓时间：30分钟
 
 ## 环境要求
 
 - **Windows 10/11 + PowerShell**
-- Python **3.12**（推荐与当前工程一致）
-- （可选）NVIDIA GPU（CUDA 环境用于加速训练/预测）
-- PostgreSQL（建议启用 TimescaleDB 扩展）+ Redis
+- Python **3.12**
+- （可选）NVIDIA GPU（CUDA 环境用于加速）
 
 ## 安装依赖
 
 ```powershell
-cd "f:\AI\20251007"
+cd "F:\AI\20251007_1"
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-### GPU（可选）
+## 配置
 
-`requirements.txt` 已包含 `torch/cupy-cuda12x` 等依赖；如你的环境需要使用官方 CUDA 轮子，可参考 `requirements.txt` 注释里的 PyTorch 安装方式。
-
-## 配置（推荐使用 .env 覆盖）
-
-项目使用 `pydantic-settings` 读取 `.env`，环境变量会覆盖默认值（见 `app/core/config.py`）。
+项目使用 `pydantic-settings` 读取 `.env`，环境变量会覆盖默认值。
 
 建议在项目根目录创建 `.env`（**不要提交到 git**），示例：
 
 ```dotenv
 # 服务
 HOST=0.0.0.0
-PORT=8000
+PORT=8001
 
-# 交易对/信号
-SYMBOL=BTC/USDT
-LEVERAGE=20
-CONFIDENCE_THRESHOLD=0.6
-TIMEFRAMES=["3m","5m","15m"]
-
-# 数据库（⚠️ 请使用测试库/本地库，避免被启动清理误删）
-PG_HOST=127.0.0.1
-PG_PORT=5432
-PG_USER=postgres
-PG_PASSWORD=your_password
-PG_DATABASE=trading-data
-
-# Redis
-REDIS_URL=redis://127.0.0.1:6379
-REDIS_DB=0
-
-# GPU
-USE_GPU=true
-GPU_DEVICE=cuda:0
+# 日志
+LOG_LEVEL=INFO
+LOG_FILE=trading_system.log
 
 # 代理（可选）
 USE_PROXY=false
@@ -90,15 +138,6 @@ USE_PROXY_WS=false
 PROXY_HOST=127.0.0.1
 PROXY_PORT=10808
 PROXY_TYPE=socks5
-```
-
-## 数据库初始化
-
-- 系统启动会自动初始化表结构（见 `app/core/database.py`、`app/core/database_schema.py`）。
-- 也可以手动执行 `init_timescaledb.sql`：
-
-```powershell
-psql -U postgres -d trading-data -f .\init_timescaledb.sql
 ```
 
 ## 启动服务
@@ -109,128 +148,80 @@ python .\main.py
 
 启动后可访问：
 
-- `GET /health`（基础健康检查）
-- `GET /api/system/info`（环境与配置）
+- `GET /health`（健康检查）
+- `GET /api/scalping/status`（交易状态）
 
 日志默认写入 `.\logs\trading_system.log`。
 
 ## API 快速参考
 
-说明：接口依赖 `HTTP Bearer`，但当前鉴权为简化实现（`app/api/dependencies.py`），**Authorization 可不传**。
+### 剥头皮交易
 
-### 训练
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/scalping/start` | 启动交易引擎 |
+| POST | `/api/scalping/stop` | 停止交易引擎 |
+| GET | `/api/scalping/status` | 获取交易状态 |
+| POST | `/api/scalping/close-position` | 手动平仓 |
+| GET | `/api/scalping/scan-symbols` | 扫描高波动币种 |
+| GET | `/api/scalping/debug` | 调试信息 |
 
-- `POST /api/training/start`：训练模型
-  - body：`{"force_retrain": false}`
-- `GET /api/training/status`：模型状态
-- `GET /api/training/metrics`：训练指标
-- `GET /api/training/features`：特征重要性（训练后）
-- `GET /api/training/schedule`：调度状态
-- `POST /api/training/schedule/run`：手动触发训练任务
+### 回测
 
-### 回测（异步任务）
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/scalping/backtest` | 创建回测任务 |
+| GET | `/api/scalping/backtest/{task_id}` | 查询回测结果 |
 
-- `POST /api/training/backtest`：创建回测任务（立即返回 `task_id`）
-- `GET /api/training/backtest/{task_id}`：查询任务状态/结果
-- `GET /api/training/backtest`：列出任务
-
-回测请求体（核心字段）：
+回测请求体：
 
 ```json
 {
-  "symbol": "BTC/USDT",
-  "days": 60,
-  "initial_balance": 20.0,
-  "leverage": 20.0,
-  "primary_timeframe": "5m",
-  "timeframes": ["3m", "5m", "15m"],
-  "include_trades": false,
-  "cumulative_mode": false
+  "symbol": "1000PEPE/USDT",
+  "days": 7,
+  "initial_balance": 5.0,
+  "leverage": 20
 }
 ```
 
-说明：
-
-- `cumulative_mode=true` 时，回测会以 **累积模式**运行：接口侧把 `initial_balance` 置为 `null`，由回测服务使用“内存累积余额”继续跑；独立模式会在任务完成后自动重置累积余额。
-
-### 信号
-
-- `GET /api/signals`：信号历史（默认查最近 24h）
-- `GET /api/signals/latest`：最新信号
-- `POST /api/signals/generate`：手动生成信号（`{"symbol":"BTC/USDT","force":false}`）
-- `GET /api/signals/performance`：信号表现统计
-- `GET /api/signals/statistics`：信号统计摘要
-- `GET /api/signals/model/prediction`：取最新数据做一次模型预测（用于调试）
-
-### 仓位（虚拟仓位）
-
-- `GET /api/positions`
-- `GET /api/positions/summary`
-- `GET /api/positions/risk`
-- `GET /api/positions/{symbol}`
-- `GET /api/positions/{symbol}/value`
-
-### 交易（手动/模式切换）
-
-- `POST /api/trading/execute`：手动下单（`LONG/SHORT/CLOSE`）
-- `POST /api/trading/mode`：切换交易模式（`AUTO` / `SIGNAL_ONLY`）
-- `GET /api/trading/status`
-- `GET /api/trading/performance`
-- `POST /api/trading/close/{symbol}`
-- `GET /api/trading/limits`
-
-⚠️ 注意：工程默认以“信号/虚拟交易”为主；若切换 `AUTO`，请先确认你的交易所客户端与密钥配置，避免产生真实下单风险。
-
-### 绩效/风险
-
-- `GET /api/performance`
-- `GET /api/performance/risk`
-- `GET /api/performance/drawdown`
-- `GET /api/performance/returns`
-- `GET /api/performance/ratios`
-- `GET /api/performance/summary`
-
 ### 系统
 
-- `GET /api/system/status`
-- `POST /api/system/control`（`START/STOP/PAUSE/RESUME`）
-- `GET /api/system/health`（详细健康检查）
-- `GET /api/system/info`
-- `GET /api/system/tasks` / `POST /api/system/tasks/{task_name}/run`
-- `GET /api/system/cache/stats`
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/system/info` | 系统信息 |
+| GET | `/health` | 健康检查 |
 
-### WebSocket
+## 代码结构
 
-- 连接：`/api/ws/connect`
-- 订阅消息示例：
-
-```json
-{"type":"subscribe","channel":"signals"}
 ```
-
-可用频道（服务端使用频道名过滤广播）：
-
-- `price`、`signals`、`orders`、`risk`、`system`
-
-查看连接统计：
-
-- `GET /api/ws/stats`
-
-## 回测分析脚本
-
-优先推荐“无需数据库”的简化分析：
-
-```powershell
-python .\test\analyze_backtest_simple.py
+app/
+├── api/                    # API层
+│   ├── endpoints/
+│   │   ├── scalping.py     # 剥头皮交易端点
+│   │   └── system.py       # 系统端点
+│   ├── routes.py           # 路由注册
+│   ├── models.py           # 请求/响应模型
+│   └── dependencies.py     # 依赖注入
+├── scalping/               # 剥头皮交易核心
+│   ├── scalping_engine.py  # 交易引擎
+│   ├── signal_generator.py # 信号生成器
+│   ├── orderflow_analyzer.py # 订单流分析
+│   ├── position_manager.py # 仓位管理
+│   ├── risk_controller.py  # 风控系统
+│   ├── symbol_scanner.py   # 币种扫描
+│   ├── multi_symbol_monitor.py # 多币种监控
+│   ├── backtest.py         # 回测系统
+│   └── config.py           # 配置
+├── exchange/               # 交易所客户端
+│   ├── clients/
+│   │   └── binance/
+│   │       └── binance_client.py
+│   └── mappers.py          # 格式映射
+├── core/                   # 核心配置
+│   └── config.py           # 全局配置
+└── utils/                  # 工具函数
+    └── helpers.py
 ```
-
-如果你已跑过回测并写入数据库，可运行完整版分析：
-
-```powershell
-python .\test\analyze_backtest_trades.py
-```
-
-更多说明见：`docs/how_to_analyze_backtest.md`
 
 ## 测试
 
@@ -238,17 +229,12 @@ python .\test\analyze_backtest_trades.py
 pytest -q
 ```
 
-## 代码结构（3 层架构）
-
-- **Features（纯函数）**：`app/model/features/`
-- **Model（有状态）**：`app/model/`
-- **External（服务/交易）**：`app/services/`、`app/trading/`
-- **API**：`app/api/`
-- **Core（配置/数据库/缓存）**：`app/core/`
-
-依赖方向：`Features → Model → External`（禁止反向依赖）。
-
 ## 风险声明
 
-本项目用于研究与工程实现参考，不构成投资建议。实盘交易存在巨大风险（特别是高杠杆与高频策略），请在隔离环境中验证并自行承担后果。
+本项目用于研究与工程实现参考，不构成投资建议。高频交易和高杠杆策略存在巨大风险，请在隔离环境中验证并自行承担后果。
 
+**目标收益率计算**：
+- 100倍 = (1 + r)^30
+- 每日目标收益率 r ≈ 16.6%
+
+这是一个极具挑战性的目标，需要高胜率和严格的风控配合。
