@@ -75,36 +75,36 @@ class ScalpingConfig:
     max_lose_streak_reduce: int = 3           # 最大连亏减仓次数
 
     # ==================== 动量信号配置 ====================
-    momentum_threshold: float = 0.005      # 动量阈值0.5%（3分钟价格变化）
-    volume_multiplier: float = 2.0         # 成交量放大倍数（当前量 > 均量 × 此值）
+    momentum_threshold: float = 0.006      # 动量阈值0.6%（提高：0.5% → 0.6%）
+    volume_multiplier: float = 1.5         # 成交量放大倍数（降低：2.0 → 1.5，更容易满足）
     atr_period: int = 14                   # ATR计算周期
-    atr_filter_multiplier: float = 1.5     # ATR过滤倍数（当前ATR > 均值ATR × 此值）
+    atr_filter_multiplier: float = 1.2     # ATR过滤倍数（降低：1.5 → 1.2）
     trend_lookback_minutes: int = 5        # 趋势回看时间（分钟）
-    min_signal_score: float = 0.50         # 最小信号得分（降低阈值，增加交易机会）
-    signal_cooldown_seconds: int = 15      # 同一币种信号冷却时间（缩短）
+    min_signal_score: float = 0.65         # 最小信号得分（提高：0.50 → 0.65，过滤低质量信号）
+    signal_cooldown_seconds: int = 30      # 同一币种信号冷却时间（增加：15 → 30秒，避免频繁交易）
 
     # ==================== 止损配置（基于ATR动态调整） ====================
-    stop_loss_atr_multiplier: float = 1.5  # 止损 = 1.5倍ATR
-    max_stop_loss_pct: float = 0.01        # 最大止损1%
-    min_stop_loss_pct: float = 0.005       # 最小止损0.5%
-    stop_loss_pct: float = 0.008           # 默认止损0.8%（收紧：1.8% → 0.8%）
+    stop_loss_atr_multiplier: float = 1.2  # 止损 = 1.2倍ATR（收紧：1.5 → 1.2）
+    max_stop_loss_pct: float = 0.006       # 最大止损0.6%（收紧：1% → 0.6%）
+    min_stop_loss_pct: float = 0.003       # 最小止损0.3%（收紧：0.5% → 0.3%）
+    stop_loss_pct: float = 0.005           # 默认止损0.5%（收紧：0.8% → 0.5%）
 
     # ==================== 追踪止盈配置（分级追踪） ====================
     trailing_stop_enabled: bool = True     # 启用追踪止盈
-    trailing_stop_activation: float = 0.01 # 盈利1%后激活追踪（收紧：2.5% → 1%）
-    trailing_stop_callback: float = 0.005  # 从最高点回撤0.5%触发止盈（收紧：1.0% → 0.5%）
+    trailing_stop_activation: float = 0.015  # 盈利1.5%后激活追踪（放宽：1% → 1.5%，让利润跑）
+    trailing_stop_callback: float = 0.004  # 从最高点回撤0.4%触发止盈（收紧：0.5% → 0.4%）
 
     # 分级追踪止盈：(盈利阈值, 回撤阈值)
     trailing_tiers: List[Tuple[float, float]] = field(default_factory=lambda: [
-        (0.01, 0.005),   # 盈利1%，回撤0.5%止盈
-        (0.015, 0.003),  # 盈利1.5%，回撤0.3%止盈
-        (0.02, 0.002),   # 盈利2%，回撤0.2%止盈
+        (0.015, 0.004),  # 盈利1.5%，回撤0.4%止盈
+        (0.025, 0.003),  # 盈利2.5%，回撤0.3%止盈
+        (0.035, 0.002),  # 盈利3.5%，回撤0.2%止盈
     ])
 
     # ==================== 移动保本配置 ====================
     breakeven_enabled: bool = True         # 启用移动保本
-    breakeven_activation: float = 0.006    # 盈利0.6%后移动止损到保本（收紧：2.0% → 0.6%）
-    breakeven_buffer: float = 0.002        # 保本缓冲（入场价+0.2%，确保覆盖手续费）（收紧：0.8% → 0.2%）
+    breakeven_activation: float = 0.01     # 盈利1%后移动止损到保本（放宽：0.6% → 1%）
+    breakeven_buffer: float = 0.001        # 保本缓冲（入场价+0.1%）（收紧：0.2% → 0.1%）
 
     # ==================== 金字塔加仓配置 ====================
     pyramid_enabled: bool = True           # 启用金字塔加仓
