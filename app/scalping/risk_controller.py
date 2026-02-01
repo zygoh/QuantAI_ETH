@@ -128,11 +128,11 @@ class RiskController:
 
         current_price = symbol_data.last_price
 
-        # 计算当前盈亏
+        # 计算当前盈亏（使用综合成本价）
         if position.direction == "LONG":
-            pnl_pct = (current_price - position.entry_price) / position.entry_price
+            pnl_pct = (current_price - position.avg_entry_price) / position.avg_entry_price
         else:
-            pnl_pct = (position.entry_price - current_price) / position.entry_price
+            pnl_pct = (position.avg_entry_price - current_price) / position.avg_entry_price
 
         # 更新移动保本和追踪止盈状态
         self._update_trailing_state(position, current_price, pnl_pct)
@@ -141,14 +141,42 @@ class RiskController:
         if self._check_stop_loss(position, current_price, pnl_pct):
             return
 
-        # 2. 检查分级追踪止盈
+        # 2. 检查金字塔加仓机会
+        if self._check_pyramid_add(position, current_price, pnl_pct):
+            # 加仓成功后继续监控，不return
+            pass
+
+        # 3. 检查分级追踪止盈
         if self.trailing_enabled:
             if self._check_trailing_stop(position, current_price, pnl_pct):
                 return
 
-        # 3. 检查持仓超时
+        # 4. 检查持仓超时
         if self._check_timeout(position, current_price, pnl_pct):
             return
+
+    def _check_pyramid_add(self, position: PositionInfo, current_price: float, pnl_pct: float) -> bool:
+        """
+        检查并执行金字塔加仓
+
+        Returns:
+            是否执行了加仓
+        """
+        if not scalping_config.pyramid_enabled:
+            return False
+
+        # 检查是否可以加仓
+        if not self.position_manager.can_pyramid_add(position.symbol, current_price):
+            return False
+
+        # 执行加仓
+        result = self.position_manager.pyramid_add_position(position.symbol, current_price)
+
+        if result:
+            logger.info(f"🔺 金字塔加仓成功: {position.symbol} 第{result['addition_count']}次加仓")
+            return True
+
+        return False
 
     def _get_trailing_state(self, symbol: str) -> dict:
         """获取或创建追踪状态"""
@@ -185,11 +213,11 @@ class RiskController:
         if self.breakeven_enabled and not state['breakeven_activated']:
             if pnl_pct >= self.breakeven_activation:
                 state['breakeven_activated'] = True
-                # 计算保本止损价（入场价+0.2%缓冲）
+                # 计算保本止损价（综合成本价+缓冲）
                 if position.direction == "LONG":
-                    state['current_stop_loss'] = position.entry_price * (1 + self.breakeven_buffer)
+                    state['current_stop_loss'] = position.avg_entry_price * (1 + self.breakeven_buffer)
                 else:
-                    state['current_stop_loss'] = position.entry_price * (1 - self.breakeven_buffer)
+                    state['current_stop_loss'] = position.avg_entry_price * (1 - self.breakeven_buffer)
                 logger.info(f"🛡️ 移动保本激活 {symbol}: 盈利{pnl_pct:.2%}, 止损移至 {state['current_stop_loss']:.6f}")
 
         # 检查追踪止盈激活（盈利1%后）

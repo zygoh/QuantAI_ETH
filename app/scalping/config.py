@@ -106,6 +106,20 @@ class ScalpingConfig:
     breakeven_activation: float = 0.006    # 盈利0.6%后移动止损到保本（收紧：2.0% → 0.6%）
     breakeven_buffer: float = 0.002        # 保本缓冲（入场价+0.2%，确保覆盖手续费）（收紧：0.8% → 0.2%）
 
+    # ==================== 金字塔加仓配置 ====================
+    pyramid_enabled: bool = True           # 启用金字塔加仓
+    pyramid_max_additions: int = 3         # 最大加仓次数
+
+    # 加仓触发盈利阈值（价格波动，非杠杆后）
+    pyramid_profit_trigger: float = 0.03   # 盈利3%触发加仓
+    pyramid_spacing: float = 0.025         # 加仓间隔至少2.5%（防止回调同时扫损）
+
+    # 加仓量递减因子（1.0=等量加仓，0.8=递减加仓）
+    pyramid_scale_factor: float = 0.8      # 每次加仓量 = 底仓 × 此值
+
+    # 加仓后止损设置
+    pyramid_stop_buffer: float = 0.002     # 止损设在综合成本价上方0.2%
+
     # ==================== 手续费配置 ====================
     # Binance合约手续费（双边）
     taker_fee_rate: float = 0.0005         # Taker手续费 0.05%
