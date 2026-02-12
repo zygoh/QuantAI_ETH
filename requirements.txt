@@ -14,8 +14,11 @@ python-dotenv
 # 交易所API
 # ========================================
 binance-connector  # Binance交易所API
+binance-futures-connector  # Binance合约API
 websocket-client   # WebSocket客户端
+websockets         # 异步WebSocket客户端（价格监控）
 requests           # HTTP请求库
+httpx              # 异步HTTP客户端（高性能）
 PySocks            # SOCKS5代理支持
 socksio==1.0.0
 

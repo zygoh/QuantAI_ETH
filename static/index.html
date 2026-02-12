@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI自动交易系统</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1>📊 AI自动交易系统 <span class="version">v3.0</span></h1>
+            <div class="status-bar">
+                <span id="status-indicator" class="status-dot"></span>
+                <span id="status-text">连接中...</span>
+                <span id="current-symbol" class="current-symbol"></span>
+                <span id="current-price" class="current-price"></span>
+                <button id="toggle-trades" class="toggle-chart-btn">📋 交易</button>
+                <button id="toggle-chart" class="toggle-chart-btn">📈 图表</button>
+                <button id="toggle-notes" class="toggle-chart-btn">📝 留言</button>
+            </div>
+        </header>
+
+        <!-- 三列布局 -->
+        <main class="main-content">
+            <section class="left-panel">
+                <!-- 账户概览 -->
+                <section class="account-overview">
+                    <div class="stat-card">
+                        <div class="stat-label">账户余额</div>
+                        <div id="balance" class="stat-value">$0.00</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">总收益</div>
+                        <div id="total-pnl" class="stat-value">$0.00</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">收益率</div>
+                        <div id="return-pct" class="stat-value">0.00%</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">胜率</div>
+                        <div id="win-rate" class="stat-value">0.0%</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">交易次数</div>
+                        <div id="total-trades" class="stat-value">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">总手续费</div>
+                        <div id="total-fees" class="stat-value">$0.00</div>
+                    </div>
+                </section>
+
+                <!-- 当前持仓 -->
+                <div class="panel">
+                    <h2>📊 当前持仓</h2>
+                    <div id="position-empty" class="empty-state">暂无持仓</div>
+                    <div id="position-info" class="position-info hidden">
+                        <div class="pos-header">
+                            <span id="pos-symbol" class="pos-symbol"></span>
+                            <span id="pos-side" class="pos-side"></span>
+                            <span id="pos-leverage" class="pos-leverage"></span>
+                        </div>
+                        <div class="pos-grid">
+                            <div class="pos-item"><span class="pos-label">入场价格</span><span id="pos-entry" class="pos-val"></span></div>
+                            <div class="pos-item"><span class="pos-label">仓位大小</span><span id="pos-size" class="pos-val"></span></div>
+                            <div class="pos-item"><span class="pos-label">止损</span><span id="pos-sl" class="pos-val negative"></span></div>
+                            <div class="pos-item"><span class="pos-label">止盈</span><span id="pos-tp" class="pos-val positive"></span></div>
+                            <div class="pos-item"><span class="pos-label">开仓时间</span><span id="pos-time" class="pos-val"></span></div>
+                            <div class="pos-item"><span class="pos-label">持仓时长</span><span id="pos-duration" class="pos-val"></span></div>
+                            <div class="pos-item"><span class="pos-label">手续费</span><span id="pos-fee" class="pos-val"></span></div>
+                            <div class="pos-item"><span class="pos-label">浮动盈亏</span><span id="pos-pnl" class="pos-val"></span></div>
+                            <div class="pos-item"><span class="pos-label">爆仓价</span><span id="pos-liq" class="pos-val negative"></span></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- AI 对话 -->
+                <div class="panel chat-panel">
+                    <h2>🤖 AI 分析对话</h2>
+                    <div id="chat-container" class="chat-container">
+                        <div id="chat-empty" class="empty-state">等待 AI 分析...</div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="mid-panel hidden">
+                <!-- 交易历史 -->
+                <div class="panel">
+                    <h2>📋 交易历史</h2>
+                    <div id="trades-empty" class="empty-state">暂无交易记录</div>
+                    <div id="trades-table" class="table-container hidden">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>币种</th>
+                                    <th>方向</th>
+                                    <th>入场价</th>
+                                    <th>出场价</th>
+                                    <th>盈亏</th>
+                                    <th>原因</th>
+                                    <th>时间</th>
+                                </tr>
+                            </thead>
+                            <tbody id="trades-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <section class="right-panel hidden">
+                <!-- K线图表 -->
+                <div class="panel">
+                    <div class="chart-header">
+                        <h2>📈 K线图表</h2>
+                        <div class="chart-tabs">
+                            <button class="tab-btn active" data-interval="5m">5分钟</button>
+                            <button class="tab-btn" data-interval="15m">15分钟</button>
+                        </div>
+                    </div>
+                    <div class="chart-container">
+                        <img id="chart-image" src="" alt="K线图表">
+                        <div id="chart-placeholder" class="empty-state">等待选币...</div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="notes-panel hidden">
+                <!-- 留言板 -->
+                <div class="panel notes-board">
+                    <div class="notes-header">
+                        <h2>📝 留言板</h2>
+                        <button id="clear-notes" class="notes-clear-btn">清空</button>
+                    </div>
+                    <div class="notes-input-area">
+                        <textarea id="note-input" class="note-input" placeholder="记录交易想法..." rows="3"></textarea>
+                        <button id="add-note" class="note-add-btn">发布</button>
+                    </div>
+                    <div id="notes-list" class="notes-list"></div>
+                </div>
+            </section>
+        </main>
+
+        <footer class="footer">
+            AI自动交易系统 v3.0 — 仅供学习研究，不构成投资建议
+        </footer>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

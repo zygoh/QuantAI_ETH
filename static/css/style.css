@@ -1,0 +1,586 @@
+/* AI 模拟交易系统 - 深色主题 */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    background: #0d1117;
+    color: #c9d1d9;
+    min-height: 100vh;
+}
+
+.container {
+    max-width: 1600px;
+    margin: 0 auto;
+    padding: 16px;
+}
+
+.header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 20px;
+    background: #161b22;
+    border-radius: 8px;
+    margin-bottom: 16px;
+}
+
+.header h1 {
+    font-size: 1.3rem;
+    color: #58a6ff;
+}
+
+.version {
+    font-size: 0.8rem;
+    color: #8b949e;
+    font-weight: normal;
+}
+
+.status-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 0.9rem;
+}
+
+.status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #f85149;
+}
+
+.status-dot.running {
+    background: #3fb950;
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+.current-symbol {
+    color: #ffd54f;
+    font-weight: 600;
+}
+
+.current-price {
+    color: #3fb950;
+    font-weight: 700;
+    font-size: 1rem;
+    font-family: 'Consolas', 'Monaco', monospace;
+}
+
+/* 账户概览 */
+.account-overview {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    margin-bottom: 16px;
+}
+
+.stat-card {
+    background: #161b22;
+    border-radius: 8px;
+    padding: 10px 20px;
+    text-align: center;
+    min-width: 100px;
+}
+
+.stat-label {
+    font-size: 0.8rem;
+    color: #8b949e;
+    margin-bottom: 6px;
+}
+
+.stat-value {
+    font-size: 1.3rem;
+    font-weight: 700;
+    color: #c9d1d9;
+}
+
+.positive { color: #3fb950; }
+.negative { color: #f85149; }
+
+/* 主内容区 */
+.main-content {
+    display: grid;
+    grid-template-columns: 1fr 0.8fr 1.2fr;
+    gap: 16px;
+}
+
+@media (max-width: 1200px) {
+    .main-content { grid-template-columns: 1fr; }
+}
+
+.panel {
+    background: #161b22;
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+}
+
+.panel h2 {
+    font-size: 1.1rem;
+    color: #c9d1d9;
+    margin-bottom: 12px;
+}
+
+.empty-state {
+    color: #8b949e;
+    text-align: center;
+    padding: 24px;
+    font-size: 0.95rem;
+}
+
+.hidden { display: none !important; }
+
+/* 持仓信息 */
+.pos-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #21262d;
+}
+
+.pos-symbol {
+    font-size: 1.2rem;
+    font-weight: 700;
+    color: #58a6ff;
+}
+
+.pos-side {
+    font-size: 0.9rem;
+    font-weight: 600;
+    padding: 2px 10px;
+    border-radius: 4px;
+    background: #21262d;
+}
+
+.pos-leverage {
+    font-size: 0.85rem;
+    color: #ffd54f;
+    font-weight: 600;
+}
+
+.pos-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+.pos-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 0;
+    border-bottom: 1px solid #21262d;
+}
+
+.pos-label {
+    color: #8b949e;
+    font-size: 0.85rem;
+}
+
+.pos-val {
+    font-weight: 600;
+    font-size: 0.9rem;
+}
+
+/* 交易历史表格 */
+.table-container {
+    overflow-x: auto;
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+}
+
+th, td {
+    padding: 10px 8px;
+    text-align: left;
+    border-bottom: 1px solid #21262d;
+    white-space: nowrap;
+}
+
+th {
+    background: #21262d;
+    color: #8b949e;
+    font-weight: 600;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+
+tbody tr:hover {
+    background: #21262d;
+}
+
+/* 图表区 */
+.chart-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.chart-header h2 {
+    margin-bottom: 0;
+}
+
+.chart-tabs {
+    display: flex;
+    gap: 8px;
+}
+
+.tab-btn {
+    padding: 8px 16px;
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #8b949e;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-size: 0.85rem;
+}
+
+.tab-btn:hover {
+    background: #30363d;
+}
+
+.tab-btn.active {
+    background: #1f6feb;
+    border-color: #1f6feb;
+    color: white;
+}
+
+.chart-container {
+    background: #0d1117;
+    border-radius: 8px;
+    padding: 8px;
+    min-height: 500px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.chart-container img {
+    max-width: 100%;
+    border-radius: 4px;
+}
+
+/* AI 对话面板 */
+.chat-panel {
+    display: flex;
+    flex-direction: column;
+}
+
+.chat-container {
+    flex: 1;
+    overflow-y: auto;
+    max-height: 550px;
+    padding: 4px;
+}
+
+.chat-round {
+    margin-bottom: 16px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid #21262d;
+}
+
+.chat-round:last-child {
+    border-bottom: none;
+    margin-bottom: 0;
+    padding-bottom: 0;
+}
+
+.chat-msg {
+    margin-bottom: 8px;
+}
+
+.chat-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+    font-size: 0.8rem;
+}
+
+.chat-role {
+    color: #8b949e;
+    font-weight: 600;
+}
+
+.chat-time {
+    color: #6e7681;
+    font-size: 0.75rem;
+}
+
+.chat-tag {
+    font-size: 0.7rem;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+}
+
+.tag-pos {
+    background: #1f6feb22;
+    color: #58a6ff;
+}
+
+.tag-duration {
+    background: #3fb95022;
+    color: #3fb950;
+}
+
+.chat-bubble {
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 0.88rem;
+    line-height: 1.5;
+    word-break: break-word;
+}
+
+.user-bubble {
+    background: #1f6feb22;
+    color: #c9d1d9;
+    border-left: 3px solid #1f6feb;
+}
+
+.ai-bubble {
+    background: #21262d;
+    color: #c9d1d9;
+    border-left: 3px solid #3fb950;
+}
+
+.chat-signal {
+    font-size: 0.75rem;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-weight: 700;
+}
+
+.signal-long {
+    background: #3fb95022;
+    color: #3fb950;
+}
+
+.signal-short {
+    background: #f8514922;
+    color: #f85149;
+}
+
+.signal-wait {
+    background: #d2992222;
+    color: #d29922;
+}
+
+.signal-adjust {
+    background: #1f6feb22;
+    color: #58a6ff;
+}
+
+.chat-detail {
+    font-size: 0.78rem;
+    color: #8b949e;
+    margin-top: 4px;
+    padding-left: 17px;
+}
+
+/* 图表切换按钮 */
+.toggle-chart-btn {
+    padding: 6px 14px;
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #8b949e;
+    cursor: pointer;
+    font-size: 0.85rem;
+    transition: all 0.2s;
+}
+
+.toggle-chart-btn:hover {
+    background: #30363d;
+    color: #c9d1d9;
+}
+
+.toggle-chart-btn.active {
+    background: #1f6feb;
+    border-color: #1f6feb;
+    color: white;
+}
+
+/* 动态列布局 - 最多4列 */
+.main-content.cols-1 {
+    grid-template-columns: 1fr;
+}
+
+.main-content.cols-2 {
+    grid-template-columns: 1fr 1fr;
+}
+
+.main-content.cols-3 {
+    grid-template-columns: 1fr 0.8fr 1.2fr;
+}
+
+.main-content.cols-4 {
+    grid-template-columns: 1fr 0.8fr 1.2fr 0.8fr;
+}
+
+/* 留言板 */
+.notes-board {
+    display: flex;
+    flex-direction: column;
+}
+
+.notes-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.notes-header h2 {
+    margin-bottom: 0;
+}
+
+.notes-clear-btn {
+    padding: 4px 12px;
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    color: #f85149;
+    cursor: pointer;
+    font-size: 0.8rem;
+    transition: all 0.2s;
+}
+
+.notes-clear-btn:hover {
+    background: #f8514922;
+}
+
+.notes-input-area {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.note-input {
+    flex: 1;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #c9d1d9;
+    padding: 8px 12px;
+    font-size: 0.88rem;
+    resize: vertical;
+    font-family: inherit;
+}
+
+.note-input:focus {
+    outline: none;
+    border-color: #1f6feb;
+}
+
+.note-add-btn {
+    padding: 8px 16px;
+    background: #1f6feb;
+    border: none;
+    border-radius: 6px;
+    color: white;
+    cursor: pointer;
+    font-size: 0.85rem;
+    align-self: flex-end;
+    transition: all 0.2s;
+}
+
+.note-add-btn:hover {
+    background: #388bfd;
+}
+
+.notes-list {
+    flex: 1;
+    overflow-y: auto;
+    max-height: 600px;
+}
+
+.note-item {
+    padding: 10px 12px;
+    background: #0d1117;
+    border-radius: 6px;
+    margin-bottom: 8px;
+    border-left: 3px solid #1f6feb;
+}
+
+.note-text {
+    font-size: 0.88rem;
+    line-height: 1.5;
+    color: #c9d1d9;
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+
+.note-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 6px;
+}
+
+.note-time {
+    font-size: 0.75rem;
+    color: #6e7681;
+}
+
+.note-delete {
+    background: none;
+    border: none;
+    color: #6e7681;
+    cursor: pointer;
+    font-size: 0.75rem;
+    padding: 2px 6px;
+    border-radius: 3px;
+    transition: all 0.2s;
+}
+
+.note-delete:hover {
+    color: #f85149;
+    background: #f8514922;
+}
+
+/* 底部 */
+.footer {
+    margin-top: 16px;
+    padding: 12px;
+    text-align: center;
+    color: #8b949e;
+    font-size: 0.8rem;
+}
+
+/* 滚动条 */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: #21262d;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #484f58;
+    border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #6e7681;
+}
