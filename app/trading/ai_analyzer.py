@@ -50,17 +50,20 @@ class AIAnalyzer:
         chart_5m_path: str,
         chart_15m_path: str,
         current_price: float,
-        position_info: Optional[dict] = None
+        position_info: Optional[dict] = None,
+        market_context: Optional[str] = None,
     ) -> Optional[TradeSignal]:
         """
         分析图表并返回交易信号
-        
+
         Args:
             symbol: 交易对
             chart_5m_path: 5分钟图表路径
             chart_15m_path: 15分钟图表路径
             current_price: 当前价格
-            
+            position_info: 持仓信息（可选）
+            market_context: 订单簿/成交分布等市场微观文本（可选）
+
         Returns:
             交易信号
         """
@@ -84,8 +87,8 @@ class AIAnalyzer:
                 logger.warning(f"⚠️ {symbol} 图表文件不完整")
                 return None
             
-            # 构建提示词
-            prompt = self._build_prompt(symbol, current_price, position_info)
+            # 构建提示词（含可选市场微观数据）
+            prompt = self._build_prompt(symbol, current_price, position_info, market_context)
             
             logger.info(f"🤖 AI 信号: {prompt}")
 
@@ -116,8 +119,14 @@ class AIAnalyzer:
             logger.error(f"❌ AI 分析失败: {e}", exc_info=True)
             return None
 
-    def _build_prompt(self, symbol: str, current_price: float, position_info: Optional[dict] = None) -> str:
-        """构建分析提示词"""
+    def _build_prompt(
+        self,
+        symbol: str,
+        current_price: float,
+        position_info: Optional[dict] = None,
+        market_context: Optional[str] = None,
+    ) -> str:
+        """构建分析提示词（位置+形态的结构化交易逻辑，高盈亏比导向）"""
         # 持仓上下文
         position_context = ""
         if position_info:
@@ -137,49 +146,56 @@ class AIAnalyzer:
         else:
             position_context = "\n当前无持仓\n"
 
-        return f"""你是一个专业的加密货币短线交易分析师。目标：提高胜率，宁可少做不可做错。请分析这两张 K 线图表（5 分钟 + 15 分钟）。
+        # 市场微观：订单簿、成交分布、逐笔买卖压力（可选）
+        micro_section = ""
+        if market_context and market_context.strip():
+            micro_section = f"""
+{market_context}
+"""
 
-交易对: {symbol}
-当前价格: {current_price}
+        return f"""你是一名专业的加密货币剥头皮交易员（Scalper）。你的目标是寻找【高盈亏比（High R:R）】的交易机会，核心优势是识别【关键供需区】和【价格行为（Price Action）】。
+
+当前市场数据:
+- 交易对: {symbol}
+- 当前价格: {current_price}
 {position_context}
+{micro_section}
 
-分析框架（严格遵守）：
-- 15 分钟图：定方向（上升/下降/震荡）。仅当 15m 有明确趋势时才考虑开仓。
-- 5 分钟图：定入场时机。开仓必须满足「15m 与 5m 方向一致」；若 15m 震荡或双周期方向矛盾，一律选择 wait。
-- 默认倾向观望：不确定、多空均衡、或置信度不足时，必须选 wait；只有多周期共振、结构清晰时才开仓。
+请综合分析 5m 和 15m 两张 K 线图。
 
-{"=== 当前有持仓，你必须从以下动作中选一个 ===" if position_info else "=== 当前无持仓，你必须从以下动作中选一个 ==="}
+### 第一步：市场结构分析（必须在 reasoning 中体现）
+1. **关键位置**：识别强支撑位（Support）和强阻力位（Resistance）。
+2. **趋势状态**：趋势行情中寻找回调（Pullback）入场；震荡行情中寻找高抛低吸（Range）机会。
+3. **K 线形态**：5m 级别的反转或中继信号（吞没、针、双底/顶、突破回踩等）。
 
-{'''1. close_position - 主动平仓（趋势反转、动能衰竭、达到预期、或风险大于收益时果断平仓）
-2. hold - 继续持有（趋势延续良好、无反转信号时保持不动）
-3. adjust_stops - 调整止盈止损（仅当明确需要移动止损保护利润时使用，禁止频繁调整）
-4. open_long / open_short - 反向开仓（仅当明确趋势反转且需要反向操作时）
+### 第二步：交易决策
+{"=== 现有持仓管理 ===" if position_info else "=== 寻找开仓机会 ==="}
 
-原则：盈利且动能减弱优先 close_position；趋势良好选 hold；浮亏扩大且趋势不利果断 close_position。
+{'''- close_position：价格遇强阻力、动能衰竭（如背离）、或跌破关键支撑结构时。
+- hold：价格仍在健康趋势中，尚未触及止损/止盈目标。
+- adjust_stops：仅在价格突破关键前高/前低后，移动止损以锁定利润。
+- open_long/open_short：极少使用，仅在发生明确结构性破坏（趋势反转）时反向开仓。
 
 止损止盈方向（必须遵守）：
-- 做多：止损 < 入场价，止盈 > 入场价；保护利润 = 止损移到入场价之上
-- 做空：止损 > 入场价，止盈 < 入场价；保护利润 = 止损移到入场价之下''' if position_info else '''1. wait - 观望（默认首选。震荡、双周期不一致、或置信度 < 70 时必须选此项）
-2. open_long - 开多（仅当 15m 与 5m 均支持做多且置信度 ≥ 70）
-3. open_short - 开空（仅当 15m 与 5m 均支持做空且置信度 ≥ 70）
+- 做多：止损 < 入场价，止盈 > 入场价；保护利润 = 止损移到入场价之上。
+- 做空：止损 > 入场价，止盈 < 入场价；保护利润 = 止损移到入场价之下。''' if position_info else '''- wait：无明显形态、价格在“真空地带”（不在关键支撑/阻力附近）、或多空不明朗。
 
-开仓硬性条件：15m 有明确趋势 + 5m 与 15m 同向 + 置信度 ≥ 70；否则必须 wait。
-止损止盈：止损距离不宜过大（相对当前价约 1%~3% 内可接受）；止盈建议至少 1.2 倍止损距离，保证盈亏比。'''}
+**重要**：当价格已进入关键支撑/阻力附近（与关键位距离约 1% 以内）且 5m 有企稳或止跌迹象时，即可考虑开仓，不必等待“完美触碰+标准反转 K 线”。给出具体 stop_loss、take_profit 和 confidence（60+）即可。'''}
 
-JSON 格式（只返回一个 JSON 对象）：
+### 第三步：风控规则（严格执行）
+- **止损**：基于图表结构（前低之下/前高之上），不要用固定百分比。
+- **盈亏比 R:R**：止盈空间至少为止损空间的 1.5 倍；不划算则选 wait。
+- **置信度**：60–70 一般机会（如接近关键位+企稳）；70–85 优质结构；85+ 完美共振（大周期支撑 + 小周期突破）。
 
-{'''{{"symbol": "''' + symbol + '''", "action": "close_position", "reasoning": "平仓原因"}}
-{{"symbol": "''' + symbol + '''", "action": "hold", "reasoning": "继续持有原因"}}
-{{"symbol": "''' + symbol + '''", "action": "adjust_stops", "stop_loss": 新止损价, "take_profit": 新止盈价, "reasoning": "调整原因"}}
-{{"symbol": "''' + symbol + '''", "action": "open_long", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 置信度0-100, "reasoning": "反向开多原因"}}
-{{"symbol": "''' + symbol + '''", "action": "open_short", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 置信度0-100, "reasoning": "反向开空原因"}}''' if position_info else '''{{"symbol": "''' + symbol + '''", "action": "wait", "reasoning": "观望原因"}}
-{{"symbol": "''' + symbol + '''", "action": "open_long", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 70-100, "reasoning": "开多原因"}}
-{{"symbol": "''' + symbol + '''", "action": "open_short", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 70-100, "reasoning": "开空原因"}}'''}
+请只输出一个 JSON 对象，不要 markdown 或其它文字。开仓时必须带 stop_loss、take_profit、confidence；wait/close_position/hold 可不带止损止盈。
 
-注意：
-1. 止损/止盈为数字，且符合方向规则；开仓时 confidence 低于 70 应选 wait。
-2. 杠杆与仓位由系统管理，无需在 JSON 中指定。
-3. 只返回一段 JSON，不要 markdown、不要其他文字。"""
+{'''{{"symbol": "''' + symbol + '''", "action": "close_position", "reasoning": "..."}}
+{{"symbol": "''' + symbol + '''", "action": "hold", "reasoning": "..."}}
+{{"symbol": "''' + symbol + '''", "action": "adjust_stops", "stop_loss": 新止损价, "take_profit": 新止盈价, "reasoning": "..."}}
+{{"symbol": "''' + symbol + '''", "action": "open_long", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 60-100, "reasoning": "..."}}
+{{"symbol": "''' + symbol + '''", "action": "open_short", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 60-100, "reasoning": "..."}}''' if position_info else '''{{"symbol": "''' + symbol + '''", "action": "wait", "reasoning": "..."}}
+{{"symbol": "''' + symbol + '''", "action": "open_long", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 60-100, "reasoning": "趋势+关键位置+形态+盈亏比"}}
+{{"symbol": "''' + symbol + '''", "action": "open_short", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 60-100, "reasoning": "趋势+关键位置+形态+盈亏比"}}'''}"""
     
     async def _call_claude_api(
         self,
@@ -228,10 +244,10 @@ JSON 格式（只返回一个 JSON 对象）：
     def _parse_response(self, symbol: str, response: str) -> Optional[TradeSignal]:
         """解析 AI 响应"""
         try:
-            # 提取 JSON
-            response = response.strip()
+            # 清洗：去掉可能的 Markdown 代码块标记（防止 Claude 输出 ```json ... ```）
+            response = response.replace("```json", "").replace("```", "").strip()
 
-            # 尝试找到 JSON 部分
+            # 提取 JSON
             start_idx = response.find("{")
             end_idx = response.rfind("}") + 1
 
@@ -255,10 +271,10 @@ JSON 格式（只返回一个 JSON 对象）：
             action = action_map.get(action_str, SignalAction.WAIT)
             confidence = data.get("confidence", 0)
 
-            # 开仓置信度门槛：低于 70 强制视为观望，提高胜率
-            if action in (SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT) and confidence < 70:
+            # 开仓置信度门槛：低于 60 强制视为观望；60+ 交给仓位/风控层处理
+            if action in (SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT) and confidence < 60:
                 action = SignalAction.WAIT
-                logger.info(f"🤖 置信度 {confidence}% < 70，已强制改为 wait")
+                logger.info(f"🤖 置信度 {confidence}% < 60，已强制改为 wait")
 
             return TradeSignal(
                 symbol=data.get("symbol", symbol),

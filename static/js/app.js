@@ -186,6 +186,7 @@ function renderTrades(data) {
             '<td>$' + formatPrice(t.exit_price) + '</td>' +
             '<td class="' + pnlClass + '">' + (t.pnl >= 0 ? '+' : '') + t.pnl.toFixed(4) + ' (' + (t.pnl_pct >= 0 ? '+' : '') + t.pnl_pct.toFixed(2) + '%)</td>' +
             '<td>' + (reasonMap[t.exit_reason] || t.exit_reason) + '</td>' +
+            '<td>' + formatTime(t.entry_time) + '</td>' +
             '<td>' + formatTime(t.exit_time) + '</td>' +
             '</tr>';
     }).join('');

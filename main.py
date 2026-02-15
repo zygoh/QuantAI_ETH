@@ -32,6 +32,8 @@ from app.trading.ai_analyzer import ai_analyzer
 from app.trading.simulator import trading_simulator
 from app.trading.models import PositionSide, SignalAction
 from app.trading.price_monitor import price_monitor
+from app.trading.price_util import get_current_price
+from app.trading.market_context import build_market_context
 from app.exchange.clients.binance.binance_client import binance_client
 
 
@@ -81,19 +83,6 @@ def setup_logging() -> logging.Logger:
 
 
 logger = setup_logging()
-
-
-async def get_current_price(symbol: str) -> float:
-    """获取当前价格（使用 ticker 接口）"""
-    try:
-        tickers = await binance_client.get_24hr_ticker_async(symbol)
-        if tickers and len(tickers) > 0:
-            price = float(tickers[0].get("lastPrice", 0))
-            if price > 0:
-                return price
-    except Exception as e:
-        logger.warning(f"⚠️ 获取 {symbol} 价格失败: {e}")
-    return 0.0
 
 
 # 上次价格日志时间
@@ -156,18 +145,6 @@ async def on_price_update(symbol: str, price: float) -> None:
         )
 
 
-def is_4h_cycle_start() -> bool:
-    """
-    检查当前是否是 4 小时周期开始后的第 5 分钟
-
-    4H 周期: 0:00, 4:00, 8:00, 12:00, 16:00, 20:00
-    选币时间: 0:05, 4:05, 8:05, 12:05, 16:05, 20:05
-    （预留 5 分钟给 4H K 线收盘和云端计算）
-    """
-    now = datetime.now()
-    return now.hour % 4 == 0 and now.minute == 5
-
-
 def is_5min_chart_time() -> bool:
     """
     检查当前是否是 5 分钟周期后 1 秒（生成图表时间）
@@ -202,27 +179,6 @@ def get_seconds_until_next_5min_chart() -> int:
     return max(1, int(delta))
 
 
-def get_seconds_until_next_4h_cycle() -> int:
-    """计算距离下一个 4 小时周期开始后 5 分钟的秒数"""
-    now = datetime.now()
-    current_hour = now.hour
-
-    # 找到下一个 4H 周期的小时
-    next_4h_hour = ((current_hour // 4) + 1) * 4
-    if next_4h_hour >= 24:
-        next_4h_hour = 0
-
-    # 计算目标时间（下一个 4H 周期的第 5 分钟）
-    if next_4h_hour == 0 and current_hour >= 20:
-        # 跨天
-        target = now.replace(hour=0, minute=5, second=0, microsecond=0) + timedelta(days=1)
-    else:
-        target = now.replace(hour=next_4h_hour, minute=5, second=0, microsecond=0)
-
-    delta = (target - now).total_seconds()
-    return max(1, int(delta))
-
-
 # 当前选中的币种
 _current_selected_symbol: Optional[str] = None
 _startup_done: bool = False
@@ -233,26 +189,30 @@ async def trading_loop() -> None:
     """
     主交易循环
 
-    选币时机：
-    - 启动时立即从云端获取一次
-    - 每 4 小时执行一次（0:05, 4:05, 8:05, 12:05, 16:05, 20:05）
-      预留 5 分钟给 4H K 线收盘和云端计算
+    选币与分析：
+    - 启动时：无仓位则从云端选币并分析；有仓位则只分析持仓币种（一般启动时无仓）
+    - 之后每 5 分钟：
+      有仓位 → 只对持仓币种生成图表并 AI 分析（平/持/调仓/反向）
+      无仓位 → 先云端选币，再对选中币种生成图表并 AI 分析（找开仓机会）
 
-    图表生成 + AI 分析时机：
-    - 每 5 分钟后 1 秒（0:00:01, 0:05:01, 0:10:01, ...）
-
-    有持仓时：
-    - WebSocket 实时监控价格，检查止盈止损
+    WebSocket：
+    - 有仓位时一定订阅持仓币种，用于止盈止损与爆仓检查；无仓位时取消订阅
     """
     global _current_selected_symbol, _startup_done, _last_chart_time
 
     # 首次启动等待
     await asyncio.sleep(3)
 
-    # 启动时立即执行一次选币
+    # 启动时：有仓分析持仓币种，无仓则云端选币并分析
     if not _startup_done:
-        logger.info("🚀 系统启动，执行首次选币...")
-        await do_select_coin()
+        if trading_simulator.has_position():
+            pos = trading_simulator.position
+            trading_simulator.current_symbol = pos.symbol
+            logger.info("🚀 系统启动，当前有持仓，分析持仓币种...")
+            await do_chart_and_analyze(pos.symbol)
+        else:
+            logger.info("🚀 系统启动，执行首次选币...")
+            await do_select_coin()
         _startup_done = True
         trading_simulator.is_running = True
 
@@ -260,38 +220,31 @@ async def trading_loop() -> None:
         try:
             now = datetime.now()
 
-            # 有持仓时：确保 WebSocket 订阅
+            # 有持仓时：WebSocket 一定订阅持仓币种（用于止盈止损）；图表与 AI 只分析持仓币种
             if trading_simulator.has_position():
                 pos = trading_simulator.position
-                _current_selected_symbol = pos.symbol
-
                 if price_monitor.current_symbol != pos.symbol:
                     await price_monitor.subscribe(pos.symbol, on_price_update)
             else:
-                # 无持仓：取消订阅
                 if price_monitor.current_symbol:
                     await price_monitor.unsubscribe()
 
-            # 检查是否是 4H 周期开始后的第 1 分钟 -> 重新选币
-            if is_4h_cycle_start():
-                logger.info("⏰ 4H 周期开始，执行选币...")
-                await do_select_coin()
-                await asyncio.sleep(60)  # 避免重复执行
-                continue
-
-            # 检查是否是 5 分钟图表生成时间
-            if is_5min_chart_time() and _current_selected_symbol:
-                # 避免同一分钟重复执行
+            # 每 5 分钟：有仓分析持仓币种，无仓先选币再分析云端币种
+            if is_5min_chart_time():
                 if _last_chart_time is None or (now - _last_chart_time).total_seconds() > 60:
                     _last_chart_time = now
-                    await do_chart_and_analyze(_current_selected_symbol)
+                    if trading_simulator.has_position():
+                        pos = trading_simulator.position
+                        trading_simulator.current_symbol = pos.symbol
+                        await do_chart_and_analyze(pos.symbol)
+                    else:
+                        await do_select_coin()
                     await asyncio.sleep(30)
                     continue
 
             # 计算下一个事件的等待时间
-            wait_4h = get_seconds_until_next_4h_cycle()
             wait_5m = get_seconds_until_next_5min_chart()
-            wait_seconds = min(wait_4h, wait_5m, 30)
+            wait_seconds = min(wait_5m, 30)
             await asyncio.sleep(wait_seconds)
 
         except asyncio.CancelledError:
@@ -317,11 +270,19 @@ async def do_select_coin() -> None:
         # 失败格式: {"detail": "选币服务暂不可用: ..."}
         if "detail" in data:
             logger.warning(f"⚠️ 云端选币不可用: {data['detail']}")
+            if _current_selected_symbol:
+                logger.info(f"📊 使用上一轮币种继续分析: {_current_selected_symbol}")
+                _last_chart_time = datetime.now()
+                await do_chart_and_analyze(_current_selected_symbol)
             return
 
         symbol = data.get("symbol")
         if not symbol:
             logger.warning("⚠️ 云端未返回有效币种")
+            if _current_selected_symbol:
+                logger.info(f"📊 使用上一轮币种继续分析: {_current_selected_symbol}")
+                _last_chart_time = datetime.now()
+                await do_chart_and_analyze(_current_selected_symbol)
             return
 
         _current_selected_symbol = symbol
@@ -380,10 +341,15 @@ async def do_chart_and_analyze(symbol: str) -> None:
 
     logger.info(f"📊 图表生成完成: {chart_result.chart_5m}, {chart_result.chart_15m}")
 
-    # 构建持仓信息（传给 AI 做决策参考）
+    # 构建持仓信息（传给 AI 做决策参考）；浮盈必须用持仓币种价格
     position_info = None
     if trading_simulator.has_position():
         pos = trading_simulator.position
+        pos_price = current_price if symbol == pos.symbol else await get_current_price(pos.symbol)
+        if pos_price <= 0 and price_monitor.current_symbol == pos.symbol:
+            pos_price = price_monitor.current_price
+        if pos_price <= 0:
+            pos_price = current_price
         position_info = {
             "side": pos.side.value,
             "entry_price": pos.entry_price,
@@ -391,17 +357,30 @@ async def do_chart_and_analyze(symbol: str) -> None:
             "leverage": pos.leverage,
             "stop_loss": pos.stop_loss,
             "take_profit": pos.take_profit,
-            "unrealized_pnl": pos.unrealized_pnl(current_price),
-            "unrealized_pnl_pct": pos.unrealized_pnl_pct(current_price)
+            "unrealized_pnl": pos.unrealized_pnl(pos_price),
+            "unrealized_pnl_pct": pos.unrealized_pnl_pct(pos_price)
         }
 
-    # 调用 AI 分析（使用同一个 current_price）
+    # 并行拉取订单簿与近期成交，生成市场微观上下文供 AI 参考
+    orderbook: Optional[dict] = None
+    agg_trades: Optional[list] = None
+    try:
+        orderbook, agg_trades = await asyncio.gather(
+            binance_client.get_orderbook_async(symbol, limit=20),
+            binance_client.get_agg_trades_async(symbol, limit=100),
+        )
+    except Exception as e:
+        logger.debug(f"拉取订单簿/成交失败: {e}")
+    market_context = build_market_context(symbol, current_price, orderbook, agg_trades)
+
+    # 调用 AI 分析（使用同一个 current_price，并注入市场微观数据）
     signal = await ai_analyzer.analyze_charts(
         symbol=symbol,
         chart_5m_path=chart_result.chart_5m,
         chart_15m_path=chart_result.chart_15m,
         current_price=current_price,
-        position_info=position_info
+        position_info=position_info,
+        market_context=market_context,
     )
 
     if not signal:
@@ -415,9 +394,19 @@ async def do_chart_and_analyze(symbol: str) -> None:
         logger.info(f"✊ AI 建议继续持有: {signal.reasoning}")
     elif signal.action == SignalAction.CLOSE_POSITION:
         if trading_simulator.has_position():
+            pos = trading_simulator.position
+            # 平仓必须使用持仓币种的实时价，避免 4H 选币后分析的是新币种导致用错价格
+            close_price = await get_current_price(pos.symbol)
+            if close_price <= 0 and price_monitor.current_symbol == pos.symbol:
+                close_price = price_monitor.current_price
+            if close_price <= 0:
+                close_price = current_price if symbol == pos.symbol else 0.0
+                if close_price <= 0:
+                    logger.warning(f"⚠️ 无法获取 {pos.symbol} 平仓价格，跳过本次平仓")
+                    return
             logger.info(f"📤 AI 建议主动平仓: {signal.reasoning}")
             await price_monitor.unsubscribe()
-            trading_simulator.close_position(current_price, "ai_close")
+            trading_simulator.close_position(close_price, "ai_close")
         else:
             logger.info("⚠️ 无持仓，忽略 close_position 信号")
     elif signal.action == SignalAction.ADJUST_STOPS:
@@ -432,22 +421,34 @@ async def do_chart_and_analyze(symbol: str) -> None:
         logger.info(f"📊 {symbol} 最大杠杆: {max_leverage}x, 使用: {signal.leverage}x")
 
         if trading_simulator.has_position():
-            # 有持仓时，检查是否需要反向操作
+            # 有持仓时，只处理「同币种反向」：先平仓再开新仓；同币种同向或新币种开仓信号均忽略
             pos = trading_simulator.position
-            is_reverse = (
+            is_same_symbol = symbol == pos.symbol
+            is_reverse = is_same_symbol and (
                 (pos.side.value == "long" and signal.action == SignalAction.OPEN_SHORT) or
                 (pos.side.value == "short" and signal.action == SignalAction.OPEN_LONG)
             )
             if is_reverse:
                 logger.info("🔄 AI 建议反向操作，执行平仓并开新仓")
+                # 平仓必须使用持仓币种的实时价，避免用错价格
+                close_price = await get_current_price(pos.symbol)
+                if close_price <= 0 and price_monitor.current_symbol == pos.symbol:
+                    close_price = price_monitor.current_price
+                if close_price <= 0:
+                    close_price = current_price if is_same_symbol else 0.0
+                if close_price <= 0:
+                    logger.warning(f"⚠️ 无法获取 {pos.symbol} 平仓价格，使用当前分析价作为 fallback")
+                    close_price = current_price
                 await price_monitor.unsubscribe()
-                trading_simulator.close_position(current_price, "ai_reverse")
+                trading_simulator.close_position(close_price, "ai_reverse")
                 trading_simulator.execute_signal(signal, current_price)
                 if trading_simulator.has_position():
                     await price_monitor.subscribe(
                         trading_simulator.position.symbol,
                         on_price_update
                     )
+            elif not is_same_symbol:
+                logger.info(f"⏭️ 当前持仓 {pos.symbol}，忽略新币种 {symbol} 的开仓信号，保持现有仓位")
         else:
             # 无持仓，直接开仓
             trading_simulator.execute_signal(signal, current_price)

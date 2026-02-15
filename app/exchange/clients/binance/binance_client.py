@@ -351,6 +351,22 @@ class BinanceClient:
             logger.debug(f"异步获取订单簿失败: {symbol} - {e}")
             return {"bids": [], "asks": []}
 
+    async def get_agg_trades_async(self, symbol: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """近期聚合成交（逐笔聚合），用于成交分布与买卖压力"""
+        try:
+            client = await self._get_async_client()
+            exchange_symbol = SymbolMapper.to_exchange_format(symbol, "BINANCE")
+            response = await client.get(
+                "/fapi/v1/aggTrades",
+                params={"symbol": exchange_symbol, "limit": min(limit, 1000)},
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.debug(f"异步获取近期成交失败: {symbol} - {e}")
+            return []
+
     async def get_24hr_ticker_async(
         self, symbol: Optional[str] = None
     ) -> List[Dict[str, Any]]:

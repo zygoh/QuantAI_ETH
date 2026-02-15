@@ -23,6 +23,7 @@ from app.api.models import (
 )
 from app.trading.ai_analyzer import ai_analyzer
 from app.trading.price_monitor import price_monitor
+from app.trading.price_util import get_current_price
 from app.trading.simulator import trading_simulator
 
 
@@ -35,6 +36,11 @@ router = APIRouter(prefix="/api", tags=["交易系统"])
 async def get_system_status() -> SystemStatusResponse:
     """获取系统运行状态和当前选中币种"""
     acc = trading_simulator.account
+    current_price = price_monitor.current_price
+    # 无仓时 WebSocket 未订阅，用 REST 拉取当前分析币种价格供前端展示
+    if not trading_simulator.has_position() and trading_simulator.current_symbol:
+        if not current_price or price_monitor.current_symbol != trading_simulator.current_symbol:
+            current_price = await get_current_price(trading_simulator.current_symbol)
 
     return SystemStatusResponse(
         success=True,
@@ -43,7 +49,7 @@ async def get_system_status() -> SystemStatusResponse:
             "version": "3.0",
             "is_running": trading_simulator.is_running,
             "current_symbol": trading_simulator.current_symbol,
-            "current_price": price_monitor.current_price,
+            "current_price": current_price,
             "has_position": trading_simulator.has_position(),
             "balance": round(acc.balance, 4),
             "total_pnl": round(acc.total_pnl, 4),

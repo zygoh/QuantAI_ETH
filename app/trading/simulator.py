@@ -238,7 +238,7 @@ class TradingSimulator:
         Returns:
             是否成功
         """
-        # 如果已有持仓，先平仓
+        # 如果已有持仓，先平仓（调用方需保证 current_price 为当前持仓币种价格）
         if self.position:
             logger.info(f"📤 已有持仓，先平仓...")
             self.close_position(current_price, "new_signal")
@@ -258,7 +258,16 @@ class TradingSimulator:
         
         # 计算数量（基于实际仓位）
         quantity = position_size / current_price
-        
+
+        # 校验止损止盈方向，防止 AI 设反导致一开仓就触发止损
+        stop_loss, take_profit = self._clamp_stop_take_profit(
+            current_price, signal.stop_loss, signal.take_profit, side
+        )
+        if stop_loss != signal.stop_loss or take_profit != signal.take_profit:
+            logger.warning(
+                f"⚠️ 止损/止盈方向已校正: 多仓止损须<入场价、止盈须>入场价；空仓相反"
+            )
+
         # 创建持仓
         self.position = Position(
             symbol=signal.symbol,
@@ -266,8 +275,8 @@ class TradingSimulator:
             entry_price=current_price,
             quantity=quantity,
             leverage=signal.leverage,
-            stop_loss=signal.stop_loss,
-            take_profit=signal.take_profit,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
             position_size_usd=position_size,
             entry_fee=entry_fee,
         )
@@ -283,13 +292,35 @@ class TradingSimulator:
             f"保证金: ${margin:.2f}, "
             f"仓位: ${position_size:.2f}, "
             f"杠杆: {signal.leverage}x, "
-            f"止损: ${signal.stop_loss:.4f}, "
-            f"止盈: ${signal.take_profit:.4f}, "
+            f"止损: ${stop_loss:.4f}, "
+            f"止盈: ${take_profit:.4f}, "
             f"手续费: ${entry_fee:.4f}"
         )
         
         return True
     
+    def _clamp_stop_take_profit(
+        self,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        side: PositionSide,
+    ) -> tuple:
+        """校正止损止盈方向：多仓止损<入场、止盈>入场；空仓相反。防止反向触发。"""
+        if side == PositionSide.LONG:
+            # 多仓：止损必须 < 入场价，止盈必须 > 入场价
+            if stop_loss >= entry_price:
+                stop_loss = entry_price * 0.995
+            if take_profit <= entry_price:
+                take_profit = entry_price * 1.005
+        else:
+            # 空仓：止损必须 > 入场价，止盈必须 < 入场价
+            if stop_loss <= entry_price:
+                stop_loss = entry_price * 1.005
+            if take_profit >= entry_price:
+                take_profit = entry_price * 0.995
+        return stop_loss, take_profit
+
     def _adjust_stops(self, signal: TradeSignal) -> bool:
         """
         调整止盈止损
@@ -304,16 +335,22 @@ class TradingSimulator:
             logger.warning(f"⚠️ 无持仓，无法调整止盈止损")
             return False
 
-        old_sl = self.position.stop_loss
-        old_tp = self.position.take_profit
+        pos = self.position
+        stop_loss, take_profit = self._clamp_stop_take_profit(
+            pos.entry_price, signal.stop_loss, signal.take_profit, pos.side
+        )
+        if stop_loss != signal.stop_loss or take_profit != signal.take_profit:
+            logger.warning(f"⚠️ 调整止盈止损时方向已校正")
 
-        self.position.stop_loss = signal.stop_loss
-        self.position.take_profit = signal.take_profit
+        old_sl = pos.stop_loss
+        old_tp = pos.take_profit
+        pos.stop_loss = stop_loss
+        pos.take_profit = take_profit
 
         logger.info(
-            f"🔧 调整止盈止损 {self.position.symbol} - "
-            f"止损: ${old_sl:.4f} -> ${signal.stop_loss:.4f}, "
-            f"止盈: ${old_tp:.4f} -> ${signal.take_profit:.4f}"
+            f"🔧 调整止盈止损 {pos.symbol} - "
+            f"止损: ${old_sl:.4f} -> ${stop_loss:.4f}, "
+            f"止盈: ${old_tp:.4f} -> ${take_profit:.4f}"
         )
 
         return True
