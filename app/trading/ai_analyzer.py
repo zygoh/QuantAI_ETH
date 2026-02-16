@@ -52,6 +52,7 @@ class AIAnalyzer:
         current_price: float,
         position_info: Optional[dict] = None,
         market_context: Optional[str] = None,
+        indicator_data: Optional[Dict] = None,
     ) -> Optional[TradeSignal]:
         """
         分析图表并返回交易信号
@@ -63,6 +64,7 @@ class AIAnalyzer:
             current_price: 当前价格
             position_info: 持仓信息（可选）
             market_context: 订单簿/成交分布等市场微观文本（可选）
+            indicator_data: 指标快照字典 {"5m": {...}, "15m": {...}}（可选）
 
         Returns:
             交易信号
@@ -87,16 +89,19 @@ class AIAnalyzer:
                 logger.warning(f"⚠️ {symbol} 图表文件不完整")
                 return None
             
-            # 构建提示词（含可选市场微观数据）
-            prompt = self._build_prompt(symbol, current_price, position_info, market_context)
-            
+            # 构建提示词（含可选市场微观数据和指标数值）
+            prompt = self._build_prompt(symbol, current_price, position_info, market_context, indicator_data)
+
             logger.info(f"🤖 AI 信号: {prompt}")
+
+            # 构建 system prompt（账户状态、历史交易、上次分析摘要）
+            system_prompt = self._build_system_context()
 
             # 记录请求时间
             request_time = datetime.now()
-            
+
             # 调用 Claude API
-            response = await self._call_claude_api(images, prompt)
+            response = await self._call_claude_api(images, prompt, system_prompt)
 
             if response:
                 # 计算耗时
@@ -125,6 +130,7 @@ class AIAnalyzer:
         current_price: float,
         position_info: Optional[dict] = None,
         market_context: Optional[str] = None,
+        indicator_data: Optional[Dict] = None,
     ) -> str:
         """构建分析提示词（位置+形态的结构化交易逻辑，高盈亏比导向）"""
         # 持仓上下文
@@ -153,13 +159,30 @@ class AIAnalyzer:
 {market_context}
 """
 
-        return f"""你是一名专业的加密货币剥头皮交易员（Scalper）。你的目标是寻找【高盈亏比（High R:R）】的交易机会，核心优势是识别【关键供需区】和【价格行为（Price Action）】。
+        # 指标数值文本块
+        indicator_section = ""
+        if indicator_data:
+            indicator_section = self._format_indicator_text(indicator_data)
+
+        # 手续费提醒
+        fee_section = f"""
+交易成本提醒:
+- 往返手续费: 0.07%（开仓0.02% Maker + 平仓0.05% Taker）
+- 10x杠杆下手续费占保证金: 0.7%
+- 20x杠杆下手续费占保证金: 1.4%
+- 25x杠杆下手续费占保证金: 1.75%
+- 止盈空间必须远大于手续费成本，否则选择 wait
+"""
+
+        return f"""你是一名稳健的日内交易员（Day Trader）。你的目标是捕捉 15分钟级别 的趋势波段，避免在震荡市中频繁磨损手续费，核心优势是识别【关键供需区】和【价格行为（Price Action）】。
 
 当前市场数据:
 - 交易对: {symbol}
 - 当前价格: {current_price}
 {position_context}
 {micro_section}
+{indicator_section}
+{fee_section}
 
 请综合分析 5m 和 15m 两张 K 线图。
 
@@ -180,27 +203,138 @@ class AIAnalyzer:
 - 做多：止损 < 入场价，止盈 > 入场价；保护利润 = 止损移到入场价之上。
 - 做空：止损 > 入场价，止盈 < 入场价；保护利润 = 止损移到入场价之下。''' if position_info else '''- wait：无明显形态、价格在“真空地带”（不在关键支撑/阻力附近）、或多空不明朗。
 
-**重要**：当价格已进入关键支撑/阻力附近（与关键位距离约 1% 以内）且 5m 有企稳或止跌迹象时，即可考虑开仓，不必等待“完美触碰+标准反转 K 线”。给出具体 stop_loss、take_profit 和 confidence（60+）即可。'''}
+**重要**：当价格已进入关键支撑/阻力附近（与关键位距离约 1% 以内）且 5m 有企稳或止跌迹象时，即可考虑开仓，不必等待“完美触碰+标准反转 K 线”。开仓请给出 stop_loss、take_profit 和 confidence（须 ≥75，否则不会执行）。'''}
 
 ### 第三步：风控规则（严格执行）
 - **止损**：基于图表结构（前低之下/前高之上），不要用固定百分比。
 - **盈亏比 R:R**：止盈空间至少为止损空间的 1.5 倍；不划算则选 wait。
-- **置信度**：60–70 一般机会（如接近关键位+企稳）；70–85 优质结构；85+ 完美共振（大周期支撑 + 小周期突破）。
+- **置信度**：75–80 一般机会（如接近关键位+企稳）；80–90 优质结构；90+ 完美共振（大周期支撑 + 小周期突破）。低于 75 不会执行开仓。
 
 请只输出一个 JSON 对象，不要 markdown 或其它文字。开仓时必须带 stop_loss、take_profit、confidence；wait/close_position/hold 可不带止损止盈。
 
 {'''{{"symbol": "''' + symbol + '''", "action": "close_position", "reasoning": "..."}}
 {{"symbol": "''' + symbol + '''", "action": "hold", "reasoning": "..."}}
 {{"symbol": "''' + symbol + '''", "action": "adjust_stops", "stop_loss": 新止损价, "take_profit": 新止盈价, "reasoning": "..."}}
-{{"symbol": "''' + symbol + '''", "action": "open_long", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 60-100, "reasoning": "..."}}
-{{"symbol": "''' + symbol + '''", "action": "open_short", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 60-100, "reasoning": "..."}}''' if position_info else '''{{"symbol": "''' + symbol + '''", "action": "wait", "reasoning": "..."}}
-{{"symbol": "''' + symbol + '''", "action": "open_long", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 60-100, "reasoning": "趋势+关键位置+形态+盈亏比"}}
-{{"symbol": "''' + symbol + '''", "action": "open_short", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 60-100, "reasoning": "趋势+关键位置+形态+盈亏比"}}'''}"""
+{{"symbol": "''' + symbol + '''", "action": "open_long", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 75-100, "reasoning": "..."}}
+{{"symbol": "''' + symbol + '''", "action": "open_short", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 75-100, "reasoning": "..."}}''' if position_info else '''{{"symbol": "''' + symbol + '''", "action": "wait", "reasoning": "..."}}
+{{"symbol": "''' + symbol + '''", "action": "open_long", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 75-100, "reasoning": "趋势+关键位置+形态+盈亏比"}}
+{{"symbol": "''' + symbol + '''", "action": "open_short", "stop_loss": 止损价, "take_profit": 止盈价, "confidence": 75-100, "reasoning": "趋势+关键位置+形态+盈亏比"}}'''}"""
     
+    def _format_indicator_text(self, indicator_data: Dict) -> str:
+        """将指标快照格式化为 AI 可读的文本块"""
+        lines = ["技术指标数值（精确值，请结合图表形态综合判断）:"]
+
+        for tf_label, tf_key in [("5分钟", "5m"), ("15分钟", "15m")]:
+            snap = indicator_data.get(tf_key, {})
+            if not snap:
+                continue
+            lines.append(f"\n【{tf_label}周期】")
+
+            # EMA
+            if "ema9" in snap and "ema21" in snap:
+                cross = "金叉(多头)" if snap.get("ema_cross") == "golden" else "死叉(空头)"
+                lines.append(f"  EMA(9): {snap['ema9']}, EMA(21): {snap['ema21']} → {cross}")
+
+            # RSI
+            if "rsi" in snap:
+                zone_map = {"overbought": "超买", "oversold": "超卖", "neutral": "中性"}
+                zone = zone_map.get(snap.get("rsi_zone", ""), "")
+                lines.append(f"  RSI(14): {snap['rsi']} → {zone}")
+
+            # MACD
+            if "macd" in snap:
+                hist = snap.get("macd_hist", 0)
+                momentum = "多头动能" if hist > 0 else "空头动能"
+                lines.append(f"  MACD: {snap['macd']}, Signal: {snap.get('macd_signal', 0)}, Hist: {hist} → {momentum}")
+
+            # KDJ
+            if "kdj_k" in snap:
+                lines.append(f"  KDJ K: {snap['kdj_k']}, D: {snap.get('kdj_d', 0)}")
+
+            # ADX
+            if "adx" in snap:
+                trend = "趋势行情" if snap.get("adx_trend") == "trending" else "震荡行情"
+                lines.append(f"  ADX: {snap['adx']} → {trend}")
+
+            # ATR
+            if "atr" in snap:
+                lines.append(f"  ATR(14): {snap['atr']} ({snap.get('atr_pct', 0)}%)")
+
+            # 布林带
+            if "bb_upper" in snap:
+                lines.append(f"  布林带: 上轨 {snap['bb_upper']}, 中轨 {snap.get('bb_middle', 0)}, 下轨 {snap.get('bb_lower', 0)}")
+
+            # VWAP
+            if "vwap" in snap:
+                price = snap.get("price", 0)
+                above = "价格在VWAP上方" if price > snap["vwap"] else "价格在VWAP下方"
+                lines.append(f"  VWAP: {snap['vwap']} → {above}")
+
+            # 量比
+            if "volume_ratio" in snap:
+                vr = snap["volume_ratio"]
+                vol_desc = "放量" if vr > 1.5 else ("缩量" if vr < 0.7 else "正常")
+                lines.append(f"  量比: {vr} → {vol_desc}")
+
+        return "\n".join(lines)
+
+    def _build_system_context(self) -> str:
+        """构建 system prompt：账户状态、最近交易、连亏检测、上次分析摘要"""
+        from app.trading.simulator import trading_simulator
+
+        parts = []
+
+        # 账户状态
+        acc = trading_simulator.account
+        parts.append(
+            f"账户状态: 余额 ${acc.balance:.2f}, "
+            f"总交易 {acc.total_trades} 笔, "
+            f"胜率 {acc.win_rate:.1f}%, "
+            f"总盈亏 ${acc.total_pnl:+.2f}"
+        )
+
+        # 最近10笔交易
+        recent = trading_simulator.trade_history[-10:]
+        if recent:
+            parts.append("\n最近交易记录:")
+            for t in recent:
+                parts.append(
+                    f"  {t.symbol} {t.side.value} | "
+                    f"入场 ${t.entry_price:.4f} → 出场 ${t.exit_price:.4f} | "
+                    f"盈亏 ${t.pnl:+.2f} ({t.pnl_pct:+.1f}%) | "
+                    f"原因: {t.exit_reason}"
+                )
+
+        # 连亏检测
+        last_5 = trading_simulator.trade_history[-5:]
+        if last_5:
+            losses = sum(1 for t in last_5 if t.pnl < 0)
+            if losses >= 3:
+                parts.append(f"\n⚠️ 警告: 近5笔交易中有{losses}笔亏损，请提高开仓标准，只做高置信度机会。")
+
+            # 连续止损检测
+            sl_count = sum(1 for t in last_5 if t.exit_reason == "stop_loss")
+            if sl_count >= 3:
+                parts.append(f"\n⚠️ 警告: 近5笔中{sl_count}笔触发止损，可能止损设置过紧，请适当放宽止损距离。")
+
+        # 上次分析摘要
+        if self.chat_history:
+            last = self.chat_history[-1]
+            sig = last.get("signal")
+            if sig:
+                parts.append(
+                    f"\n上次分析: {last.get('symbol', '?')} → {sig['action']}, "
+                    f"置信度 {sig.get('confidence', 0)}%, "
+                    f"理由: {sig.get('reasoning', '')[:100]}"
+                )
+
+        return "\n".join(parts)
+
     async def _call_claude_api(
         self,
         images: list,
-        prompt: str
+        prompt: str,
+        system_prompt: Optional[str] = None,
     ) -> Optional[str]:
         """调用 Claude API"""
         try:
@@ -209,10 +343,10 @@ class AIAnalyzer:
                 "x-api-key": self.api_key,
                 "anthropic-version": "2023-06-01"
             }
-            
+
             # 构建消息内容
             content = images + [{"type": "text", "text": prompt}]
-            
+
             payload = {
                 "model": self.model,
                 "max_tokens": 1024,
@@ -220,6 +354,10 @@ class AIAnalyzer:
                     {"role": "user", "content": content}
                 ]
             }
+
+            # 注入 system prompt
+            if system_prompt:
+                payload["system"] = system_prompt
             
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
@@ -271,10 +409,10 @@ class AIAnalyzer:
             action = action_map.get(action_str, SignalAction.WAIT)
             confidence = data.get("confidence", 0)
 
-            # 开仓置信度门槛：低于 60 强制视为观望；60+ 交给仓位/风控层处理
-            if action in (SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT) and confidence < 60:
+            # 开仓置信度门槛：低于 75 强制视为观望（宁可不做也不做亏损单）
+            if action in (SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT) and confidence < 75:
                 action = SignalAction.WAIT
-                logger.info(f"🤖 置信度 {confidence}% < 60，已强制改为 wait")
+                logger.info(f"🤖 置信度 {confidence}% < 75，已强制改为 wait")
 
             return TradeSignal(
                 symbol=data.get("symbol", symbol),
@@ -314,6 +452,7 @@ class AIAnalyzer:
             "current_price": current_price,
             "has_position": position_info is not None,
             "prompt_summary": f"分析 {symbol} @ ${current_price}",
+            "prompt_full": prompt,
             "response": response,
             "signal": None
         }

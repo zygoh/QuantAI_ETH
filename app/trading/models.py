@@ -37,6 +37,7 @@ class TradeSignal:
     take_profit: float = 0.0
     confidence: int = 0
     risk_usd: float = 0.0
+    atr: float = 0.0
 
 
 @dataclass
@@ -52,6 +53,7 @@ class Position:
     position_size_usd: float
     entry_time: datetime = field(default_factory=datetime.now)
     entry_fee: float = 0.0  # 开仓手续费
+    margin_pct: float = 0.0  # 保证金占余额比例
     
     def unrealized_pnl(self, current_price: float) -> float:
         """计算未实现盈亏"""

@@ -17,10 +17,12 @@ from fastapi import APIRouter, Query
 from app.api.models import (
     AccountResponse,
     ChatHistoryResponse,
+    IndicatorsResponse,
     PositionResponse,
     SystemStatusResponse,
     TradeListResponse,
 )
+from app.chart.generator import chart_generator
 from app.trading.ai_analyzer import ai_analyzer
 from app.trading.price_monitor import price_monitor
 from app.trading.price_util import get_current_price
@@ -119,6 +121,7 @@ async def get_position() -> PositionResponse:
             "unrealized_pnl": round(unrealized_pnl, 4),
             "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
             "liquidation_price": round(liquidation_price, 10),
+            "margin_pct": round(pos.margin_pct * 100, 0),
         }
     )
 
@@ -169,4 +172,28 @@ async def get_chat_history(
         message=f"获取成功，共 {len(history)} 条记录",
         data=history,
         total=len(ai_analyzer.chat_history)
+    )
+
+
+@router.get("/indicators", response_model=IndicatorsResponse, summary="指标快照")
+async def get_indicators() -> IndicatorsResponse:
+    """获取最新技术指标快照（5m / 15m）"""
+    symbol = chart_generator.latest_symbol
+    indicators = chart_generator.latest_indicators
+
+    if not symbol or not indicators:
+        return IndicatorsResponse(
+            success=True,
+            message="暂无指标数据",
+            data=None
+        )
+
+    return IndicatorsResponse(
+        success=True,
+        message="获取成功",
+        data={
+            "symbol": symbol,
+            "5m": indicators.get("5m", {}),
+            "15m": indicators.get("15m", {}),
+        }
     )

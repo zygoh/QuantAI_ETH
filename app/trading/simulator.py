@@ -243,14 +243,16 @@ class TradingSimulator:
             logger.info(f"📤 已有持仓，先平仓...")
             self.close_position(current_price, "new_signal")
         
-        # 全仓开仓（使用 95% 余额作为保证金，预留手续费空间）
-        margin = self.account.balance * 0.95
-        
+        # 开仓使用固定保证金比例，杠杆由置信度档位 + 币种最大杠杆在 main 中已算好并写入 signal.leverage
+        FIXED_MARGIN_PCT = 0.90  # 统一用 90% 余额作为该笔保证金
+        margin_pct = FIXED_MARGIN_PCT
+        margin = self.account.balance * margin_pct
+
         if margin <= 0:
             logger.warning(f"⚠️ 余额不足，无法开仓 (${self.account.balance:.4f})")
             return False
-        
-        # 实际仓位 = 保证金 × 杠杆
+
+        # 实际仓位 = 保证金 × 杠杆（杠杆由置信度档位与币种最大杠杆动态决定）
         position_size = margin * signal.leverage
         
         # 计算开仓手续费（基于实际仓位）
@@ -261,7 +263,7 @@ class TradingSimulator:
 
         # 校验止损止盈方向，防止 AI 设反导致一开仓就触发止损
         stop_loss, take_profit = self._clamp_stop_take_profit(
-            current_price, signal.stop_loss, signal.take_profit, side
+            current_price, signal.stop_loss, signal.take_profit, side, signal.atr
         )
         if stop_loss != signal.stop_loss or take_profit != signal.take_profit:
             logger.warning(
@@ -279,6 +281,7 @@ class TradingSimulator:
             take_profit=take_profit,
             position_size_usd=position_size,
             entry_fee=entry_fee,
+            margin_pct=margin_pct,
         )
         
         # 扣除手续费
@@ -289,12 +292,13 @@ class TradingSimulator:
         logger.info(
             f"{side_emoji} 开仓 {signal.symbol} ({side.value}) - "
             f"价格: ${current_price:.4f}, "
+            f"杠杆: {signal.leverage}x, "
             f"保证金: ${margin:.2f}, "
             f"仓位: ${position_size:.2f}, "
-            f"杠杆: {signal.leverage}x, "
             f"止损: ${stop_loss:.4f}, "
             f"止盈: ${take_profit:.4f}, "
-            f"手续费: ${entry_fee:.4f}"
+            f"手续费: ${entry_fee:.4f}, "
+            f"置信度: {signal.confidence}%"
         )
         
         return True
@@ -305,20 +309,25 @@ class TradingSimulator:
         stop_loss: float,
         take_profit: float,
         side: PositionSide,
+        atr: float = 0.0,
     ) -> tuple:
-        """校正止损止盈方向：多仓止损<入场、止盈>入场；空仓相反。防止反向触发。"""
+        """校正止损止盈方向，使用 ATR 自适应回退（无 ATR 时回退 0.5%）。"""
+        # ATR 自适应回退距离：SL=1.5×ATR, TP=2.5×ATR
+        sl_distance = 1.5 * atr if atr > 0 else entry_price * 0.005
+        tp_distance = 2.5 * atr if atr > 0 else entry_price * 0.005
+
         if side == PositionSide.LONG:
             # 多仓：止损必须 < 入场价，止盈必须 > 入场价
             if stop_loss >= entry_price:
-                stop_loss = entry_price * 0.995
+                stop_loss = entry_price - sl_distance
             if take_profit <= entry_price:
-                take_profit = entry_price * 1.005
+                take_profit = entry_price + tp_distance
         else:
             # 空仓：止损必须 > 入场价，止盈必须 < 入场价
             if stop_loss <= entry_price:
-                stop_loss = entry_price * 1.005
+                stop_loss = entry_price + sl_distance
             if take_profit >= entry_price:
-                take_profit = entry_price * 0.995
+                take_profit = entry_price - tp_distance
         return stop_loss, take_profit
 
     def _adjust_stops(self, signal: TradeSignal) -> bool:
@@ -337,7 +346,7 @@ class TradingSimulator:
 
         pos = self.position
         stop_loss, take_profit = self._clamp_stop_take_profit(
-            pos.entry_price, signal.stop_loss, signal.take_profit, pos.side
+            pos.entry_price, signal.stop_loss, signal.take_profit, pos.side, signal.atr
         )
         if stop_loss != signal.stop_loss or take_profit != signal.take_profit:
             logger.warning(f"⚠️ 调整止盈止损时方向已校正")

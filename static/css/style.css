@@ -130,6 +130,40 @@ body {
     margin-bottom: 12px;
 }
 
+.leverage-config-panel .leverage-table-wrap {
+    overflow-x: auto;
+    margin-bottom: 8px;
+}
+
+.leverage-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+}
+
+.leverage-table th,
+.leverage-table td {
+    padding: 6px 10px;
+    text-align: center;
+    border: 1px solid #21262d;
+}
+
+.leverage-table th {
+    background: #21262d;
+    color: #8b949e;
+    font-weight: 600;
+}
+
+.leverage-table td {
+    color: #c9d1d9;
+}
+
+.leverage-hint {
+    font-size: 0.8rem;
+    color: #8b949e;
+    margin: 0;
+}
+
 .empty-state {
     color: #8b949e;
     text-align: center;
@@ -396,6 +430,43 @@ tbody tr:hover {
     padding-left: 17px;
 }
 
+.chat-expand-btn {
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    color: #8b949e;
+    cursor: pointer;
+    font-size: 0.7rem;
+    padding: 1px 8px;
+    transition: all 0.2s;
+    margin-left: auto;
+}
+
+.chat-expand-btn:hover {
+    background: #30363d;
+    color: #c9d1d9;
+}
+
+.chat-full-content {
+    margin-top: 8px;
+    background: #0d1117;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+.chat-pre {
+    padding: 12px;
+    margin: 0;
+    font-size: 0.78rem;
+    line-height: 1.6;
+    color: #c9d1d9;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+}
+
 /* 图表切换按钮 */
 .toggle-chart-btn {
     padding: 6px 14px;
@@ -419,7 +490,7 @@ tbody tr:hover {
     color: white;
 }
 
-/* 动态列布局 - 最多4列 */
+/* 动态列布局 - 最多5列 */
 .main-content.cols-1 {
     grid-template-columns: 1fr;
 }
@@ -434,6 +505,90 @@ tbody tr:hover {
 
 .main-content.cols-4 {
     grid-template-columns: 1fr 0.8fr 1.2fr 0.8fr;
+}
+
+.main-content.cols-5 {
+    grid-template-columns: 1fr 0.8fr 1.2fr 0.8fr 0.8fr;
+}
+
+/* 指标快照面板 */
+.indicators-tabs {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.ind-tab-btn {
+    padding: 6px 14px;
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #8b949e;
+    cursor: pointer;
+    font-size: 0.82rem;
+    transition: all 0.2s;
+}
+
+.ind-tab-btn:hover {
+    background: #30363d;
+}
+
+.ind-tab-btn.active {
+    background: #1f6feb;
+    border-color: #1f6feb;
+    color: white;
+}
+
+.indicators-body {
+    max-height: 600px;
+    overflow-y: auto;
+}
+
+.ind-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 7px 0;
+    border-bottom: 1px solid #21262d;
+    font-size: 0.85rem;
+}
+
+.ind-row:last-child {
+    border-bottom: none;
+}
+
+.ind-label {
+    color: #8b949e;
+    font-size: 0.82rem;
+}
+
+.ind-value {
+    font-weight: 600;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 0.85rem;
+}
+
+.ind-tag {
+    font-size: 0.7rem;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+    margin-left: 6px;
+}
+
+.ind-tag.bullish {
+    background: #3fb95022;
+    color: #3fb950;
+}
+
+.ind-tag.bearish {
+    background: #f8514922;
+    color: #f85149;
+}
+
+.ind-tag.neutral {
+    background: #d2992222;
+    color: #d29922;
 }
 
 /* 留言板 */

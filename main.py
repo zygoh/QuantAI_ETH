@@ -259,6 +259,16 @@ async def do_select_coin() -> None:
     """从云端获取选币结果"""
     global _current_selected_symbol, _last_chart_time
 
+    # 固定币种模式：跳过云端选币，直接使用指定币种
+    FIXED_SYMBOL = "ETHUSDT"
+    if FIXED_SYMBOL:
+        _current_selected_symbol = FIXED_SYMBOL
+        trading_simulator.current_symbol = FIXED_SYMBOL
+        logger.info(f"📌 固定币种模式: {FIXED_SYMBOL}")
+        _last_chart_time = datetime.now()
+        await do_chart_and_analyze(FIXED_SYMBOL)
+        return
+
     logger.info("🔍 从云端获取选币结果...")
 
     try:
@@ -373,7 +383,11 @@ async def do_chart_and_analyze(symbol: str) -> None:
         logger.debug(f"拉取订单簿/成交失败: {e}")
     market_context = build_market_context(symbol, current_price, orderbook, agg_trades)
 
-    # 调用 AI 分析（使用同一个 current_price，并注入市场微观数据）
+    # 调用 AI 分析（使用同一个 current_price，并注入市场微观数据和指标数值）
+    indicator_data = {
+        "5m": chart_result.indicators_5m,
+        "15m": chart_result.indicators_15m,
+    }
     signal = await ai_analyzer.analyze_charts(
         symbol=symbol,
         chart_5m_path=chart_result.chart_5m,
@@ -381,6 +395,7 @@ async def do_chart_and_analyze(symbol: str) -> None:
         current_price=current_price,
         position_info=position_info,
         market_context=market_context,
+        indicator_data=indicator_data,
     )
 
     if not signal:
@@ -415,10 +430,24 @@ async def do_chart_and_analyze(symbol: str) -> None:
         else:
             logger.info("⚠️ 无持仓，忽略 adjust_stops 信号")
     elif signal.action in [SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT]:
-        # 获取最大杠杆（上限 30x）
+        # 置信度分级杠杆：≥90 用最大，≥85 用 70%，≥80 用 50%，<80 用 40%（均去小数）
         max_leverage = await binance_client.get_max_leverage_async(symbol)
-        signal.leverage = min(max_leverage, 30)
-        logger.info(f"📊 {symbol} 最大杠杆: {max_leverage}x, 使用: {signal.leverage}x")
+        confidence = signal.confidence
+        if confidence >= 90:
+            signal.leverage = max_leverage  # 直接用最大杠杆
+        elif confidence >= 85:
+            signal.leverage = max(1, int(max_leverage * 0.70))
+        elif confidence >= 80:
+            signal.leverage = max(1, int(max_leverage * 0.50))
+        else:
+            signal.leverage = max(1, int(max_leverage * 0.40))
+        logger.info(f"📊 {symbol} 最大杠杆: {max_leverage}x, 置信度: {confidence}%, 使用: {signal.leverage}x")
+
+        # 从5m指标快照提取ATR赋值给signal
+        atr_5m = chart_result.indicators_5m.get("atr", 0.0)
+        if atr_5m:
+            signal.atr = atr_5m
+            logger.info(f"📊 ATR(5m): {atr_5m:.6f}")
 
         if trading_simulator.has_position():
             # 有持仓时，只处理「同币种反向」：先平仓再开新仓；同币种同向或新币种开仓信号均忽略

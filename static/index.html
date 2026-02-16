@@ -17,6 +17,7 @@
                 <span id="current-price" class="current-price"></span>
                 <button id="toggle-trades" class="toggle-chart-btn">📋 交易</button>
                 <button id="toggle-chart" class="toggle-chart-btn">📈 图表</button>
+                <button id="toggle-indicators" class="toggle-chart-btn">📐 指标</button>
                 <button id="toggle-notes" class="toggle-chart-btn">📝 留言</button>
             </div>
         </header>
@@ -52,6 +53,25 @@
                     </div>
                 </section>
 
+                <!-- 开仓杠杆配置：按最大杠杆的比例，去小数 -->
+                <div class="panel leverage-config-panel">
+                    <h2>⚙️ 开仓杠杆</h2>
+                    <div class="leverage-table-wrap">
+                        <table class="leverage-table">
+                            <thead>
+                                <tr><th>置信度</th><th>杠杆</th></tr>
+                            </thead>
+                            <tbody>
+                                <tr><td>≥ 90</td><td>100% 最大</td></tr>
+                                <tr><td>≥ 85</td><td>70% 最大</td></tr>
+                                <tr><td>≥ 80</td><td>50% 最大</td></tr>
+                                <tr><td>&lt; 80</td><td>40% 最大</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <p class="leverage-hint">比例按整数取整（去小数），至少 1x</p>
+                </div>
+
                 <!-- 当前持仓 -->
                 <div class="panel">
                     <h2>📊 当前持仓</h2>
@@ -65,6 +85,7 @@
                         <div class="pos-grid">
                             <div class="pos-item"><span class="pos-label">入场价格</span><span id="pos-entry" class="pos-val"></span></div>
                             <div class="pos-item"><span class="pos-label">仓位大小</span><span id="pos-size" class="pos-val"></span></div>
+                            <div class="pos-item"><span class="pos-label">杠杆</span><span id="pos-leverage-val" class="pos-val"></span></div>
                             <div class="pos-item"><span class="pos-label">止损</span><span id="pos-sl" class="pos-val negative"></span></div>
                             <div class="pos-item"><span class="pos-label">止盈</span><span id="pos-tp" class="pos-val positive"></span></div>
                             <div class="pos-item"><span class="pos-label">开仓时间</span><span id="pos-time" class="pos-val"></span></div>
@@ -96,6 +117,7 @@
                                 <tr>
                                     <th>币种</th>
                                     <th>方向</th>
+                                    <th>杠杆</th>
                                     <th>入场价</th>
                                     <th>出场价</th>
                                     <th>盈亏</th>
@@ -123,6 +145,21 @@
                     <div class="chart-container">
                         <img id="chart-image" src="" alt="K线图表">
                         <div id="chart-placeholder" class="empty-state">等待选币...</div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="indicators-panel hidden">
+                <!-- 指标快照 -->
+                <div class="panel">
+                    <h2>📐 技术指标快照</h2>
+                    <div id="indicators-empty" class="empty-state">等待指标数据...</div>
+                    <div id="indicators-content" class="indicators-content hidden">
+                        <div class="indicators-tabs">
+                            <button class="ind-tab-btn active" data-tf="5m">5分钟</button>
+                            <button class="ind-tab-btn" data-tf="15m">15分钟</button>
+                        </div>
+                        <div id="indicators-body" class="indicators-body"></div>
                     </div>
                 </div>
             </section>

@@ -283,16 +283,16 @@ class BinanceClient:
 
     async def get_max_leverage_async(self, symbol: str) -> int:
         """
-        获取币种最大杠杆倍数
+        获取币种最大杠杆倍数（用于按置信度动态计算开仓杠杆上限）
 
         通过 Binance leverageBracket 接口查询，需要 API Key 签名。
-        上限 30x，失败时回退到 20x。
+        返回该合约允许的最大杠杆，失败时回退到 20x。
 
         Args:
             symbol: 交易对
 
         Returns:
-            最大杠杆倍数（上限 30）
+            最大杠杆倍数
         """
         api_key = settings.BINANCE_API_KEY
         api_secret = settings.BINANCE_API_SECRET
@@ -325,12 +325,10 @@ class BinanceClient:
             response.raise_for_status()
             data = response.json()
 
-            # 解析最大杠杆
             if isinstance(data, list) and len(data) > 0:
                 brackets = data[0].get("brackets", [])
                 if brackets:
-                    max_lev = brackets[0].get("initialLeverage", 20)
-                    return min(int(max_lev), 30)
+                    return int(brackets[0].get("initialLeverage", 20))
 
             return 20
         except Exception as e:

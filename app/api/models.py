@@ -47,3 +47,8 @@ class ChatHistoryResponse(BaseResponse):
     """AI 对话历史响应"""
     data: List[Dict[str, Any]] = Field(default_factory=list, description="对话记录列表")
     total: int = Field(0, description="总数量")
+
+
+class IndicatorsResponse(BaseResponse):
+    """指标快照响应"""
+    data: Optional[Dict[str, Any]] = Field(None, description="指标快照数据")

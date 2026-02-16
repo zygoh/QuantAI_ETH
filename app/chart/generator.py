@@ -325,7 +325,10 @@ class ChartGenerator:
         self.intervals: List[str] = settings.CHART_INTERVALS
         self.base_dir: str = "image"
         self.watermark: str = "@Three_Dog_z"
-        self.kline_limit: int = 50
+        self.kline_limit: int = 100
+        # 最新指标快照（供 API 读取）
+        self.latest_indicators: Dict[str, Dict] = {}
+        self.latest_symbol: Optional[str] = None
         
         logger.info(
             f"📊 图表生成器初始化完成 - "
@@ -353,20 +356,29 @@ class ChartGenerator:
         self.cleanup_old_charts(exchange_symbol)
 
         chart_paths: Dict[str, str] = {}
+        indicator_snapshots: Dict[str, Dict] = {}
 
         for interval in self.intervals:
             try:
-                path = self._generate_single_chart(exchange_symbol, interval, current_price)
+                path, snapshot = self._generate_single_chart(exchange_symbol, interval, current_price)
                 chart_paths[interval] = path
+                indicator_snapshots[interval] = snapshot
                 logger.debug(f"✅ {exchange_symbol} {interval} 图表生成成功: {path}")
             except Exception as e:
                 logger.error(f"❌ {exchange_symbol} {interval} 图表生成失败: {e}")
                 chart_paths[interval] = ""
+                indicator_snapshots[interval] = {}
+
+        # 缓存最新指标快照供 API 读取
+        self.latest_symbol = exchange_symbol
+        self.latest_indicators = indicator_snapshots
 
         return ChartResult(
             symbol=exchange_symbol,
             chart_5m=chart_paths.get("5m", ""),
-            chart_15m=chart_paths.get("15m", "")
+            chart_15m=chart_paths.get("15m", ""),
+            indicators_5m=indicator_snapshots.get("5m", {}),
+            indicators_15m=indicator_snapshots.get("15m", {}),
         )
     
     def cleanup_old_charts(self, symbol: str) -> None:
@@ -386,7 +398,7 @@ class ChartGenerator:
             except Exception as e:
                 logger.warning(f"⚠️ 删除旧图表目录失败: {e}")
     
-    def _generate_single_chart(self, symbol: str, interval: str, current_price: float = 0.0) -> str:
+    def _generate_single_chart(self, symbol: str, interval: str, current_price: float = 0.0) -> Tuple[str, Dict]:
         """
         生成单个时间周期的图表
 
@@ -396,7 +408,7 @@ class ChartGenerator:
             current_price: 外部传入的实时价格
 
         Returns:
-            图表文件路径
+            (图表文件路径, 指标快照字典)
         """
         # 获取 K 线数据
         klines = binance_client.get_klines(symbol, interval, self.kline_limit)
@@ -419,6 +431,9 @@ class ChartGenerator:
         # 计算技术指标
         indicators = self._calculate_indicators(opens, highs, lows, closes, volumes)
 
+        # 提取指标快照
+        snapshot = self._extract_indicator_snapshot(closes, highs, lows, volumes, indicators, current_price)
+
         # 生成图表
         filepath = self._create_chart(
             symbol, interval, dates,
@@ -426,8 +441,86 @@ class ChartGenerator:
             indicators, current_price
         )
 
-        return filepath
-    
+        return filepath, snapshot
+
+    def _extract_indicator_snapshot(
+        self,
+        closes: np.ndarray,
+        highs: np.ndarray,
+        lows: np.ndarray,
+        volumes: np.ndarray,
+        indicators: Dict[str, np.ndarray],
+        current_price: float,
+    ) -> Dict:
+        """
+        提取最新指标数值快照，供 AI 文本分析
+
+        Returns:
+            指标快照字典
+        """
+        price = current_price if current_price > 0 else float(closes[-1])
+        snap: Dict = {"price": price}
+
+        # EMA
+        for key in ("ema9", "ema21"):
+            if key in indicators:
+                snap[key] = round(float(indicators[key][-1]), 6)
+        if "ema9" in snap and "ema21" in snap:
+            snap["ema_cross"] = "golden" if snap["ema9"] > snap["ema21"] else "death"
+
+        # RSI
+        if "rsi" in indicators:
+            rsi_val = float(indicators["rsi"][-1])
+            snap["rsi"] = round(rsi_val, 2)
+            if rsi_val >= 70:
+                snap["rsi_zone"] = "overbought"
+            elif rsi_val <= 30:
+                snap["rsi_zone"] = "oversold"
+            else:
+                snap["rsi_zone"] = "neutral"
+
+        # MACD
+        for key in ("macd", "macd_signal", "macd_hist"):
+            if key in indicators:
+                snap[key] = round(float(indicators[key][-1]), 6)
+
+        # KDJ
+        for key in ("kdj_k", "kdj_d"):
+            if key in indicators:
+                snap[key] = round(float(indicators[key][-1]), 2)
+
+        # ADX
+        if "adx" in indicators:
+            adx_val = float(indicators["adx"][-1])
+            snap["adx"] = round(adx_val, 2)
+            if adx_val >= 25:
+                snap["adx_trend"] = "trending"
+            else:
+                snap["adx_trend"] = "ranging"
+
+        # ATR
+        if "atr" in indicators:
+            atr_val = float(indicators["atr"][-1])
+            snap["atr"] = round(atr_val, 6)
+            snap["atr_pct"] = round(atr_val / price * 100, 4) if price > 0 else 0
+
+        # 布林带
+        for key in ("bb_upper", "bb_middle", "bb_lower"):
+            if key in indicators:
+                snap[key] = round(float(indicators[key][-1]), 6)
+
+        # VWAP
+        if "vwap" in indicators:
+            snap["vwap"] = round(float(indicators["vwap"][-1]), 6)
+
+        # 量比（当前成交量 / SMA20）
+        if "vol_sma20" in indicators and not np.isnan(indicators["vol_sma20"][-1]):
+            vol_sma = float(indicators["vol_sma20"][-1])
+            if vol_sma > 0:
+                snap["volume_ratio"] = round(float(volumes[-1]) / vol_sma, 2)
+
+        return snap
+
     def _calculate_indicators(
         self,
         opens: np.ndarray,
