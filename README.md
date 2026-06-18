@@ -1,3 +1,7 @@
+# QuantAI-ETH
+
+> **简介**：**Quantitative AI for Ethereum Trading** — 以太坊量化智能交易系统。FastAPI + 多时间框架信号 + Stacking 集成模型（LGB/XGB/Cat）+ 严格模式（训练/回测/实盘同一路径）。
+
 QuantAI 量化交易系统（Strict Mode）
 
 ## 项目简介
@@ -252,3 +256,8 @@ pytest -q
 
 本项目用于研究与工程实现参考，不构成投资建议。实盘交易存在巨大风险（特别是高杠杆与高频策略），请在隔离环境中验证并自行承担后果。
 
+---
+
+## GitHub About 简介
+
+`QuantAI-ETH：以太坊量化智能交易系统，FastAPI + Stacking 集成模型 + 严格模式回测/信号。`
